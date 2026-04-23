@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Main training entry point."""
+
+from __future__ import annotations
+
+import datetime
+import gc
+import json
+import os
+import re
+import shutil
+import sys
+import warnings
+from pathlib import Path
+
+import torch
+
+warnings.filterwarnings("ignore")
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
+from tqdm import tqdm
+from importlib import import_module
+
+from src.utils import batch_str_to_tensor, seed_everything, initialize_overwatch, flatten, StepTimer
+
+overwatch = initialize_overwatch(__name__)
+
+MAX_TRAINING_EPOCHS = 1_000_000
+
+
+def _initialize_accelerator(trainer) -> Accelerator:
+    os.makedirs(trainer.project_dir, exist_ok=True)
+    logging_dir = os.path.join(trainer.project_dir, trainer.cfg.log.logging_dir)
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=trainer.project_dir, logging_dir=logging_dir
+    )
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=trainer.cfg.train.gradient_accumulation_steps,
+        mixed_precision=trainer.cfg.train.mixed_precision,
+        log_with=trainer.cfg.log.report_to,
+        project_config=accelerator_project_config,
+    )
+
+    if overwatch.is_rank_zero() and not trainer.cfg.eval:
+        os.makedirs(trainer.project_dir, exist_ok=True)
+        with open(f"{trainer.project_dir}/run_config.json", "w") as f:
+            f.write(trainer.cfg.model_dump_json(indent=4))
+
+    trainer.accelerator = accelerator
+    return accelerator
+
+
+def train(config):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(overwatch.local_rank())
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    if config.seed:
+        seed_everything(config.seed)
+
+    from src.trainers import Trainer
+    trainer = Trainer.instantiate(config, overwatch.local_rank())
+    overwatch.info("Initializing models...")
+    trainer.init_models()
+    accelerator = _initialize_accelerator(trainer)
+
+    overwatch.info(f"Training task: '{config.train.name}'")
+    overwatch.info(f"Run name: {trainer.run_name}")
+    overwatch.info(f"Max training steps: {trainer.max_training_steps}")
+
+    train_dataset, val_dataset = trainer.create_datasets()
+    trainer.create_dataloaders(train_dataset, val_dataset)
+    overwatch.info(f"Training dataset size: {trainer.len_train_dataset}")
+
+    overwatch.info("Initializing optimizer and scheduler...")
+    trainer.create_optimizer_and_scheduler(trainer.max_training_steps)
+
+    overwatch.info(f"Global train batch size: {trainer.global_train_batch_size}")
+    overwatch.info(f"Num processes: {trainer.world_size}")
+
+    trainer.prepare(accelerator)
+    global_step = initial_global_step = trainer.resume_from_checkpoint()[0]
+    epoch_start = global_step // trainer.num_steps_per_epoch
+
+    overwatch.info(f"Accelerator working directory: {trainer.project_dir}")
+    trainer.set_train()
+
+    profiling = config.log.enable_profiling
+    timer = None
+    if profiling:
+        timer = StepTimer(
+            window_size=config.log.profiling_window,
+            use_cuda=torch.cuda.is_available(),
+            use_mps=torch.backends.mps.is_available(),
+        )
+        trainer._step_timer = timer
+        overwatch.info(f"Profiling enabled (window={config.log.profiling_window})")
+
+    progress_bar = tqdm(
+        range(0, trainer.max_training_steps),
+        initial=initial_global_step,
+        desc="Training steps",
+        disable=not overwatch.is_rank_zero(),
+    )
+
+    for epoch in range(epoch_start, MAX_TRAINING_EPOCHS):
+        accelerator.wait_for_everyone()
+        for local_step, batch in enumerate(trainer.train_dataloader):
+            if timer:
+                timer.start("step_total")
+                timer.start("data_loading")
+            batch = batch_str_to_tensor(batch)
+            if timer:
+                timer.stop("data_loading")
+
+            sync_gradients, losses = trainer.step(batch, global_step, local_step)
+
+            if sync_gradients:
+                if timer:
+                    timer.start("logging")
+
+                log_metrics = flatten({**losses, "epoch": epoch}, parent_key="train")
+
+                if timer:
+                    timer.stop("step_total")
+                    timer.sync()
+                    log_metrics.update(timer.summary())
+
+                trainer.log(log_metrics)
+
+                if (global_step + 1) % config.train.checkpointing_steps == 0:
+                    accelerator.wait_for_everyone()
+                    save_path = trainer.save_checkpoint(global_step + 1)
+                    if overwatch.is_rank_zero():
+                        tqdm.write(f"Saved state to {save_path}")
+
+                if config.train.validation_steps > 0 and (
+                    global_step % config.train.validation_steps == 0
+                ):
+                    if timer:
+                        timer.stop("logging")
+                        timer.sync()
+                        timer.start("validation")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                    trainer.set_eval()
+                    autocast_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+                    with torch.no_grad(), torch.autocast(
+                        device_type=autocast_device, dtype=trainer.dtype
+                    ):
+                        eval_losses = trainer.evaluate()
+                        if eval_losses is not None:
+                            trainer.log(flatten(eval_losses, parent_key="eval"))
+                    trainer.set_train()
+                    if timer:
+                        timer.stop("validation")
+                        timer.sync()
+                        timer.start("logging")
+
+                if timer:
+                    timer.stop("logging")
+                    timer.sync()
+
+                progress_bar.update()
+                postfix = {"loss": losses.get("loss", 0), "lr": trainer.lr}
+                if timer:
+                    avgs = timer.averages()
+                    postfix["s/step"] = f"{avgs.get('step_total', 0):.2f}"
+                progress_bar.set_postfix(postfix)
+                global_step += 1
+
+            if global_step >= trainer.max_training_steps:
+                break
+
+        if global_step >= trainer.max_training_steps:
+            break
+
+    accelerator.wait_for_everyone()
+    trainer.finalize()
+    progress_bar.close()
+
+    if timer and overwatch.is_rank_zero():
+        overwatch.info("=== Profiling Summary ===")
+        for name, avg in sorted(timer.averages().items()):
+            overwatch.info(f"  {name}: {avg:.4f}s avg")
+    overwatch.info("Training complete!")
+    accelerator.end_training()
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    env_vars = [
+        "OMP_NUM_THREADS", "HF_HOME", "TORCH_HOME", "HF_TOKEN",
+        "CUDA_VISIBLE_DEVICES", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+        "RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"
+    ]
+    for var in env_vars:
+        overwatch.info(f"{var}: {os.environ.get(var, 'Not Set')}")
+
+    overwatch.info("Parsing configuration...")
+    try:
+        module = import_module(f"src.config.train.{sys.argv[1]}")
+        DynamicLaunchConfigClass = getattr(module, "DynamicLaunchConfig")
+        from tyro import cli
+        config = cli(
+            DynamicLaunchConfigClass,
+            args=sys.argv[2:]
+        )
+    except Exception as e:
+        overwatch.error(f"Failed to import config module: {e}")
+        raise e
+
+    train(config)

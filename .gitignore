@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+outputs
+
+# Virtual environments
+.venv
+.runs
+.claude
+.sii
+
+# Project directories
+resource
+test
+Psi0
+humanoid everyday
+FastWAM
+last0
+starVLA
+Motus
+Mixture-of-Transformers
