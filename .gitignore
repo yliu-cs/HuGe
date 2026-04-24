@@ -23,3 +23,6 @@ last0
 starVLA
 Motus
 Mixture-of-Transformers
+
+# Log files
+*.log

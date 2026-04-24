@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Precompute SONIC latent tokens for all episodes and save as .npy files."""
 from __future__ import annotations
 
@@ -6,16 +5,18 @@ import argparse
 import os
 import sys
 
+os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
+
 import numpy as np
-import pandas as pd
+import polars as pl
 from tqdm import tqdm
 
 from src.tokenizer.sonic_encoder import SonicEncoder
 
 
-def load_episodes(data_root: str) -> dict[int, pd.DataFrame]:
+def load_episodes(data_root: str) -> dict[int, pl.DataFrame]:
     data_dir = os.path.join(data_root, "data")
-    episodes: dict[int, list[pd.DataFrame]] = {}
+    episodes: dict[int, list[pl.DataFrame]] = {}
     for chunk_dir in sorted(os.listdir(data_dir)):
         chunk_path = os.path.join(data_dir, chunk_dir)
         if not os.path.isdir(chunk_path):
@@ -23,30 +24,34 @@ def load_episodes(data_root: str) -> dict[int, pd.DataFrame]:
         for parquet_file in sorted(os.listdir(chunk_path)):
             if not parquet_file.endswith(".parquet"):
                 continue
-            df = pd.read_parquet(os.path.join(chunk_path, parquet_file))
-            for ep_idx, group in df.groupby("episode_index"):
-                episodes.setdefault(int(ep_idx), []).append(group)
+            df = pl.read_parquet(os.path.join(chunk_path, parquet_file))
+            for ep_idx_val, group in df.group_by("episode_index"):
+                episodes.setdefault(int(ep_idx_val[0]), []).append(group)
 
     merged = {}
     for ep_idx in sorted(episodes):
-        merged[ep_idx] = pd.concat(episodes[ep_idx], ignore_index=True)
+        merged[ep_idx] = pl.concat(episodes[ep_idx])
     return merged
 
 
-def encode_episode(encoder: SonicEncoder, df: pd.DataFrame) -> np.ndarray:
+def encode_episode(encoder: SonicEncoder, df: pl.DataFrame) -> np.ndarray:
     ep_len = len(df)
     jp = np.zeros((ep_len, 29), dtype=np.float64)
     oq = np.zeros((ep_len, 4), dtype=np.float32)
     ig = np.zeros((ep_len, 3), dtype=np.float32)
 
+    leg_col = df["observation.leg_joints"].to_list()
+    arm_col = df["observation.arm_joints"].to_list()
+    oq_col = df["observation.odometry.quat"].to_list()
+    ig_col = df["observation.imu.gyroscope"].to_list()
+
     for f in range(ep_len):
-        row = df.iloc[f]
-        leg = np.array(row["observation.leg_joints"], dtype=np.float64)
-        arm = np.array(row["observation.arm_joints"], dtype=np.float64)
+        leg = np.array(leg_col[f], dtype=np.float64)
+        arm = np.array(arm_col[f], dtype=np.float64)
         jp[f, :len(leg)] = leg
         jp[f, 15:15 + len(arm)] = arm
-        oq[f] = np.array(row["observation.odometry.quat"], dtype=np.float32)
-        ig[f] = np.array(row["observation.imu.gyroscope"], dtype=np.float32)
+        oq[f] = np.array(oq_col[f], dtype=np.float32)
+        ig[f] = np.array(ig_col[f], dtype=np.float32)
 
     return encoder.encode_episode(jp, oq, ig)
 

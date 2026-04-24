@@ -19,6 +19,7 @@ import torch.nn as nn
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset
 from transformers.optimization import get_scheduler
+from safetensors.torch import save_file as save_safetensors
 
 from src.utils import initialize_overwatch, snake_to_pascal
 overwatch = initialize_overwatch(__name__)
@@ -205,10 +206,19 @@ class Trainer(ABC):
         """Perform a single training step. Return (sync_gradients, losses_dict)."""
 
     def prepare(self, accelerator: Accelerator) -> DataLoader:
-        self.optimizer, self.lr_scheduler = accelerator.prepare(
-            self.optimizer, self.lr_scheduler
-        )
-        self.train_dataloader = accelerator.prepare(self.train_dataloader)
+        self.accelerator = accelerator
+
+        if accelerator.state.deepspeed_plugin is not None:
+            self.model, self.optimizer, self.lr_scheduler, self.train_dataloader = accelerator.prepare(
+                self.model, self.optimizer, self.lr_scheduler, self.train_dataloader
+            )
+        else:
+            self.optimizer, self.lr_scheduler = accelerator.prepare(
+                self.optimizer, self.lr_scheduler
+            )
+            self.train_dataloader = accelerator.prepare(self.train_dataloader)
+
+        overwatch.add_file_handler(self.project_dir)
 
         if self.cfg.train.overfit_single_batch:
             overwatch.warning("Overfitting a single batch.")
@@ -261,9 +271,16 @@ class Trainer(ABC):
         self.accelerator.save_state(ckpt_dir)
 
         if self.accelerator.is_main_process:
-            # Save model weights
             unwrapped_model = self.accelerator.unwrap_model(self.model)
-            torch.save(unwrapped_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            state_dict = {}
+            seen_ptrs: set[int] = set()
+            for k, v in unwrapped_model.state_dict().items():
+                ptr = v.data_ptr()
+                if ptr in seen_ptrs:
+                    v = v.clone()
+                seen_ptrs.add(ptr)
+                state_dict[k] = v.cpu()
+            save_safetensors(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
 
         self.accelerator.wait_for_everyone()
 

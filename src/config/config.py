@@ -61,6 +61,12 @@ class TrainConfig(BaseModel):
     sharding_strategy: str = "full-shard"
     enable_gradient_checkpointing: bool = True
 
+    use_deepspeed: bool = True
+    deepspeed_config: str | None = None
+    zero_stage: int = 2
+    offload_optimizer: bool = False
+    offload_param: bool = False
+
     max_training_steps: int | None = 100
     num_train_epochs: int | None = None
     warmup_steps: int | None = 0

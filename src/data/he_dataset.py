@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -30,7 +30,7 @@ class HEDataset(Dataset):
             )
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
-        self.task_map = {}
+        self.task_map: dict[int, str] = {}
         if os.path.exists(tasks_path):
             with open(tasks_path) as f:
                 for line in f:
@@ -40,38 +40,81 @@ class HEDataset(Dataset):
         with open(os.path.join(data_root, "meta", "info.json")) as f:
             self.info = json.load(f)
 
-        self._load_parquet_data()
+        self._load_data()
         self._token_cache: dict[int, np.ndarray] = {}
 
-    def _load_parquet_data(self):
+    def _collect_parquet_paths(self) -> list[str]:
         data_dir = os.path.join(self.data_root, "data")
-        dfs = []
+        paths = []
         for chunk_dir in sorted(os.listdir(data_dir)):
             chunk_path = os.path.join(data_dir, chunk_dir)
             if not os.path.isdir(chunk_path):
                 continue
-            for parquet_file in sorted(os.listdir(chunk_path)):
-                if not parquet_file.endswith(".parquet"):
-                    continue
-                df = pd.read_parquet(os.path.join(chunk_path, parquet_file))
-                dfs.append(df)
+            for fname in sorted(os.listdir(chunk_path)):
+                if fname.endswith(".parquet"):
+                    paths.append(os.path.join(chunk_path, fname))
+        return paths
 
-        self.df = pd.concat(dfs, ignore_index=True)
-        ep_col = self.df["episode_index"]
-        self.episode_ids = sorted(ep_col.unique().tolist())
+    def _load_data(self):
+        cache_path = os.path.join(self.data_root, "meta", "dataset_index.json")
 
+        if os.path.exists(cache_path):
+            self._load_from_cache(cache_path)
+        else:
+            self._build_and_cache(cache_path)
+
+    def _load_from_cache(self, cache_path: str):
+        with open(cache_path) as f:
+            cache = json.load(f)
+        self.episode_ids = cache["episode_ids"]
+        self.ep_slices = {int(k): tuple(v) for k, v in cache["ep_slices"].items()}
+        self.frame_indices = [tuple(x) for x in cache["frame_indices"]]
+        self._task_ids = cache["task_ids"]
+
+    def _build_and_cache(self, cache_path: str):
+        parquet_paths = self._collect_parquet_paths()
+
+        # Read all parquets with polars (parallel internally, much faster than pandas)
+        dfs = [pl.read_parquet(p, columns=["episode_index", "task_index"]) for p in parquet_paths]
+        df = pl.concat(dfs)
+        del dfs
+
+        # Build episode slices via groupby — handles non-contiguous episodes safely
+        self.episode_ids: list[int] = []
         self.ep_slices: dict[int, tuple[int, int]] = {}
-        for ep_idx in self.episode_ids:
-            mask = ep_col == ep_idx
-            indices = self.df.index[mask]
-            self.ep_slices[ep_idx] = (int(indices[0]), int(indices[-1]) + 1)
+        task_per_ep: dict[int, int] = {}
+        offset = 0
+        for ep_idx_val, group in df.group_by("episode_index", maintain_order=True):
+            ep_idx = int(ep_idx_val[0])
+            rows = group.height
+            self.episode_ids.append(ep_idx)
+            self.ep_slices[ep_idx] = (offset, offset + rows)
+            task_per_ep[ep_idx] = int(group["task_index"][0])
+            offset += rows
 
-        self.frame_indices = []
+        # Build flat frame index and per-frame task IDs
+        self.frame_indices: list[tuple[int, int, int]] = []
+        self._task_ids: list[int] = []
         for ep_idx in self.episode_ids:
             start, end = self.ep_slices[ep_idx]
             ep_len = end - start
+            task_id = task_per_ep[ep_idx]
             for f in range(ep_len):
                 self.frame_indices.append((ep_idx, ep_len, f))
+                self._task_ids.append(task_id)
+
+        # Persist cache
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(
+                {
+                    "episode_ids": self.episode_ids,
+                    "ep_slices": {str(k): list(v) for k, v in self.ep_slices.items()},
+                    "frame_indices": self.frame_indices,
+                    "task_ids": self._task_ids,
+                },
+                f,
+            )
 
     def _get_sonic_tokens(self, ep_idx: int) -> np.ndarray:
         if ep_idx in self._token_cache:
@@ -86,10 +129,8 @@ class HEDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ep_idx, ep_len, frame_id = self.frame_indices[idx]
-        ep_start = self.ep_slices[ep_idx][0]
-        row = self.df.iloc[ep_start + frame_id]
 
-        task_idx = int(row.get("task_index", 0))
+        task_idx = self._task_ids[idx]
         text = self.task_map.get(task_idx, "perform the task")
 
         video_path = os.path.join(

@@ -19,11 +19,11 @@ class DynamicLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        max_training_steps=100,
-        train_batch_size=1,
+        max_training_steps=10000,
+        train_batch_size=16,
         num_workers=0,
-        checkpointing_steps=50,
-        validation_steps=25,
+        checkpointing_steps=5000,
+        validation_steps=1000,
         mixed_precision="bf16",
         learning_rate=1e-5,
     )

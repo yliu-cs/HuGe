@@ -65,6 +65,18 @@ class DistributedOverwatch:
             logging.INFO if self._is_main_process else logging.ERROR
         )
 
+        self._file_handler = None
+
+    def add_file_handler(self, log_dir: str, filename: str = "train.log") -> None:
+        """Add a file handler to save logs to disk."""
+        if self._file_handler is not None:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        filepath = os.path.join(log_dir, filename)
+        self._file_handler = logging.FileHandler(filepath, mode="a", encoding="utf-8")
+        self._file_handler.setFormatter(logging.Formatter(RICH_FORMATTER, datefmt=DATEFMT))
+        self.logger.logger.addHandler(self._file_handler)
+
     @staticmethod
     def _identity_decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn
@@ -107,6 +119,18 @@ class PureOverwatch:
         self.error = self.logger.error
         self.critical = self.logger.critical
         self.logger.setLevel(logging.INFO)
+
+        self._file_handler = None
+
+    def add_file_handler(self, log_dir: str, filename: str = "train.log") -> None:
+        """Add a file handler to save logs to disk."""
+        if self._file_handler is not None:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        filepath = os.path.join(log_dir, filename)
+        self._file_handler = logging.FileHandler(filepath, mode="a", encoding="utf-8")
+        self._file_handler.setFormatter(logging.Formatter(RICH_FORMATTER, datefmt=DATEFMT))
+        self.logger.logger.addHandler(self._file_handler)
 
     @staticmethod
     def get_identity_ctx() -> Callable[..., Any]:

@@ -291,13 +291,14 @@ class KappaTrainer(Trainer):
         if self.accelerator.sync_gradients:
             if timer:
                 timer.start("optimizer")
-            if self.train_cfg.max_grad_norm is not None:
-                self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), self.train_cfg.max_grad_norm
-                )
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
+            if not hasattr(self.accelerator.state, "deepspeed_plugin") or self.accelerator.state.deepspeed_plugin is None:
+                if self.train_cfg.max_grad_norm is not None:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), self.train_cfg.max_grad_norm
+                    )
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
             if timer:
                 timer.stop("optimizer")
 

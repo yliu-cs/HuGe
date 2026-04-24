@@ -34,6 +34,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         emb = self.sinusoidal_embedding(t, self.freq_dim)
+        emb = emb.to(self.mlp[0].weight.dtype)
         return self.mlp(emb)
 
 

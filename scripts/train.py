@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Main training entry point."""
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from pathlib import Path
 import torch
 
 warnings.filterwarnings("ignore")
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import ProjectConfiguration
 from tqdm import tqdm
 from importlib import import_module
@@ -35,12 +34,31 @@ def _initialize_accelerator(trainer) -> Accelerator:
         project_dir=trainer.project_dir, logging_dir=logging_dir
     )
 
-    accelerator = Accelerator(
+    kwargs = dict(
         gradient_accumulation_steps=trainer.cfg.train.gradient_accumulation_steps,
         mixed_precision=trainer.cfg.train.mixed_precision,
         log_with=trainer.cfg.log.report_to,
         project_config=accelerator_project_config,
     )
+
+    train_cfg = trainer.cfg.train
+    if train_cfg.use_deepspeed:
+        if train_cfg.deepspeed_config:
+            ds_plugin = DeepSpeedPlugin(hf_ds_config=train_cfg.deepspeed_config)
+        else:
+            ds_plugin = DeepSpeedPlugin(
+                zero_stage=train_cfg.zero_stage,
+                gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
+                gradient_clipping=train_cfg.max_grad_norm or 0.0,
+                offload_optimizer_device="cpu" if train_cfg.offload_optimizer else "none",
+                offload_param_device="cpu" if train_cfg.offload_param else "none",
+                zero3_init_flag=(train_cfg.zero_stage == 3),
+                zero3_save_16bit_model=(train_cfg.zero_stage == 3),
+            )
+        kwargs["deepspeed_plugin"] = ds_plugin
+        overwatch.info(f"DeepSpeed enabled: ZeRO-{train_cfg.zero_stage}, offload_optimizer={train_cfg.offload_optimizer}, offload_param={train_cfg.offload_param}")
+
+    accelerator = Accelerator(**kwargs)
 
     if overwatch.is_rank_zero() and not trainer.cfg.eval:
         os.makedirs(trainer.project_dir, exist_ok=True)
@@ -66,6 +84,7 @@ def train(config):
     overwatch.info("Initializing models...")
     trainer.init_models()
     accelerator = _initialize_accelerator(trainer)
+    overwatch.add_file_handler(trainer.project_dir)
 
     overwatch.info(f"Training task: '{config.train.name}'")
     overwatch.info(f"Run name: {trainer.run_name}")
@@ -87,6 +106,9 @@ def train(config):
 
     overwatch.info(f"Accelerator working directory: {trainer.project_dir}")
     trainer.set_train()
+
+    metrics_path = os.path.join(trainer.project_dir, "metrics.jsonl")
+    metrics_file = open(metrics_path, "a", encoding="utf-8")
 
     profiling = config.log.enable_profiling
     timer = None
@@ -130,6 +152,10 @@ def train(config):
                     log_metrics.update(timer.summary())
 
                 trainer.log(log_metrics)
+
+                if overwatch.is_rank_zero():
+                    metrics_file.write(json.dumps({"step": global_step, **log_metrics}) + "\n")
+                    metrics_file.flush()
 
                 if (global_step + 1) % config.train.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
@@ -184,6 +210,7 @@ def train(config):
     accelerator.wait_for_everyone()
     trainer.finalize()
     progress_bar.close()
+    metrics_file.close()
 
     if timer and overwatch.is_rank_zero():
         overwatch.info("=== Profiling Summary ===")
@@ -197,6 +224,8 @@ def train(config):
 
 
 if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--local_rank")]
+
     env_vars = [
         "OMP_NUM_THREADS", "HF_HOME", "TORCH_HOME", "HF_TOKEN",
         "CUDA_VISIBLE_DEVICES", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
@@ -207,12 +236,12 @@ if __name__ == "__main__":
 
     overwatch.info("Parsing configuration...")
     try:
-        module = import_module(f"src.config.train.{sys.argv[1]}")
+        module = import_module(f"src.config.train.{args[0]}")
         DynamicLaunchConfigClass = getattr(module, "DynamicLaunchConfig")
         from tyro import cli
         config = cli(
             DynamicLaunchConfigClass,
-            args=sys.argv[2:]
+            args=args[1:]
         )
     except Exception as e:
         overwatch.error(f"Failed to import config module: {e}")
