@@ -206,7 +206,7 @@ class MoTKappaModel(nn.Module):
     Output: predicted velocity for denoising.
     """
 
-    def __init__(self, base_model, sonic_dim: int = 64, action_loss_weight: float = 1.0):
+    def __init__(self, base_model, sonic_dim: int = 66, action_loss_weight: float = 1.0):
         super().__init__()
         self.base_model = base_model
         self.sonic_dim = sonic_dim
@@ -330,9 +330,10 @@ class MoTKappaModel(nn.Module):
                 action_loss = (nn.functional.mse_loss(velocity_pred, target, reduction="none") * mask).sum() / (mask.sum() * self.sonic_dim).clamp(min=1)
             else:
                 action_loss = nn.functional.mse_loss(velocity_pred, target)
-        else:
-            action_loss = torch.tensor(0.0, device=velocity_pred.device)
+            return CausalLMOutputWithPast(loss=self.action_loss_weight * action_loss)
 
+        # Inference path: no target, return predicted velocity via `logits` slot.
         return CausalLMOutputWithPast(
-            loss=self.action_loss_weight * action_loss,
+            loss=torch.zeros((), device=velocity_pred.device),
+            logits=velocity_pred,
         )

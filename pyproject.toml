@@ -6,7 +6,6 @@ dependencies = [
     "accelerate>=1.13.0",
     "lerobot==0.3.3",
     "matplotlib>=3.10.8",
-    "onnxruntime>=1.18.0",
     "polars>=1.40.1",
     "pydantic>=2.13.3",
     "pymupdf>=1.27.2.2",
@@ -18,6 +17,8 @@ dependencies = [
     "transformers>=5.5.4",
     "tyro>=1.0.13",
     "deepspeed>=0.16.0",
+    "onnxruntime-gpu>=1.25.0",
+    "mujoco>=3.7.0",
 ]
 
 [build-system]

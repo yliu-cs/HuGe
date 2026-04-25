@@ -18,15 +18,22 @@ class HEDataset(Dataset):
         data_root: str,
         action_chunk_size: int = 10,
         split: str = "train",
+        cache_root: str | None = None,
     ):
         self.data_root = data_root
         self.action_chunk_size = action_chunk_size
+        # cache_root holds outputs that the read-only HF dataset mount can't host
+        # (sonic tokens, dataset index, hand threshold). Auto-fall back to a parallel
+        # "<data_root>-cache" dir when data_root itself isn't writable.
+        if cache_root is None:
+            cache_root = data_root if os.access(data_root, os.W_OK) else f"{data_root}-cache"
+        self.cache_root = cache_root
 
-        self.sonic_tokens_dir = os.path.join(data_root, "sonic_tokens")
+        self.sonic_tokens_dir = os.path.join(self.cache_root, "sonic_tokens")
         if not os.path.isdir(self.sonic_tokens_dir):
             raise FileNotFoundError(
                 f"Precomputed sonic tokens not found at {self.sonic_tokens_dir}. "
-                "Run `python scripts/precompute_sonic_tokens.py` first."
+                "Run `python scripts/calc_sonic_tokens.py` first."
             )
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
@@ -56,7 +63,7 @@ class HEDataset(Dataset):
         return paths
 
     def _load_data(self):
-        cache_path = os.path.join(self.data_root, "meta", "dataset_index.json")
+        cache_path = os.path.join(self.cache_root, "meta", "dataset_index.json")
 
         if os.path.exists(cache_path):
             self._load_from_cache(cache_path)

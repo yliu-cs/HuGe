@@ -68,7 +68,7 @@ class KappaModelWrapper(nn.Module):
         if device is not None:
             self.model = self.model.to(device)
 
-    def convert_to_mot(self, sonic_dim: int = 64, action_loss_weight: float = 1.0):
+    def convert_to_mot(self, sonic_dim: int = 66, action_loss_weight: float = 1.0):
         from src.models.mot_kappa import MoTKappaModel
         overwatch.info("Converting to MoT architecture...")
         device = next(self.model.parameters()).device

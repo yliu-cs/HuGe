@@ -24,5 +24,7 @@ starVLA
 Motus
 Mixture-of-Transformers
 
-# Log files
+# Others
 *.log
+kappa_eval_video
+kappa_eval_tokens.npy

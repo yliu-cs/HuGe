@@ -9,6 +9,8 @@ uv sync
 uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 
 mkdir -p resource/dataset
+wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
+./hfd.sh USC-PSI-Lab/humanoid-everyday --dataset
 mkdir -p resource/model
 cd resource/model
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
@@ -22,7 +24,8 @@ mkdir -p sonic
 ## 🚀 Training
 
 ```
-uv run python scripts/calc_sonic_tokens.py
+uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
+uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py
 
 tmux new -s pretrain_kappa -d "./scripts/train/pretrain_kappa.sh 2>&1 | tee pretrain_kappa.log"
 ```

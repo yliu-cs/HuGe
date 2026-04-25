@@ -93,6 +93,7 @@ class DataConfig(BaseModel):
 
 class HEDataConfig(DataConfig):
     data_root: str = "resource/dataset/humanoid-everyday"
+    cache_root: str | None = None  # auto-resolved at runtime to writable parallel dir
     action_chunk_size: int = 10
 
 

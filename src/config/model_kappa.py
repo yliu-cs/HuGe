@@ -29,7 +29,8 @@ class KappaModelConfig(ModelConfig):
     lora: bool = False
 
     use_mot: bool = True
-    sonic_dim: int = 64
+    # 64 SONIC latent + 2 hand-binary bits (left/right open/close)
+    sonic_dim: int = 66
     action_chunk_size: int = 10
     action_loss_weight: float = 1.0
 

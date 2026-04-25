@@ -218,6 +218,7 @@ class KappaTrainer(Trainer):
             data_root=data_cfg.data_root,
             action_chunk_size=data_cfg.action_chunk_size,
             split="train",
+            cache_root=getattr(data_cfg, "cache_root", None),
         )
         self.val_dataset = None
         self.len_train_dataset = len(self.train_dataset)
