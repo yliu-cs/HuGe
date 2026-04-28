@@ -37,7 +37,7 @@ class HEDataset(Dataset):
     def __init__(
         self,
         data_root: str,
-        action_chunk_size: int = 10,
+        action_chunk_size: int = 50,
         split: str = "train",
         cache_root: str | None = None,
     ):
@@ -54,7 +54,7 @@ class HEDataset(Dataset):
         if not os.path.isdir(self.sonic_tokens_dir):
             raise FileNotFoundError(
                 f"Precomputed sonic tokens not found at {self.sonic_tokens_dir}. "
-                "Run `python scripts/calc_sonic_tokens.py` first."
+                "Run `python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py` first."
             )
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
@@ -85,9 +85,11 @@ class HEDataset(Dataset):
     def _load_data(self):
         # Index is stored as packed ``int32`` ndarrays in an .npz: at ~2e8
         # frames the prior list-of-tuples layout was ~5 GB Python objects
-        # and slow to fork into workers. Four parallel arrays keep the same
-        # info under ~3 GB and give O(1) integer access in __getitem__.
-        cache_path = os.path.join(self.cache_root, "meta", "dataset_index.npz")
+        # and slow to fork into workers. The arrays keep the same info
+        # under ~3 GB and give O(1) integer access in __getitem__.
+        # ``_50hz`` suffix bumps the cache so old 30 Hz indices don't get
+        # reused after the calc_sonic_tokens.py upsampling change.
+        cache_path = os.path.join(self.cache_root, "meta", "dataset_index_50hz.npz")
 
         if os.path.exists(cache_path):
             self._load_from_cache(cache_path)
@@ -97,7 +99,8 @@ class HEDataset(Dataset):
     def _load_from_cache(self, cache_path: str):
         with np.load(cache_path) as cache:
             self._frame_ep = cache["frame_ep"].astype(np.int32, copy=False)
-            self._frame_ep_len = cache["frame_ep_len"].astype(np.int32, copy=False)
+            self._frame_ep_tok_len = cache["frame_ep_tok_len"].astype(np.int32, copy=False)
+            self._frame_ep_vid_len = cache["frame_ep_vid_len"].astype(np.int32, copy=False)
             self._frame_local = cache["frame_local"].astype(np.int32, copy=False)
             self._frame_task = cache["frame_task"].astype(np.int32, copy=False)
 
@@ -109,33 +112,45 @@ class HEDataset(Dataset):
         df = pl.concat(dfs)
         del dfs
 
-        # Build per-episode (length, task) via groupby — handles non-contiguous
-        # episodes safely. We discard the global row offset (no longer used).
+        # Build per-episode (vid_len, tok_len, task) via groupby — handles
+        # non-contiguous episodes safely. ``vid_len`` is the parquet/video row
+        # count (30 Hz native); ``tok_len`` is the SONIC token row count, which
+        # is 50 Hz after calc_sonic_tokens.py's upsampling. The flat index is
+        # expanded along the token axis so ``frame_local`` is the 50 Hz time
+        # step, matching EgoDexDataset.
         ep_ids: list[int] = []
-        ep_lens: list[int] = []
+        ep_vid_lens: list[int] = []
+        ep_tok_lens: list[int] = []
         ep_tasks: list[int] = []
         for ep_idx_val, group in df.group_by("episode_index", maintain_order=True):
-            ep_ids.append(int(ep_idx_val[0]))
-            ep_lens.append(group.height)
+            ep_id = int(ep_idx_val[0])
+            npy_path = os.path.join(self.sonic_tokens_dir, f"episode_{ep_id:06d}.npy")
+            tok_len = int(np.load(npy_path, mmap_mode="r").shape[0])
+            ep_ids.append(ep_id)
+            ep_vid_lens.append(group.height)
+            ep_tok_lens.append(tok_len)
             ep_tasks.append(int(group["task_index"][0]))
 
-        total = sum(ep_lens)
+        total = sum(ep_tok_lens)
         frame_ep = np.empty(total, dtype=np.int32)
-        frame_ep_len = np.empty(total, dtype=np.int32)
+        frame_ep_tok_len = np.empty(total, dtype=np.int32)
+        frame_ep_vid_len = np.empty(total, dtype=np.int32)
         frame_local = np.empty(total, dtype=np.int32)
         frame_task = np.empty(total, dtype=np.int32)
 
         cur = 0
-        for ep_id, ep_len, task in zip(ep_ids, ep_lens, ep_tasks):
-            sl = slice(cur, cur + ep_len)
+        for ep_id, vid_len, tok_len, task in zip(ep_ids, ep_vid_lens, ep_tok_lens, ep_tasks):
+            sl = slice(cur, cur + tok_len)
             frame_ep[sl] = ep_id
-            frame_ep_len[sl] = ep_len
-            frame_local[sl] = np.arange(ep_len, dtype=np.int32)
+            frame_ep_tok_len[sl] = tok_len
+            frame_ep_vid_len[sl] = vid_len
+            frame_local[sl] = np.arange(tok_len, dtype=np.int32)
             frame_task[sl] = task
-            cur += ep_len
+            cur += tok_len
 
         self._frame_ep = frame_ep
-        self._frame_ep_len = frame_ep_len
+        self._frame_ep_tok_len = frame_ep_tok_len
+        self._frame_ep_vid_len = frame_ep_vid_len
         self._frame_local = frame_local
         self._frame_task = frame_task
 
@@ -144,7 +159,8 @@ class HEDataset(Dataset):
         np.savez(
             tmp_path,
             frame_ep=frame_ep,
-            frame_ep_len=frame_ep_len,
+            frame_ep_tok_len=frame_ep_tok_len,
+            frame_ep_vid_len=frame_ep_vid_len,
             frame_local=frame_local,
             frame_task=frame_task,
         )
@@ -169,12 +185,13 @@ class HEDataset(Dataset):
 
         ``_load_data`` builds the flat index so each episode occupies a
         contiguous block in row order, so spans fall out of "where does
-        ``frame_local == 0``". O(N) over the index, no parquet re-reads.
+        ``frame_local == 0``". Lengths are in 50 Hz token rows, matching
+        ``EgoDexDataset.episode_spans``.
         """
         starts = np.flatnonzero(self._frame_local == 0).astype(np.int64, copy=False)
         if starts.size == 0:
             return np.zeros((0, 2), dtype=np.int64)
-        lengths = self._frame_ep_len[starts].astype(np.int64, copy=False)
+        lengths = self._frame_ep_tok_len[starts].astype(np.int64, copy=False)
         out = np.empty((starts.size, 2), dtype=np.int64)
         out[:, 0] = starts
         out[:, 1] = lengths
@@ -182,11 +199,16 @@ class HEDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ep_idx = int(self._frame_ep[idx])
-        ep_len = int(self._frame_ep_len[idx])
-        frame_id = int(self._frame_local[idx])
+        tok_len = int(self._frame_ep_tok_len[idx])
+        vid_len = int(self._frame_ep_vid_len[idx])
+        t = int(self._frame_local[idx])  # 50 Hz token index
         task_idx = int(self._frame_task[idx])
         text = self.task_map.get(task_idx, "perform the task")
 
+        # Map 50 Hz token index to 30 Hz video frame using the per-episode
+        # actual ratio rather than a fixed 30/50, so off-by-one rounding from
+        # the resampler stays in sync with the encoded token count.
+        frame_id = min(int(t * vid_len / max(tok_len, 1)), max(vid_len - 1, 0))
         video_path = os.path.join(
             self.data_root,
             f"videos/chunk-{ep_idx // 1000:03d}/egocentric/episode_{ep_idx:06d}.mp4",
@@ -194,10 +216,10 @@ class HEDataset(Dataset):
         pil_image = self._decode_frame(video_path, frame_id)
 
         sonic_all = self._get_sonic_tokens(ep_idx)
-        chunk_indices = [min(frame_id + t, ep_len - 1) for t in range(self.action_chunk_size)]
+        chunk_indices = [min(t + k, tok_len - 1) for k in range(self.action_chunk_size)]
         sonic_tokens = sonic_all[chunk_indices]
         sonic_mask = np.array(
-            [1.0 if frame_id + t < ep_len else 0.0 for t in range(self.action_chunk_size)],
+            [1.0 if t + k < tok_len else 0.0 for k in range(self.action_chunk_size)],
             dtype=np.float32,
         )
 

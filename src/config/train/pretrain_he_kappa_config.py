@@ -32,14 +32,15 @@ class DynamicLaunchConfig(LaunchConfig):
     train: TrainConfig = TrainConfig(
         name="kappa",
         max_training_steps=1000000,
-        train_batch_size=64,
+        train_batch_size=96,
         gradient_accumulation_steps=1,
         num_workers=12,
         # HE has GOP=250 H.264 — random seek is the dominant data cost
         # (66 ms/seek measured). Block-shuffling to 1 batch ≈ 1 episode
         # converts these into next-frame decodes (~22× per-sample speedup).
-        # HE is 30 Hz video / 30 Hz tokens so frame_cache hit rate is 0;
-        # leaving size=2 still has negligible cost.
+        # Tokens are 50 Hz, video stays at 30 Hz; consecutive token rows
+        # land on the same video frame ~40% of the time, so frame_cache_size=2
+        # gives a real (small) hit rate.
         block_shuffle_size=64,
         frame_cache_size=2,
         checkpointing_steps=10000,

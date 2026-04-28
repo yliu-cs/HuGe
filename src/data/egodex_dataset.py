@@ -64,7 +64,7 @@ class EgoDexDataset(Dataset):
     def __init__(
         self,
         data_root: str,
-        action_chunk_size: int = 10,
+        action_chunk_size: int = 50,
         split: str = "train",
         cache_root: str | None = None,
         sonic_dim: int = 66,

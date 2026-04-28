@@ -75,11 +75,14 @@ def _build_encoder_batch(
     joint_pos_mujoco: np.ndarray,
     odom_quat_wxyz: np.ndarray,
     imu_gyro: np.ndarray,
+    fps: float,
 ) -> np.ndarray:
     n = len(joint_pos_mujoco)
     jp = joint_pos_mujoco.astype(np.float64, copy=False)
     jv = np.zeros_like(jp)
-    jv[1:] = (jp[1:] - jp[:-1]) * 30.0
+    # rad/sample × fps = rad/s; pass the actual sample rate of jp so velocity
+    # stays physically meaningful regardless of upstream resampling.
+    jv[1:] = (jp[1:] - jp[:-1]) * fps
 
     jp_isaac = jp[:, MUJOCO_TO_ISAACLAB].astype(np.float32)
     jv_isaac = jv[:, MUJOCO_TO_ISAACLAB].astype(np.float32)
@@ -190,8 +193,9 @@ class SonicEncoder:
         imu_gyro: np.ndarray,
         hand_joints: np.ndarray,
         hand_thresholds: HandThresholds,
+        fps: float,
     ) -> np.ndarray:
-        obs = _build_encoder_batch(joint_pos_mujoco, odom_quat, imu_gyro)
+        obs = _build_encoder_batch(joint_pos_mujoco, odom_quat, imu_gyro, fps)
         n = len(obs)
         if hand_joints.shape[0] != n:
             raise ValueError(

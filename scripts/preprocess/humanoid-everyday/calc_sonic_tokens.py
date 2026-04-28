@@ -54,6 +54,47 @@ def load_episode_arrays(parquet_path: str):
     return jp, oq, ig, hj
 
 
+def _resample_linear(arr, n_src: int, n_tgt: int):
+    """Linear interpolation along axis=0 from length n_src to n_tgt. Preserves dtype."""
+    import numpy as np
+
+    if n_tgt == n_src:
+        return arr
+    if n_src == 1:
+        return np.repeat(arr, n_tgt, axis=0)
+    pos = np.linspace(0.0, n_src - 1, n_tgt)
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.minimum(lo + 1, n_src - 1)
+    frac = (pos - lo).reshape((n_tgt,) + (1,) * (arr.ndim - 1))
+    out = (1.0 - frac) * arr[lo] + frac * arr[hi]
+    return out.astype(arr.dtype, copy=False)
+
+
+def _resample_quat_wxyz(q, n_src: int, n_tgt: int):
+    """Linear interpolation of WXYZ unit quaternions with sign canonicalization
+    + L2 renormalization. SLERP would be exact, but at 30→50 Hz the per-step
+    rotation is small (<<1 rad), so canonicalized lerp + renorm is within rounding.
+    """
+    import numpy as np
+
+    if n_tgt == n_src:
+        return q
+    # Canonicalize: flip signs so consecutive quats have nonneg dot — avoids
+    # lerp taking the long way around the hypersphere.
+    q = q.astype(np.float64, copy=True)
+    if n_src > 1:
+        dots = np.sum(q[1:] * q[:-1], axis=-1)
+        flips = np.cumprod(np.where(dots < 0.0, -1.0, 1.0))
+        q[1:] *= flips[:, None]
+    out = _resample_linear(q, n_src, n_tgt)
+    norms = np.linalg.norm(out, axis=-1, keepdims=True)
+    safe = norms >= 1e-10
+    normalized = np.divide(out, norms, out=np.zeros_like(out), where=safe)
+    identity = np.array([1.0, 0.0, 0.0, 0.0])
+    out = np.where(safe, normalized, identity)
+    return out.astype(np.float32, copy=False)
+
+
 def worker_main(
     gpu_id: int | None,
     work_q: mp.Queue,
@@ -61,6 +102,8 @@ def worker_main(
     encoder_path: str,
     out_dir: str,
     hand_thresholds: tuple[float, float, float, float],
+    source_fps: float,
+    target_fps: float,
 ) -> None:
     os.environ.setdefault("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -84,7 +127,14 @@ def worker_main(
         ep_idx, parquet_path = item
         try:
             jp, oq, ig, hj = load_episode_arrays(parquet_path)
-            tokens = encoder.encode_episode(jp, oq, ig, hj, hand_thresholds)
+            n_src = jp.shape[0]
+            n_tgt = max(1, int(round(n_src * target_fps / source_fps)))
+            if n_tgt != n_src:
+                jp = _resample_linear(jp, n_src, n_tgt)
+                oq = _resample_quat_wxyz(oq, n_src, n_tgt)
+                ig = _resample_linear(ig, n_src, n_tgt)
+                hj = _resample_linear(hj, n_src, n_tgt)
+            tokens = encoder.encode_episode(jp, oq, ig, hj, hand_thresholds, fps=target_fps)
             final = os.path.join(out_dir, f"episode_{ep_idx:06d}.npy")
             tmp = final + ".tmp.npy"
             np.save(tmp, tokens)
@@ -115,8 +165,19 @@ def main() -> None:
         "--log-failures", default=None,
         help="Path to write failed episode indices + tracebacks (default: <out_dir>/failed_episodes.log).",
     )
+    parser.add_argument(
+        "--source-fps", type=float, default=None,
+        help="Native sample rate of the parquet rows. Default: read from "
+             "<data-root>/meta/info.json:fps.",
+    )
+    parser.add_argument(
+        "--target-fps", type=float, default=50.0,
+        help="Resample inputs to this rate before encoding so output tokens land on "
+             "a 50 Hz timeline (matching EgoDex). Default 50.",
+    )
     args = parser.parse_args()
 
+    import json
     import torch
     from tqdm import tqdm
     from src.tokenizer.sonic_encoder import load_hand_thresholds
@@ -124,6 +185,20 @@ def main() -> None:
     cache_root = args.cache_root
     if cache_root is None:
         cache_root = args.data_root if os.access(args.data_root, os.W_OK) else f"{args.data_root}-cache"
+
+    source_fps = args.source_fps
+    if source_fps is None:
+        info_path = os.path.join(args.data_root, "meta", "info.json")
+        try:
+            with open(info_path) as f:
+                source_fps = float(json.load(f)["fps"])
+        except (FileNotFoundError, KeyError, ValueError) as e:
+            raise SystemExit(
+                f"Could not read fps from {info_path}: {e}. Pass --source-fps explicitly."
+            )
+    target_fps = float(args.target_fps)
+    if source_fps <= 0 or target_fps <= 0:
+        raise SystemExit(f"fps must be positive, got source={source_fps} target={target_fps}")
 
     threshold_path = os.path.join(cache_root, "meta", "hand_threshold.json")
     if not os.path.exists(threshold_path):
@@ -137,6 +212,12 @@ def main() -> None:
         f"left=({hand_thresholds[0]:.4f}, {hand_thresholds[1]:.4f}), "
         f"right=({hand_thresholds[2]:.4f}, {hand_thresholds[3]:.4f}) [low, high]"
     )
+    if target_fps != source_fps:
+        print(
+            f"Resampling {source_fps:g} Hz -> {target_fps:g} Hz before encoding. "
+            f"Skip-if-exists is keyed by filename only -- if sonic_tokens/ already "
+            f"holds tokens from a different rate, clear it first."
+        )
 
     encoder_path = os.path.join(args.sonic_model_dir, "model_encoder.onnx")
     out_dir = os.path.join(cache_root, "sonic_tokens")
@@ -181,7 +262,7 @@ def main() -> None:
         gpu = gpu_ids[w % len(gpu_ids)]
         p = ctx.Process(
             target=worker_main,
-            args=(gpu, work_q, result_q, encoder_path, out_dir, hand_thresholds),
+            args=(gpu, work_q, result_q, encoder_path, out_dir, hand_thresholds, source_fps, target_fps),
             daemon=False,
         )
         p.start()

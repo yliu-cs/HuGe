@@ -270,12 +270,25 @@ class KappaTrainer(Trainer):
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
+            else:
+                # DeepSpeed engine.step() (run inside accelerator.backward())
+                # handles optimizer.step + grad clip + zero_grad, but only
+                # advances the LR scheduler if it's in DeepSpeed's
+                # VALID_LR_SCHEDULES — our HF cosine LambdaLR isn't, so
+                # accelerate's `DeepSpeedSchedulerWrapper.step()` is a no-op
+                # and engine.lr_scheduler is None. Step the inner LambdaLR
+                # ourselves; loop world_size times to match
+                # AcceleratedScheduler's non-DS path (which compensates for
+                # the world_size-pre-scaling in `Trainer.create_scheduler`).
+                inner_scheduler = self.lr_scheduler.scheduler
+                for _ in range(self.world_size):
+                    inner_scheduler.step()
             if timer:
                 timer.stop("optimizer")
 
         return self.accelerator.sync_gradients, {
             "loss": loss.item(),
-            "lr": self.lr_scheduler.get_last_lr()[0],
+            "lr": self.lr,
         }
 
     def create_optimizer(self):

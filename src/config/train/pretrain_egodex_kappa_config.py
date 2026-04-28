@@ -49,7 +49,7 @@ class DynamicLaunchConfig(LaunchConfig):
     train: TrainConfig = TrainConfig(
         name="kappa",
         num_train_epochs=1,
-        train_batch_size=64,
+        train_batch_size=96,
         gradient_accumulation_steps=1,
         num_workers=8,
         prefetch_factor=2,
