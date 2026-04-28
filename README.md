@@ -11,6 +11,7 @@ uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 mkdir -p resource/dataset
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
 ./hfd.sh USC-PSI-Lab/humanoid-everyday --dataset
+# Download EgoDex from [ml-egodex](https://github.com/apple/ml-egodex) to "resource/dataset/EgoDex"
 mkdir -p resource/model
 cd resource/model
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
@@ -24,10 +25,14 @@ mkdir -p sonic
 ## 🚀 Training
 
 ```
-uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
-uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py
+# Stage 1-1: Pre-Train on EgoDex
+uv run python scripts/preprocess/egodex/build_index.py
+tmux new -s pretrain_egodex -d "./scripts/train/pretrain_kappa.sh --stage egodex 2>&1 | tee pretrain_egodex.log"
 
-tmux new -s pretrain_kappa -d "./scripts/train/pretrain_kappa.sh 2>&1 | tee pretrain_kappa.log"
+# Stage 1-2: Pre-Train on Humanoid-Everyday
+uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
+tmux new -s calc_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
+tmux new -s pretrain_he -d "./scripts/train/pretrain_kappa.sh --stage he --train.pretrained-weights .runs/kappa/<egodex-run>"
 ```
 
 ## ❤️ Acknowledgment

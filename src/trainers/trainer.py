@@ -127,9 +127,17 @@ class Trainer(ABC):
 
     @property
     def max_training_steps(self) -> int:
-        if self.cfg.train.max_training_steps is not None:
-            return self.cfg.train.max_training_steps
-        return self.num_steps_per_epoch * self.world_size * self.cfg.train.num_train_epochs
+        # Treat 0 the same as None ("not set") so configs can opt into the
+        # epoch-based path by setting only `num_train_epochs`. The validator
+        # already enforces mutual exclusion.
+        steps = self.cfg.train.max_training_steps
+        if steps is not None and steps > 0:
+            return steps
+        # `num_steps_per_epoch` is already per-rank optimizer steps:
+        # `len_train_dataloader` divides the dataset by `world_size`, so
+        # multiplying by `world_size` here would inflate total training by
+        # that factor (8× on 8 GPUs).
+        return self.num_steps_per_epoch * self.cfg.train.num_train_epochs
 
     @property
     def num_warmup_steps(self) -> int:
@@ -167,7 +175,7 @@ class Trainer(ABC):
         """Create training and validation dataloaders."""
 
     def create_optimizer(self):
-        optimizer_kwargs = dict(self.cfg.train.lr_scheduler_kwargs)
+        optimizer_kwargs = dict(self.cfg.train.optimizer_kwargs)
         if self.cfg.train.optimizer_foreach is not None:
             optimizer_kwargs["foreach"] = self.cfg.train.optimizer_foreach
         self.optimizer = torch.optim.AdamW(
@@ -237,6 +245,67 @@ class Trainer(ABC):
 
         self.accelerator = accelerator
         return self.train_dataloader
+
+    def load_pretrained_weights(self) -> Optional[str]:
+        """Load weights only (no optimizer/scheduler/step state) for two-stage training.
+
+        Resolves ``train.pretrained_weights`` to a ``model.safetensors`` file:
+        accepts a direct file path, a ``ckpt_*`` directory, or a run directory
+        (in which case the latest ``ckpt_*`` is selected). Must be called after
+        ``init_models()`` and before ``prepare()`` so the unwrapped HF model is
+        addressable on every rank.
+        """
+        path_str = self.train_cfg.pretrained_weights
+        if path_str is None:
+            return None
+
+        from pathlib import Path
+        from safetensors.torch import load_file
+
+        p = Path(path_str)
+        if p.is_file():
+            weights_file = p
+        elif p.is_dir():
+            if (p / "model.safetensors").is_file():
+                weights_file = p / "model.safetensors"
+            elif (p / "checkpoints").is_dir():
+                ckpt_dirs = [
+                    d for d in (p / "checkpoints").iterdir()
+                    if d.is_dir() and d.name.startswith("ckpt_")
+                ]
+                if not ckpt_dirs:
+                    raise FileNotFoundError(f"No ckpt_* dirs under {p / 'checkpoints'}")
+                ckpt_dirs.sort(key=lambda d: int(d.name.split("_")[1]))
+                weights_file = ckpt_dirs[-1] / "model.safetensors"
+                if not weights_file.is_file():
+                    raise FileNotFoundError(f"Expected {weights_file} to exist")
+            else:
+                raise FileNotFoundError(
+                    f"Cannot resolve pretrained_weights from directory {p}: "
+                    "expected model.safetensors or checkpoints/ckpt_*/"
+                )
+        else:
+            raise FileNotFoundError(f"pretrained_weights path does not exist: {p}")
+
+        overwatch.info(f"Loading pretrained weights from {weights_file}")
+        state_dict = load_file(str(weights_file))
+        result = self.model.load_state_dict(state_dict, strict=False)
+
+        n_loaded = len(state_dict) - len(result.unexpected_keys)
+        msg = (
+            f"Loaded {n_loaded}/{len(state_dict)} tensors; "
+            f"{len(result.missing_keys)} missing, {len(result.unexpected_keys)} unexpected"
+        )
+        if result.missing_keys or result.unexpected_keys:
+            overwatch.warning(msg)
+            if result.missing_keys:
+                overwatch.warning(f"  First missing keys: {result.missing_keys[:5]}")
+            if result.unexpected_keys:
+                overwatch.warning(f"  First unexpected keys: {result.unexpected_keys[:5]}")
+        else:
+            overwatch.info(msg)
+
+        return str(weights_file)
 
     def resume_from_checkpoint(self) -> tuple[int, Optional[str]]:
         if self.cfg.train.resume_from_checkpoint is None:

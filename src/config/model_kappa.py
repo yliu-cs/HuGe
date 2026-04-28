@@ -18,8 +18,7 @@ class KappaModelConfig(ModelConfig):
     weight_decay: float = 0.01
     gradient_checkpointing: bool = True
 
-    mm_projector_lr: float = 1e-5
-    vision_tower_lr: float = 1e-6
+    mm_projector_lr: float = 5e-5
 
     model_max_length: int = 8192
 
@@ -31,7 +30,7 @@ class KappaModelConfig(ModelConfig):
     use_mot: bool = True
     # 64 SONIC latent + 2 hand-binary bits (left/right open/close)
     sonic_dim: int = 66
-    action_chunk_size: int = 10
+    action_chunk_size: int = 50
     action_loss_weight: float = 1.0
 
     num_inference_steps: int = 10

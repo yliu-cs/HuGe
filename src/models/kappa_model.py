@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional, Any, Union
 import torch
 import torch.nn as nn
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, Qwen2TokenizerFast
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from src.utils import initialize_overwatch
 overwatch = initialize_overwatch(__name__)
@@ -29,21 +29,41 @@ class KappaModelWrapper(nn.Module):
 
         load_dtype = torch.float32 if (device is not None and device.type == "mps") else torch.bfloat16
 
-        try:
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_name_or_path,
-                attn_implementation="sdpa",
-                torch_dtype=load_dtype,
-                local_files_only=True,
-            )
-            overwatch.info(f"Loaded backbone from {model_name_or_path}")
-        except Exception as e:
-            overwatch.warning(f"Failed to load with sdpa, trying without: {e}")
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_name_or_path,
-                torch_dtype=load_dtype,
-                local_files_only=True,
-            )
+        # Prefer flash-attn-2 for the vision tower and any non-MoT call path
+        # (it is much faster than SDPA on the patch grid). MoTAttention forces
+        # SDPA internally because its 4D float mask is not flash-attn-2
+        # compatible. flash-attn-2 requires CUDA + bf16/fp16; fall back to
+        # SDPA on CPU/MPS or when the kernel isn't available.
+        prefer_fa2 = (
+            torch.cuda.is_available()
+            and load_dtype in (torch.bfloat16, torch.float16)
+        )
+        attn_impls = (
+            ["flash_attention_2", "sdpa", None] if prefer_fa2 else ["sdpa", None]
+        )
+
+        last_err: Exception | None = None
+        self.model = None
+        for impl in attn_impls:
+            try:
+                kwargs = dict(torch_dtype=load_dtype, local_files_only=True)
+                if impl is not None:
+                    kwargs["attn_implementation"] = impl
+                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_name_or_path, **kwargs
+                )
+                overwatch.info(
+                    f"Loaded backbone from {model_name_or_path} "
+                    f"(attn_implementation={impl or 'default'})"
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                overwatch.warning(
+                    f"Failed to load with attn_implementation={impl}: {e}"
+                )
+        if self.model is None:
+            raise RuntimeError("Failed to load backbone with any attn impl") from last_err
 
         if not hasattr(self.model.config, "hidden_size"):
             self.model.config.hidden_size = self.model.config.text_config.hidden_size

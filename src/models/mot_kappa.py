@@ -84,16 +84,18 @@ class MoTAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
-        latent_indexes: Optional[torch.Tensor] = None,
-        action_indexes: Optional[torch.Tensor] = None,
+        n_latent: Optional[int] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # ``n_latent`` is the count of language/vision tokens; action tokens
+        # are the contiguous tail. Caller guarantees this layout, so we slice
+        # directly instead of fancy-indexing through arange tensors.
         attn = self.original
         input_shape = hidden_states.shape[:-1]
         hidden_shape_fn = lambda x: (*x.shape[:-1], -1, attn.head_dim)
 
-        latent_h = hidden_states[:, latent_indexes]
-        action_h = hidden_states[:, action_indexes]
+        latent_h = hidden_states[:, :n_latent]
+        action_h = hidden_states[:, n_latent:]
 
         q_latent = attn.q_norm(attn.q_proj(latent_h).view(hidden_shape_fn(latent_h)))
         k_latent = attn.k_norm(attn.k_proj(latent_h).view(hidden_shape_fn(latent_h)))
@@ -113,8 +115,13 @@ class MoTAttention(nn.Module):
 
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         from transformers.models.qwen3_vl.modeling_qwen3_vl import eager_attention_forward
+        # Force SDPA: the action expert relies on a 4D float attention mask
+        # (bidirectional among action tokens, causal among text), which
+        # flash-attn-2 does not support. The vision tower / non-MoT paths
+        # still use whatever ``_attn_implementation`` the model was loaded
+        # with (typically flash_attention_2).
         attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            attn.config._attn_implementation, eager_attention_forward
+            "sdpa", eager_attention_forward
         )
 
         attn_output, attn_weights = attention_interface(
@@ -129,12 +136,9 @@ class MoTAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        n_latent = latent_indexes.shape[0]
         latent_out = attn.o_proj(attn_output[:, :n_latent])
         action_out = self.o_proj_action(attn_output[:, n_latent:])
-        output = torch.cat([latent_out, action_out], dim=1)
-
-        return output, attn_weights
+        return torch.cat([latent_out, action_out], dim=1), attn_weights
 
 
 class MoTDecoderLayer(nn.Module):
@@ -159,14 +163,17 @@ class MoTDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
-        latent_indexes: Optional[torch.Tensor] = None,
-        action_indexes: Optional[torch.Tensor] = None,
+        n_latent: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # latent | action are kept contiguous along dim=1, so we slice
+        # directly. The previous ``empty_like + index_put_`` reorder was a
+        # no-op (the indexes were ``arange``s) and burned an allocation per
+        # layer × 28 layers per step.
         residual = hidden_states
 
-        latent_h = hidden_states[:, latent_indexes]
-        action_h = hidden_states[:, action_indexes]
+        latent_h = hidden_states[:, :n_latent]
+        action_h = hidden_states[:, n_latent:]
         normed = torch.cat([
             self.input_layernorm(latent_h),
             self.input_layernorm_action(action_h),
@@ -176,25 +183,17 @@ class MoTDecoderLayer(nn.Module):
             hidden_states=normed,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            latent_indexes=torch.arange(latent_indexes.shape[0], device=hidden_states.device),
-            action_indexes=torch.arange(latent_indexes.shape[0], latent_indexes.shape[0] + action_indexes.shape[0], device=hidden_states.device),
+            n_latent=n_latent,
             **kwargs,
         )
-
-        attn_out = attn_out.to(hidden_states.dtype)
-        reordered = torch.empty_like(hidden_states)
-        n_latent = latent_indexes.shape[0]
-        reordered[:, latent_indexes] = attn_out[:, :n_latent]
-        reordered[:, action_indexes] = attn_out[:, n_latent:]
-        hidden_states = residual + reordered
+        hidden_states = residual + attn_out.to(hidden_states.dtype)
 
         residual = hidden_states
-        latent_h = hidden_states[:, latent_indexes]
-        action_h = hidden_states[:, action_indexes]
-        mlp_out = torch.empty_like(hidden_states)
-        mlp_out[:, latent_indexes] = self.mlp(self.post_attention_layernorm(latent_h)).to(hidden_states.dtype)
-        mlp_out[:, action_indexes] = self.mlp_action(self.post_attention_layernorm_action(action_h)).to(hidden_states.dtype)
-        hidden_states = residual + mlp_out
+        latent_h = hidden_states[:, :n_latent]
+        action_h = hidden_states[:, n_latent:]
+        mlp_latent = self.mlp(self.post_attention_layernorm(latent_h)).to(hidden_states.dtype)
+        mlp_action = self.mlp_action(self.post_attention_layernorm_action(action_h)).to(hidden_states.dtype)
+        hidden_states = residual + torch.cat([mlp_latent, mlp_action], dim=1)
 
         return hidden_states
 
@@ -295,9 +294,9 @@ class MoTKappaModel(nn.Module):
         all_embeds = torch.cat([inputs_embeds, t_emb, action_embeds], dim=1)
 
         T_total = T_text + 1 + T_action
-        latent_indexes = torch.arange(T_text, device=input_ids.device)
-        # Timestep token + action tokens share the action expert path
-        action_indexes = torch.arange(T_text, T_total, device=input_ids.device)
+        # Timestep token + action tokens share the action expert path; they
+        # are the contiguous tail starting at index ``T_text``.
+        n_latent = T_text
 
         full_attn_mask = torch.zeros(B, 1, T_total, T_total, device=input_ids.device, dtype=all_embeds.dtype)
         causal_mask = torch.triu(torch.ones(T_text, T_text, device=input_ids.device, dtype=torch.bool), diagonal=1)
@@ -315,8 +314,7 @@ class MoTKappaModel(nn.Module):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=full_attn_mask,
-                latent_indexes=latent_indexes,
-                action_indexes=action_indexes,
+                n_latent=n_latent,
             )
 
         # Extract action hidden states (skip timestep token at index T_text)
@@ -326,8 +324,16 @@ class MoTKappaModel(nn.Module):
         if velocity_target is not None:
             target = velocity_target.to(velocity_pred.dtype)
             if sonic_mask is not None:
-                mask = sonic_mask.unsqueeze(-1).to(velocity_pred.dtype)
-                action_loss = (nn.functional.mse_loss(velocity_pred, target, reduction="none") * mask).sum() / (mask.sum() * self.sonic_dim).clamp(min=1)
+                # `sonic_mask` may be [B, T] (time-only, HE) or [B, T, D]
+                # (per-dim, e.g. EgoDex masking out unused hand-binary dims).
+                if sonic_mask.dim() == 2:
+                    mask = sonic_mask.unsqueeze(-1).to(velocity_pred.dtype)
+                    denom = (mask.sum() * self.sonic_dim).clamp(min=1)
+                else:
+                    mask = sonic_mask.to(velocity_pred.dtype)
+                    denom = mask.sum().clamp(min=1)
+                mse = nn.functional.mse_loss(velocity_pred, target, reduction="none")
+                action_loss = (mse * mask).sum() / denom
             else:
                 action_loss = nn.functional.mse_loss(velocity_pred, target)
             return CausalLMOutputWithPast(loss=self.action_loss_weight * action_loss)

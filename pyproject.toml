@@ -19,6 +19,7 @@ dependencies = [
     "deepspeed>=0.16.0",
     "onnxruntime-gpu>=1.25.0",
     "mujoco>=3.7.0",
+    "decord>=0.6.0",
 ]
 
 [build-system]

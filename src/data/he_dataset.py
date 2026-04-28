@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,26 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+
+
+# Per-worker LRU cache of mmap'd ``token_state.npy`` views. Keyed by file
+# path so each forked DataLoader worker gets its own dict. ~32 episodes
+# in flight is enough to amortize the mmap setup cost on shuffled training
+# without holding the page cache hostage.
+_SONIC_MMAP_CACHE_SIZE = 64
+_SONIC_MMAP_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
+
+
+def _get_sonic_mmap(path: str) -> np.ndarray:
+    arr = _SONIC_MMAP_CACHE.get(path)
+    if arr is not None:
+        _SONIC_MMAP_CACHE.move_to_end(path)
+        return arr
+    arr = np.load(path, mmap_mode="r")
+    _SONIC_MMAP_CACHE[path] = arr
+    if len(_SONIC_MMAP_CACHE) > _SONIC_MMAP_CACHE_SIZE:
+        _SONIC_MMAP_CACHE.popitem(last=False)
+    return arr
 
 
 class HEDataset(Dataset):
@@ -48,7 +69,6 @@ class HEDataset(Dataset):
             self.info = json.load(f)
 
         self._load_data()
-        self._token_cache: dict[int, np.ndarray] = {}
 
     def _collect_parquet_paths(self) -> list[str]:
         data_dir = os.path.join(self.data_root, "data")
@@ -63,7 +83,11 @@ class HEDataset(Dataset):
         return paths
 
     def _load_data(self):
-        cache_path = os.path.join(self.cache_root, "meta", "dataset_index.json")
+        # Index is stored as packed ``int32`` ndarrays in an .npz: at ~2e8
+        # frames the prior list-of-tuples layout was ~5 GB Python objects
+        # and slow to fork into workers. Four parallel arrays keep the same
+        # info under ~3 GB and give O(1) integer access in __getitem__.
+        cache_path = os.path.join(self.cache_root, "meta", "dataset_index.npz")
 
         if os.path.exists(cache_path):
             self._load_from_cache(cache_path)
@@ -71,12 +95,11 @@ class HEDataset(Dataset):
             self._build_and_cache(cache_path)
 
     def _load_from_cache(self, cache_path: str):
-        with open(cache_path) as f:
-            cache = json.load(f)
-        self.episode_ids = cache["episode_ids"]
-        self.ep_slices = {int(k): tuple(v) for k, v in cache["ep_slices"].items()}
-        self.frame_indices = [tuple(x) for x in cache["frame_indices"]]
-        self._task_ids = cache["task_ids"]
+        with np.load(cache_path) as cache:
+            self._frame_ep = cache["frame_ep"].astype(np.int32, copy=False)
+            self._frame_ep_len = cache["frame_ep_len"].astype(np.int32, copy=False)
+            self._frame_local = cache["frame_local"].astype(np.int32, copy=False)
+            self._frame_task = cache["frame_task"].astype(np.int32, copy=False)
 
     def _build_and_cache(self, cache_path: str):
         parquet_paths = self._collect_parquet_paths()
@@ -86,58 +109,66 @@ class HEDataset(Dataset):
         df = pl.concat(dfs)
         del dfs
 
-        # Build episode slices via groupby — handles non-contiguous episodes safely
-        self.episode_ids: list[int] = []
-        self.ep_slices: dict[int, tuple[int, int]] = {}
-        task_per_ep: dict[int, int] = {}
-        offset = 0
+        # Build per-episode (length, task) via groupby — handles non-contiguous
+        # episodes safely. We discard the global row offset (no longer used).
+        ep_ids: list[int] = []
+        ep_lens: list[int] = []
+        ep_tasks: list[int] = []
         for ep_idx_val, group in df.group_by("episode_index", maintain_order=True):
-            ep_idx = int(ep_idx_val[0])
-            rows = group.height
-            self.episode_ids.append(ep_idx)
-            self.ep_slices[ep_idx] = (offset, offset + rows)
-            task_per_ep[ep_idx] = int(group["task_index"][0])
-            offset += rows
+            ep_ids.append(int(ep_idx_val[0]))
+            ep_lens.append(group.height)
+            ep_tasks.append(int(group["task_index"][0]))
 
-        # Build flat frame index and per-frame task IDs
-        self.frame_indices: list[tuple[int, int, int]] = []
-        self._task_ids: list[int] = []
-        for ep_idx in self.episode_ids:
-            start, end = self.ep_slices[ep_idx]
-            ep_len = end - start
-            task_id = task_per_ep[ep_idx]
-            for f in range(ep_len):
-                self.frame_indices.append((ep_idx, ep_len, f))
-                self._task_ids.append(task_id)
+        total = sum(ep_lens)
+        frame_ep = np.empty(total, dtype=np.int32)
+        frame_ep_len = np.empty(total, dtype=np.int32)
+        frame_local = np.empty(total, dtype=np.int32)
+        frame_task = np.empty(total, dtype=np.int32)
 
-        # Persist cache
+        cur = 0
+        for ep_id, ep_len, task in zip(ep_ids, ep_lens, ep_tasks):
+            sl = slice(cur, cur + ep_len)
+            frame_ep[sl] = ep_id
+            frame_ep_len[sl] = ep_len
+            frame_local[sl] = np.arange(ep_len, dtype=np.int32)
+            frame_task[sl] = task
+            cur += ep_len
+
+        self._frame_ep = frame_ep
+        self._frame_ep_len = frame_ep_len
+        self._frame_local = frame_local
+        self._frame_task = frame_task
+
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump(
-                {
-                    "episode_ids": self.episode_ids,
-                    "ep_slices": {str(k): list(v) for k, v in self.ep_slices.items()},
-                    "frame_indices": self.frame_indices,
-                    "task_ids": self._task_ids,
-                },
-                f,
-            )
+        tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+        np.savez(
+            tmp_path,
+            frame_ep=frame_ep,
+            frame_ep_len=frame_ep_len,
+            frame_local=frame_local,
+            frame_task=frame_task,
+        )
+        # ``np.savez`` writes ``<tmp_path>.npz`` when given a path without
+        # the suffix; rename it onto the canonical location atomically so
+        # racing ranks don't see a half-written index.
+        written = tmp_path if os.path.exists(tmp_path) else f"{tmp_path}.npz"
+        os.replace(written, cache_path)
 
     def _get_sonic_tokens(self, ep_idx: int) -> np.ndarray:
-        if ep_idx in self._token_cache:
-            return self._token_cache[ep_idx]
+        # mmap so the OS page cache is shared across workers/processes; LRU
+        # cache the mmap object itself so consecutive samples from the same
+        # episode skip the mmap setup syscall.
         npy_path = os.path.join(self.sonic_tokens_dir, f"episode_{ep_idx:06d}.npy")
-        tokens = np.load(npy_path)
-        self._token_cache[ep_idx] = tokens
-        return tokens
+        return _get_sonic_mmap(npy_path)
 
     def __len__(self) -> int:
-        return len(self.frame_indices)
+        return int(self._frame_ep.shape[0])
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        ep_idx, ep_len, frame_id = self.frame_indices[idx]
-
-        task_idx = self._task_ids[idx]
+        ep_idx = int(self._frame_ep[idx])
+        ep_len = int(self._frame_ep_len[idx])
+        frame_id = int(self._frame_local[idx])
+        task_idx = int(self._frame_task[idx])
         text = self.task_map.get(task_idx, "perform the task")
 
         video_path = os.path.join(
@@ -163,12 +194,7 @@ class HEDataset(Dataset):
 
     @staticmethod
     def _decode_frame(video_path: str, frame_idx: int) -> Image.Image:
-        import cv2
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return Image.new("RGB", (640, 480))
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        from src.data.video_reader import decode_frame
+
+        frame = decode_frame(video_path, frame_idx, target_size=(640, 480))
         return Image.fromarray(frame)

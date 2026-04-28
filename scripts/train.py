@@ -26,6 +26,56 @@ overwatch = initialize_overwatch(__name__)
 
 MAX_TRAINING_EPOCHS = 1_000_000
 
+# Per-worker shm budget. The previous 48MB estimate left no fragmentation
+# margin and let a 64MB /dev/shm pretend it could host 1 worker — which
+# crashed with a bus error mid-step. 96MB matches what we actually see in
+# practice once you factor in decord buffers, mmap caches, prefetch queue,
+# and the IPC pickling overhead.
+_SHM_PER_WORKER_BYTES = 96 * 1024 * 1024
+
+
+def _autoscale_num_workers(config) -> None:
+    """Cap config.train.num_workers to what /dev/shm can support.
+
+    Tensor handoff between DataLoader workers and the main process always
+    routes through /dev/shm on Linux (both file_descriptor and file_system
+    sharing strategies). When shm is too small the workers are killed with a
+    bus error before the first batch arrives, so we detect this up front
+    rather than crashing 18s into training.
+
+    If shm can't safely host even one worker (typical of a stock 64MB
+    container tmpfs), fall back to in-process loading (``num_workers=0``).
+    That removes shm IPC entirely at the cost of overlap with GPU compute —
+    still strictly better than crashing.
+    """
+    requested = getattr(config.train, "num_workers", 0)
+    if requested <= 0:
+        return
+    try:
+        shm_stat = os.statvfs("/dev/shm")
+        shm_bytes = shm_stat.f_blocks * shm_stat.f_frsize
+    except (FileNotFoundError, OSError):
+        return
+    affordable = max(0, shm_bytes // _SHM_PER_WORKER_BYTES)
+    if affordable >= requested:
+        return
+    if affordable < 1:
+        overwatch.warning(
+            f"/dev/shm is {shm_bytes // (1024 * 1024)}MiB; not enough to host "
+            f"a DataLoader worker safely (need ~{_SHM_PER_WORKER_BYTES // (1024 * 1024)}MiB "
+            f"each). Falling back to num_workers=0 (in-process loading). "
+            f"Increase --shm-size on the container to restore parallel loading."
+        )
+        config.train.num_workers = 0
+        return
+    overwatch.warning(
+        f"/dev/shm is {shm_bytes // (1024 * 1024)}MiB, can only safely host "
+        f"{affordable} DataLoader worker(s); downgrading num_workers "
+        f"{requested} -> {affordable}. Increase --shm-size on the container "
+        f"to restore parallel data loading."
+    )
+    config.train.num_workers = affordable
+
 
 def _initialize_accelerator(trainer) -> Accelerator:
     os.makedirs(trainer.project_dir, exist_ok=True)
@@ -83,16 +133,21 @@ def train(config):
     trainer = Trainer.instantiate(config, overwatch.local_rank())
     overwatch.info("Initializing models...")
     trainer.init_models()
+    trainer.load_pretrained_weights()
     accelerator = _initialize_accelerator(trainer)
     overwatch.add_file_handler(trainer.project_dir)
 
     overwatch.info(f"Training task: '{config.train.name}'")
     overwatch.info(f"Run name: {trainer.run_name}")
-    overwatch.info(f"Max training steps: {trainer.max_training_steps}")
 
+    # Datasets must be built before reading max_training_steps: when a config
+    # drives training off num_train_epochs, the property derives total steps
+    # from len_train_dataset, which is only assigned inside create_datasets().
     train_dataset, val_dataset = trainer.create_datasets()
+    _autoscale_num_workers(config)
     trainer.create_dataloaders(train_dataset, val_dataset)
     overwatch.info(f"Training dataset size: {trainer.len_train_dataset}")
+    overwatch.info(f"Max training steps: {trainer.max_training_steps}")
 
     overwatch.info("Initializing optimizer and scheduler...")
     trainer.create_optimizer_and_scheduler(trainer.max_training_steps)
@@ -194,11 +249,13 @@ def train(config):
                     timer.sync()
 
                 progress_bar.update()
-                postfix = {"loss": losses.get("loss", 0), "lr": trainer.lr}
-                if timer:
-                    avgs = timer.averages()
-                    postfix["s/step"] = f"{avgs.get('step_total', 0):.2f}"
-                progress_bar.set_postfix(postfix)
+                # Fixed-width scientific notation for lr so warmup (0 → 1e-9 →
+                # 1e-7) and post-warmup magnitudes stay visually comparable.
+                postfix = {
+                    "loss": f"{losses.get('loss', 0):.4f}",
+                    "lr": f"{trainer.lr:.3e}",
+                }
+                progress_bar.set_postfix(postfix, refresh=False)
                 global_step += 1
 
             if global_step >= trainer.max_training_steps:

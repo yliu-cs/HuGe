@@ -15,147 +15,75 @@ overwatch = initialize_overwatch(__name__)
 
 
 class KappaCollator:
-    """Collator that uses the VLM processor for proper input preparation."""
+    """Collator that prepares Qwen3-VL ChatML inputs and flow-matching targets.
 
-    def __init__(self, processor, model_max_length: int = 8192, use_images: bool = True):
+    Uses ``apply_chat_template`` so the processor produces the canonical
+    ``<|im_start|>user\\n<|vision_start|><|image_pad|>...<|vision_end|>{text}<|im_end|>\\n<|im_start|>assistant\\n``
+    sequence and auto-expands ``<|image_pad|>`` to one token per merged patch.
+    Labels are not produced because the MoT path supervises via
+    ``velocity_target`` only; the CE fallback in the model is unused at train.
+    """
+
+    def __init__(self, processor, model_max_length: int = 8192):
         self.processor = processor
         self.model_max_length = model_max_length
-        self.use_images = use_images
 
     def __call__(self, instances):
-        # For PIL images, process through the processor
-        if "image" in instances[0] and self.use_images:
-            from qwen_vl_utils import process_vision_info
+        from qwen_vl_utils import process_vision_info
 
-            # Build messages format for qwen_vl_utils
-            messages = [[{
-                'role': 'user',
-                'content': [
-                    {'type': 'image', 'image': inst["image"]},
-                    {'type': 'text', 'text': inst.get("text", "perform the task")}
-                ]
-            }] for inst in instances]
+        messages = [[{
+            'role': 'user',
+            'content': [
+                {'type': 'image', 'image': inst["image"]},
+                {'type': 'text', 'text': inst.get("text", "perform the task")},
+            ],
+        }] for inst in instances]
 
-            texts = [m[0]['content'][1]['text'] for m in messages]
-            image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
+        texts = [
+            self.processor.apply_chat_template(conv, add_generation_prompt=True, tokenize=False)
+            for conv in messages
+        ]
+        image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
 
-            inputs = self.processor(
-                text=texts,
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor(
+            text=texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
 
-            # Manually insert image tokens at the beginning since processor doesn't do it
-            # spatial_merge_size=2 merges 2x2 patches into 1
-            image_token_id = 151655
-            video_token_id = 151656
-            spatial_merge_size = 2
-            image_grid_thw = inputs.get("image_grid_thw", None)
-            new_input_ids_list = []
-            new_labels_list = []
-            new_mm_token_type_ids_list = []
+        input_ids = inputs["input_ids"][:, :self.model_max_length]
+        attention_mask = inputs["attention_mask"][:, :self.model_max_length]
 
-            for i, input_ids in enumerate(inputs["input_ids"]):
-                if image_grid_thw is not None:
-                    t = image_grid_thw[i]
-                    # Divide by spatial_merge_size^2 because patches are merged
-                    num_patches = (t[0] * t[1] * t[2]) // (spatial_merge_size ** 2)
-                else:
-                    num_patches = 0
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if "pixel_values" in inputs:
+            result["pixel_values"] = inputs["pixel_values"]
+        if "image_grid_thw" in inputs:
+            result["image_grid_thw"] = inputs["image_grid_thw"]
+        if "mm_token_type_ids" in inputs:
+            result["mm_token_type_ids"] = inputs["mm_token_type_ids"][:, :self.model_max_length]
 
-                if num_patches > 0:
-                    # Create image tokens
-                    image_tokens = torch.full((num_patches,), image_token_id, dtype=input_ids.dtype)
-                    new_input_ids = torch.cat([image_tokens, input_ids])
+        if "sonic_tokens" in instances[0]:
+            sonic_tokens = torch.stack([inst["sonic_tokens"] for inst in instances])
+            sonic_mask = torch.stack([inst["sonic_mask"] for inst in instances])
 
-                    # Create mm_token_type_ids: 0=text, 1=image, 2=video
-                    image_mm_types = torch.full((num_patches,), 1, dtype=torch.long)  # 1 for images
-                    text_mm_types = torch.zeros((input_ids.shape[0],), dtype=torch.long)  # 0 for text
-                    new_mm_type = torch.cat([image_mm_types, text_mm_types])
-                else:
-                    new_input_ids = input_ids
-                    new_mm_type = torch.zeros((input_ids.shape[0],), dtype=torch.long)
+            B = sonic_tokens.shape[0]
+            t = torch.distributions.Beta(1.5, 1.0).sample((B,)) * 0.999 + 0.001
+            t_expanded = t[:, None, None]
+            noise = torch.randn_like(sonic_tokens)
+            noisy_sonic_tokens = t_expanded * noise + (1 - t_expanded) * sonic_tokens
+            velocity_target = noise - sonic_tokens
 
-                # Create labels (shift by 1 for causal LM, pad with -100)
-                labels = new_input_ids.clone()
-                labels[labels == self.processor.tokenizer.pad_token_id] = -100
+            result["noisy_sonic_tokens"] = noisy_sonic_tokens
+            result["timesteps"] = t
+            result["velocity_target"] = velocity_target
+            result["sonic_mask"] = sonic_mask
 
-                new_input_ids_list.append(new_input_ids)
-                new_labels_list.append(labels)
-                new_mm_token_type_ids_list.append(new_mm_type)
-
-            # Pad sequences to same length
-            from torch.nn.utils.rnn import pad_sequence
-            input_ids = pad_sequence(new_input_ids_list, batch_first=True, padding_value=self.processor.tokenizer.pad_token_id or 0)
-            labels = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)
-            mm_token_type_ids = pad_sequence(new_mm_token_type_ids_list, batch_first=True, padding_value=0)
-
-            # Truncate if needed
-            input_ids = input_ids[:, :self.model_max_length]
-            labels = labels[:, :self.model_max_length]
-            mm_token_type_ids = mm_token_type_ids[:, :self.model_max_length]
-
-            attention_mask = input_ids.ne(self.processor.tokenizer.pad_token_id or 0)
-
-            result = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "mm_token_type_ids": mm_token_type_ids,
-            }
-
-            if "pixel_values" in inputs:
-                result["pixel_values"] = inputs["pixel_values"]
-            if "image_grid_thw" in inputs:
-                result["image_grid_thw"] = inputs["image_grid_thw"]
-
-            if "sonic_tokens" in instances[0]:
-                sonic_tokens = torch.stack([inst["sonic_tokens"] for inst in instances])
-                sonic_mask = torch.stack([inst["sonic_mask"] for inst in instances])
-
-                # Flow matching: sample timestep, add noise, compute velocity target
-                B = sonic_tokens.shape[0]
-                t = torch.distributions.Beta(1.5, 1.0).sample((B,)) * 0.999 + 0.001
-                t_expanded = t[:, None, None]
-                noise = torch.randn_like(sonic_tokens)
-                noisy_sonic_tokens = t_expanded * noise + (1 - t_expanded) * sonic_tokens
-                velocity_target = noise - sonic_tokens
-
-                result["noisy_sonic_tokens"] = noisy_sonic_tokens
-                result["timesteps"] = t
-                result["velocity_target"] = velocity_target
-                result["sonic_mask"] = sonic_mask
-
-            return result
-        else:
-            # Original behavior for tensor data
-            from torch.nn.utils.rnn import pad_sequence
-
-            input_ids = [inst["input_ids"].squeeze(0) if inst["input_ids"].dim() == 2 else inst["input_ids"]
-                         for inst in instances]
-            labels = [inst["labels"].squeeze(0) if inst["labels"].dim() == 2 else inst["labels"]
-                      for inst in instances]
-
-            input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.processor.tokenizer.pad_token_id or 0)
-            labels = pad_sequence(labels, batch_first=True, padding_value=-100)
-
-            input_ids = input_ids[:, :self.model_max_length]
-            labels = labels[:, :self.model_max_length]
-
-            attention_mask = input_ids.ne(self.processor.tokenizer.pad_token_id or 0)
-
-            pixel_values = torch.stack([inst["pixel_values"] for inst in instances])
-            image_grid_thw = torch.stack([inst["image_grid_thw"].squeeze(0) for inst in instances])
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
-            }
+        return result
 
 
 class KappaTrainer(Trainer):
@@ -209,17 +137,16 @@ class KappaTrainer(Trainer):
             self.model.gradient_checkpointing_enable()
 
     def create_datasets(self) -> tuple[Dataset, Optional[Dataset]]:
-        from src.data import HEDataset
-
-        overwatch.info("Creating Humanoid-Everyday datasets...")
         data_cfg = self.cfg.data
+        name = getattr(data_cfg, "dataset_name", "humanoid_everyday")
 
-        self.train_dataset = HEDataset(
-            data_root=data_cfg.data_root,
-            action_chunk_size=data_cfg.action_chunk_size,
-            split="train",
-            cache_root=getattr(data_cfg, "cache_root", None),
-        )
+        # Keep model.sonic_dim as the source of truth for EgoDex pad width even
+        # if the data config defaults drift; sync before instantiating.
+        if name == "egodex":
+            data_cfg.sonic_dim = self.cfg.model.sonic_dim
+
+        overwatch.info(f"Creating {name} dataset (transform: repack -> field -> model)...")
+        self.train_dataset = data_cfg(split="train")
         self.val_dataset = None
         self.len_train_dataset = len(self.train_dataset)
         self.len_val_dataset = 0
@@ -236,15 +163,23 @@ class KappaTrainer(Trainer):
         g = torch.Generator()
         g.manual_seed(self.cfg.seed or 42)
 
+        nw = self.train_cfg.num_workers
+        loader_kwargs = dict(
+            collate_fn=collator,
+            num_workers=nw,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=nw > 0,
+        )
+        if nw > 0:
+            loader_kwargs["prefetch_factor"] = self.train_cfg.prefetch_factor
+
         self.train_dataloader = DataLoader(
             train_dataset,
             shuffle=True,
             batch_size=self.train_cfg.train_batch_size,
             generator=g,
-            collate_fn=collator,
-            num_workers=self.train_cfg.num_workers,
             drop_last=True,
-            persistent_workers=True if self.train_cfg.num_workers > 0 else False,
+            **loader_kwargs,
         )
 
         if val_dataset is not None:
@@ -252,9 +187,8 @@ class KappaTrainer(Trainer):
                 val_dataset,
                 shuffle=False,
                 batch_size=self.train_cfg.val_batch_size,
-                collate_fn=collator,
-                num_workers=self.train_cfg.num_workers,
                 drop_last=False,
+                **loader_kwargs,
             )
         else:
             self.val_dataloader = None
@@ -317,7 +251,6 @@ class KappaTrainer(Trainer):
 
         param_groups = []
 
-        vision_params = []
         projector_params = []
         llm_params = []
         other_params = []
@@ -325,19 +258,15 @@ class KappaTrainer(Trainer):
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if "visual" in name:
-                vision_params.append(param)
-            elif "mlp1" in name or "projector" in name or "merger" in name:
+            if "mlp1" in name or "projector" in name or "merger" in name:
                 projector_params.append(param)
             elif "lm_head" in name or "embed_tokens" in name or "layers" in name or "norm" in name:
                 llm_params.append(param)
             else:
                 other_params.append(param)
 
-        optimizer_kwargs = dict(train_cfg.lr_scheduler_kwargs)
+        optimizer_kwargs = dict(train_cfg.optimizer_kwargs)
 
-        if len(vision_params) > 0:
-            param_groups.append({"params": vision_params, "lr": model_cfg.vision_tower_lr, "weight_decay": model_cfg.weight_decay})
         if len(projector_params) > 0:
             param_groups.append({"params": projector_params, "lr": model_cfg.mm_projector_lr, "weight_decay": model_cfg.weight_decay})
         if len(llm_params) > 0:

@@ -1,0 +1,63 @@
+"""Pretrain config for Kappa on EgoDex.
+
+EgoDex is the first stage of pretraining: SONIC tokens are 64-D (no hand-binary
+bits). The dataset right-pads tokens to ``sonic_dim=66`` and emits a per-dim
+``sonic_mask`` that zeros out the trailing two hand-bit dims, so the loss
+ignores them.
+
+Stage 2 (Humanoid-Everyday) launches via ``pretrain_he_kappa_config`` with
+``--train.pretrained-weights`` pointing at this run's ``model.safetensors``
+(file, ``ckpt_*`` dir, or run dir — latest ckpt auto-picked). Optimizer,
+scheduler, and global_step start fresh; weights are loaded with
+``strict=False`` so the architectures must already match (they do: both
+configs share ``KappaModelConfig`` with ``sonic_dim=66``).
+"""
+from pydantic import Field
+
+from src.config.config import (
+    EgoDexDataConfig,
+    LaunchConfig,
+    TrainConfig,
+)
+from src.config.model_kappa import KappaModelConfig
+from src.data.transform import (
+    DataTransform,
+    EgodexRepackTransform,
+    IdentityFieldTransform,
+    KappaModelTransform,
+)
+
+
+class DynamicDataTransform(DataTransform):
+    repack: EgodexRepackTransform = Field(default_factory=EgodexRepackTransform)
+    field: IdentityFieldTransform = Field(default_factory=IdentityFieldTransform)
+    model: KappaModelTransform = Field(default_factory=KappaModelTransform)
+
+
+class DynamicDataConfig(EgoDexDataConfig):
+    transform: DynamicDataTransform = Field(default_factory=DynamicDataTransform)
+
+
+class DynamicLaunchConfig(LaunchConfig):
+    model: KappaModelConfig
+    data: DynamicDataConfig = Field(default_factory=DynamicDataConfig)
+
+    # Effective global batch = train_batch_size × world_size × grad_accum = 64
+    # on 1 GPU and 512 on 8 GPUs (same as the previous (64, 1) config on 8 GPUs,
+    # but split into micro-batches so a single 24/48 GB GPU can fit one sample
+    # at a time without OOM).
+    train: TrainConfig = TrainConfig(
+        name="kappa",
+        num_train_epochs=1,
+        train_batch_size=64,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        prefetch_factor=2,
+        checkpointing_steps=10000,
+        max_checkpoints_to_keep=5,
+        validation_steps=0,
+        mixed_precision="bf16",
+        learning_rate=4e-5,
+        warmup_steps=0,
+        warmup_ratio=0.01,
+    )
