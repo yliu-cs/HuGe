@@ -173,13 +173,49 @@ class KappaTrainer(Trainer):
         if nw > 0:
             loader_kwargs["prefetch_factor"] = self.train_cfg.prefetch_factor
 
+        # Push the per-worker frame cache size before workers are forked so
+        # every worker inherits the configured value via copy-on-write.
+        from src.data.video_reader import set_frame_cache_size
+        set_frame_cache_size(self.train_cfg.frame_cache_size)
+
+        block = self.train_cfg.block_shuffle_size
+        sampler = None
+        shuffle_flag: bool | None = True
+        if block > 0:
+            raw = getattr(train_dataset, "raw_dataset", train_dataset)
+            spans_fn = getattr(raw, "episode_spans", None)
+            if spans_fn is None:
+                overwatch.warning(
+                    f"block_shuffle_size={block} requested but {type(raw).__name__} "
+                    "has no episode_spans(); falling back to shuffle=True."
+                )
+            else:
+                from src.data.sampler import BlockShuffleSampler
+
+                sampler = BlockShuffleSampler(
+                    episode_spans=spans_fn(),
+                    block_size=block,
+                    generator=g,
+                )
+                shuffle_flag = None
+                overwatch.info(
+                    f"BlockShuffleSampler enabled: block_size={block}, "
+                    f"episodes={len(spans_fn())}, frame_cache_size="
+                    f"{self.train_cfg.frame_cache_size}"
+                )
+
+        train_kwargs = dict(loader_kwargs)
+        if sampler is not None:
+            train_kwargs["sampler"] = sampler
+        else:
+            train_kwargs["shuffle"] = shuffle_flag
+            train_kwargs["generator"] = g
+
         self.train_dataloader = DataLoader(
             train_dataset,
-            shuffle=True,
             batch_size=self.train_cfg.train_batch_size,
-            generator=g,
             drop_last=True,
-            **loader_kwargs,
+            **train_kwargs,
         )
 
         if val_dataset is not None:

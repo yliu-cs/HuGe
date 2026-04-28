@@ -26,5 +26,4 @@ Mixture-of-Transformers
 
 # Others
 *.log
-kappa_eval_video
-kappa_eval_tokens.npy
+scripts/bench_dataloader.py

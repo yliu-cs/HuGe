@@ -230,6 +230,18 @@ class EgoDexDataset(Dataset):
         ep = int(np.searchsorted(self._ep_offsets, idx, side="right")) - 1
         return ep, idx - int(self._ep_offsets[ep])
 
+    def episode_spans(self) -> np.ndarray:
+        """Return ``[N, 2]`` int64 array of ``(start_idx, length)`` per episode.
+
+        Consumed by ``BlockShuffleSampler`` to chop the index space into
+        episode-aligned contiguous runs. Computed from the cached offsets so
+        this is O(N) and never re-reads the index file.
+        """
+        out = np.empty((self._ep_offsets.size, 2), dtype=np.int64)
+        out[:, 0] = self._ep_offsets
+        out[:, 1] = self._ep_token_rows.astype(np.int64, copy=False)
+        return out
+
     def _get_tokens(self, ep: int) -> np.ndarray:
         # mmap so 33 万 episode 的 token 文件按需分页读入，OS page cache 在
         # workers 之间共享；mmap 句柄进程内 LRU 缓存避免重复 syscall。

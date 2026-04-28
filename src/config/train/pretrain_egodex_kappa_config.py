@@ -53,6 +53,12 @@ class DynamicLaunchConfig(LaunchConfig):
         gradient_accumulation_steps=1,
         num_workers=8,
         prefetch_factor=2,
+        # Episode-aware block shuffle: one batch ≈ one episode → decord
+        # sequentializes per-worker decode (~21× per-sample speedup measured
+        # on this dataset). frame_cache absorbs ~38% of decodes that 50→30Hz
+        # token-to-video mapping reuses across adjacent token rows.
+        block_shuffle_size=64,
+        frame_cache_size=2,
         checkpointing_steps=10000,
         max_checkpoints_to_keep=5,
         validation_steps=0,

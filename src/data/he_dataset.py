@@ -164,6 +164,22 @@ class HEDataset(Dataset):
     def __len__(self) -> int:
         return int(self._frame_ep.shape[0])
 
+    def episode_spans(self) -> np.ndarray:
+        """Return ``[N, 2]`` int64 array of ``(start_idx, length)`` per episode.
+
+        ``_load_data`` builds the flat index so each episode occupies a
+        contiguous block in row order, so spans fall out of "where does
+        ``frame_local == 0``". O(N) over the index, no parquet re-reads.
+        """
+        starts = np.flatnonzero(self._frame_local == 0).astype(np.int64, copy=False)
+        if starts.size == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        lengths = self._frame_ep_len[starts].astype(np.int64, copy=False)
+        out = np.empty((starts.size, 2), dtype=np.int64)
+        out[:, 0] = starts
+        out[:, 1] = lengths
+        return out
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ep_idx = int(self._frame_ep[idx])
         ep_len = int(self._frame_ep_len[idx])

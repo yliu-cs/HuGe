@@ -35,6 +35,13 @@ class DynamicLaunchConfig(LaunchConfig):
         train_batch_size=64,
         gradient_accumulation_steps=1,
         num_workers=12,
+        # HE has GOP=250 H.264 — random seek is the dominant data cost
+        # (66 ms/seek measured). Block-shuffling to 1 batch ≈ 1 episode
+        # converts these into next-frame decodes (~22× per-sample speedup).
+        # HE is 30 Hz video / 30 Hz tokens so frame_cache hit rate is 0;
+        # leaving size=2 still has negligible cost.
+        block_shuffle_size=64,
+        frame_cache_size=2,
         checkpointing_steps=10000,
         max_checkpoints_to_keep=5,
         validation_steps=0,

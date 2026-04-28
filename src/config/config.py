@@ -50,6 +50,16 @@ class TrainConfig(BaseModel):
     val_batch_size: int = 2
     val_num_batches: int = 10
 
+    # Block-shuffle sampler: 0 disables (falls back to torch shuffle=True).
+    # When >0, indices are emitted in episode-contiguous chunks of this size,
+    # turning random video seeks into next-frame decodes. Set to
+    # ``train_batch_size`` for "one batch ≈ one episode" behavior.
+    block_shuffle_size: int = 0
+    # Per-worker decoded-frame LRU. EgoDex's 50→30 Hz token-to-video mapping
+    # produces ~37% adjacent-row frame collisions; size=2 absorbs them under
+    # block_shuffle_size>0. Set to 0 to disable.
+    frame_cache_size: int = 2
+
     checkpointing_steps: int = 100
     max_checkpoints_to_keep: int | None = None
     validation_steps: int = 50
