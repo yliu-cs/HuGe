@@ -33,4 +33,9 @@ class KappaModelConfig(ModelConfig):
     action_chunk_size: int = 50
     action_loss_weight: float = 1.0
 
-    num_inference_steps: int = 10
+    num_inference_steps: int = 4
+    # ODE solver for the flow-matching denoise loop. "heun" is a 2nd-order
+    # predictor-corrector (2 NFE per step except the final t=0 step which falls
+    # back to Euler since the model wasn't trained at t=0); "euler" is the
+    # original 1st-order scheme (1 NFE per step).
+    solver: str = "heun"

@@ -2,8 +2,9 @@
 # Kappa Training Launcher
 # Auto-detects GPU count for single-node; auto-disables DeepSpeed on single GPU.
 # Stage selection:
-#   --stage egodex                                                                # stage 1 (EgoDex pretrain)
-#   --stage he                                                                    # stage 2 (Humanoid-Everyday pretrain)
+#   --stage egodex                                                                # stage 1-1 (EgoDex pretrain)
+#   --stage he                                                                    # stage 1-2 (Humanoid-Everyday G1 only)
+#   --stage he_wbt                                                                # stage 1-2 mixed (HE-G1 + G1-WBT)
 #   --config <name>                                                               # arbitrary config under src/config/train/
 # Exactly one of --stage / --config must be provided.
 # Usage:
@@ -80,8 +81,9 @@ if [ -z "$CONFIG_NAME" ]; then
     case "$STAGE" in
         egodex) CONFIG_NAME="pretrain_egodex_kappa_config" ;;
         he)     CONFIG_NAME="pretrain_he_kappa_config" ;;
-        "")     echo "Error: must specify --stage {egodex|he} or --config <name>" >&2; exit 1 ;;
-        *)      echo "Error: unknown --stage '$STAGE' (expected 'egodex' or 'he')" >&2; exit 1 ;;
+        he_wbt) CONFIG_NAME="pretrain_he_wbt_kappa_config" ;;
+        "")     echo "Error: must specify --stage {egodex|he|he_wbt} or --config <name>" >&2; exit 1 ;;
+        *)      echo "Error: unknown --stage '$STAGE' (expected 'egodex', 'he', or 'he_wbt')" >&2; exit 1 ;;
     esac
 fi
 

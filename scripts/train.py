@@ -265,6 +265,10 @@ def train(config):
             break
 
     accelerator.wait_for_everyone()
+    if global_step > 0 and global_step % config.train.checkpointing_steps != 0:
+        save_path = trainer.save_checkpoint(global_step)
+        if overwatch.is_rank_zero():
+            tqdm.write(f"Saved final state to {save_path}")
     trainer.finalize()
     progress_bar.close()
     metrics_file.close()
@@ -294,10 +298,13 @@ if __name__ == "__main__":
     overwatch.info("Parsing configuration...")
     try:
         module = import_module(f"src.config.train.{args[0]}")
-        DynamicLaunchConfigClass = getattr(module, "DynamicLaunchConfig")
+        # Each train config module exposes its concrete launch class as
+        # `LaunchConfig` (a module-level alias to e.g. `HEWBTLaunchConfig`),
+        # so this entry point doesn't need to know per-stage class names.
+        LaunchConfigClass = getattr(module, "LaunchConfig")
         from tyro import cli
         config = cli(
-            DynamicLaunchConfigClass,
+            LaunchConfigClass,
             args=args[1:]
         )
     except Exception as e:

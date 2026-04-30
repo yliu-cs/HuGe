@@ -30,7 +30,7 @@ os.environ.setdefault("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage
 
 LEFT_JOINT_IDX = 4
 RIGHT_JOINT_IDX = 11
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _worker(parquet_path: str):
@@ -46,6 +46,26 @@ def _worker(parquet_path: str):
 
 def _init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def load_robot_type_map(data_root: str) -> dict[int, str]:
+    """Read meta/episodes.jsonl and return ``{episode_index: robot_type}``.
+
+    humanoid-everyday mixes G1 (14D hand) and H1 (12D hand) — their joint
+    ranges differ, so percentiles taken across the union don't characterize
+    either embodiment. The threshold pipeline must be run per-body.
+    """
+    path = os.path.join(data_root, "meta", "episodes.jsonl")
+    out: dict[int, str] = {}
+    with open(path) as f:
+        for line in f:
+            entry = json.loads(line)
+            out[int(entry["episode_index"])] = str(entry.get("robot_type", "")).lower()
+    return out
+
+
+def _episode_index_from_path(p: str) -> int:
+    return int(os.path.basename(p)[len("episode_"):-len(".parquet")])
 
 
 def main() -> None:
@@ -65,6 +85,12 @@ def main() -> None:
         help="Percentile of |theta| above which a frame is definitely 'closed'. Default 70.",
     )
     ap.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
+    ap.add_argument(
+        "--robot-type", default="g1",
+        help="Filter episodes by meta/episodes.jsonl:robot_type before sampling joints. "
+             "Default 'g1' (G1 hand_joints is 14D vs H1's 12D, and their ranges differ; "
+             "mixing them produces percentiles that fit neither body). Pass 'all' to disable.",
+    )
     args = ap.parse_args()
 
     if not (0.0 < args.low_pct < args.high_pct < 100.0):
@@ -83,6 +109,21 @@ def main() -> None:
     paths = sorted(glob.glob(os.path.join(args.data_root, "data", "chunk-*", "episode_*.parquet")))
     if not paths:
         raise SystemExit(f"No parquet files under {args.data_root}/data")
+
+    discovered = len(paths)
+    robot_type_filter = args.robot_type.lower()
+    if robot_type_filter != "all":
+        rt_map = load_robot_type_map(args.data_root)
+        paths = [p for p in paths if rt_map.get(_episode_index_from_path(p)) == robot_type_filter]
+        if not paths:
+            raise SystemExit(
+                f"No episodes left after robot_type='{robot_type_filter}' filter "
+                f"(scanned {discovered})."
+            )
+        print(
+            f"Robot-type filter='{robot_type_filter}': kept {len(paths)} / {discovered} episodes "
+            f"({discovered - len(paths)} dropped)."
+        )
 
     print(f"Scanning {len(paths)} episodes with {args.num_workers} workers ...")
     left_chunks: list[np.ndarray] = []
@@ -132,6 +173,7 @@ def main() -> None:
 
     out = {
         "schema_version": SCHEMA_VERSION,
+        "robot_type": robot_type_filter,
         "low_pct": args.low_pct,
         "high_pct": args.high_pct,
         "left": {

@@ -72,7 +72,13 @@ class KappaCollator:
             sonic_mask = torch.stack([inst["sonic_mask"] for inst in instances])
 
             B = sonic_tokens.shape[0]
-            t = torch.distributions.Beta(1.5, 1.0).sample((B,)) * 0.999 + 0.001
+            # Logit-normal(0, 1) t sampling: density peaks at t=0.5 — exactly the
+            # mid-noise region where 4-step Euler/Heun discretization error is
+            # largest. Beta(1.5, 1.0) skewed density toward t=1 and starved the
+            # mid-noise band that low-step solvers traverse. SD3/Flux use the
+            # same scheme. The * 0.999 + 0.001 clip avoids numerically extreme
+            # t≈0/1 endpoints (matches the prior schedule's safety margin).
+            t = torch.sigmoid(torch.randn(B)) * 0.999 + 0.001
             t_expanded = t[:, None, None]
             noise = torch.randn_like(sonic_tokens)
             noisy_sonic_tokens = t_expanded * noise + (1 - t_expanded) * sonic_tokens

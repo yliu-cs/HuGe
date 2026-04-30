@@ -360,12 +360,11 @@ class Trainer(ABC):
                 ckpt_dirs_sorted = sorted(ckpt_dirs, key=lambda d: int(d.split("_")[1]), reverse=True)
                 for old_ckpt in ckpt_dirs_sorted[max_to_keep:]:
                     old_path = os.path.join(save_dir, old_ckpt)
-                    if "0000" not in old_ckpt:
-                        try:
-                            shutil.rmtree(old_path)
-                            overwatch.info(f"Removed old checkpoint: {old_path}")
-                        except Exception as e:
-                            overwatch.warning(f"Failed to remove old checkpoint: {e}")
+                    try:
+                        shutil.rmtree(old_path)
+                        overwatch.info(f"Removed old checkpoint: {old_path}")
+                    except Exception as e:
+                        overwatch.warning(f"Failed to remove old checkpoint: {e}")
 
         self.accelerator.wait_for_everyone()
         return ckpt_dir

@@ -1,5 +1,9 @@
 # $\kappa_{0}$: A Foundation Vision-Language-Action Model for General Humanoid Robot Loco-Manipulation Control
 
+## TODO
+
+- [] Adapting RTC
+
 ## 🏠 Installation
 
 ```
@@ -12,6 +16,7 @@ mkdir -p resource/dataset
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
 ./hfd.sh USC-PSI-Lab/humanoid-everyday --dataset
 # Download EgoDex from [ml-egodex](https://github.com/apple/ml-egodex) to "resource/dataset/EgoDex"
+# Download G1-WBT from [unifolm-wbt](https://huggingface.co/collections/unitreerobotics/unifolm-wbt-dataset) to "resource/dataset/G1_WBT"
 mkdir -p resource/model
 cd resource/model
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
@@ -29,10 +34,12 @@ mkdir -p sonic
 uv run python scripts/preprocess/egodex/build_index.py
 tmux new -s pretrain_egodex -d "./scripts/train/pretrain_kappa.sh --stage egodex 2>&1 | tee pretrain_egodex.log"
 
-# Stage 1-2: Pre-Train on Humanoid-Everyday
+# Stage 1-2: Pre-Train on Humanoid-Everyday G1 + G1-WBT
 uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
 tmux new -s calc_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
-tmux new -s pretrain_he -d "./scripts/train/pretrain_kappa.sh --stage he --train.pretrained-weights .runs/kappa/<egodex-run>"
+uv run python scripts/preprocess/g1-wbt/calc_wbt_hand_thresholds.py
+tmux new -s calc_wbt_sonic -d "uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py"
+tmux new -s pretrain_he_wbt -d "./scripts/train/pretrain_kappa.sh --stage he_wbt --train.pretrained-weights .runs/kappa/<egodex-run>"
 ```
 
 ## ❤️ Acknowledgment

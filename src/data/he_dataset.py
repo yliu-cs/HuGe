@@ -1,55 +1,38 @@
 """Humanoid-Everyday dataset with precomputed SONIC latent tokens."""
 from __future__ import annotations
 
-import os
 import json
-from collections import OrderedDict
-from typing import Any
+import os
 
 import numpy as np
 import polars as pl
-import torch
-from torch.utils.data import Dataset
-from PIL import Image
+
+from src.data.tokenized_video_dataset import (
+    TokenizedVideoDataset,
+    get_token_mmap,
+    resolve_writable_cache_root,
+)
 
 
-# Per-worker LRU cache of mmap'd ``token_state.npy`` views. Keyed by file
-# path so each forked DataLoader worker gets its own dict. ~32 episodes
-# in flight is enough to amortize the mmap setup cost on shuffled training
-# without holding the page cache hostage.
-_SONIC_MMAP_CACHE_SIZE = 64
-_SONIC_MMAP_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
+class HEDataset(TokenizedVideoDataset):
+    """One mp4 per episode at ``videos/chunk-<NNN>/egocentric/episode_<NNNNNN>.mp4``."""
 
-
-def _get_sonic_mmap(path: str) -> np.ndarray:
-    arr = _SONIC_MMAP_CACHE.get(path)
-    if arr is not None:
-        _SONIC_MMAP_CACHE.move_to_end(path)
-        return arr
-    arr = np.load(path, mmap_mode="r")
-    _SONIC_MMAP_CACHE[path] = arr
-    if len(_SONIC_MMAP_CACHE) > _SONIC_MMAP_CACHE_SIZE:
-        _SONIC_MMAP_CACHE.popitem(last=False)
-    return arr
-
-
-class HEDataset(Dataset):
     def __init__(
         self,
         data_root: str,
         action_chunk_size: int = 50,
         split: str = "train",
         cache_root: str | None = None,
+        robot_type: str = "g1",
     ):
+        super().__init__(action_chunk_size=action_chunk_size)
         self.data_root = data_root
-        self.action_chunk_size = action_chunk_size
-        # cache_root holds outputs that the read-only HF dataset mount can't host
-        # (sonic tokens, dataset index, hand threshold). Auto-fall back to a parallel
-        # "<data_root>-cache" dir when data_root itself isn't writable.
-        if cache_root is None:
-            cache_root = data_root if os.access(data_root, os.W_OK) else f"{data_root}-cache"
-        self.cache_root = cache_root
-
+        # humanoid-everyday is a G1+H1 mix, but the SONIC token pipeline assumes
+        # a single embodiment (29D jp with arm starting at index 15 only matches
+        # G1). Default to G1; pass "all" to opt out once the pipeline supports
+        # cross-embodiment encoding.
+        self.robot_type = robot_type.lower()
+        self.cache_root = resolve_writable_cache_root(data_root, cache_root)
         self.sonic_tokens_dir = os.path.join(self.cache_root, "sonic_tokens")
         if not os.path.isdir(self.sonic_tokens_dir):
             raise FileNotFoundError(
@@ -58,17 +41,55 @@ class HEDataset(Dataset):
             )
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
-        self.task_map: dict[int, str] = {}
+        task_map: dict[int, str] = {}
         if os.path.exists(tasks_path):
             with open(tasks_path) as f:
                 for line in f:
                     entry = json.loads(line)
-                    self.task_map[entry["task_index"]] = entry["description"]
+                    task_map[entry["task_index"]] = entry["description"]
+        self._task_map = task_map
 
         with open(os.path.join(data_root, "meta", "info.json")) as f:
             self.info = json.load(f)
 
-        self._load_data()
+        self._load_index()
+
+    # -- index ---------------------------------------------------------------
+
+    def _index_path(self) -> str:
+        # ``_50hz_<robot_type>`` suffix bumps the cache so old 30 Hz / mixed-body
+        # indices don't get reused after upsampling and the G1/H1 split.
+        # Bumped from "dataset_index_50hz_*" so old per-frame cache files
+        # (different .npz schema) get rebuilt on first load instead of
+        # raising KeyError on the new column names.
+        return os.path.join(
+            self.cache_root, "meta", f"episode_index_50hz_{self.robot_type}.npz"
+        )
+
+    def _load_index(self) -> None:
+        cache_path = self._index_path()
+        if os.path.exists(cache_path):
+            with np.load(cache_path) as cache:
+                self._ep_episode_idx = cache["ep_episode_idx"].astype(np.int32, copy=False)
+                self._ep_tok_len = cache["ep_tok_len"].astype(np.int32, copy=False)
+                self._ep_vid_len = cache["ep_vid_len"].astype(np.int32, copy=False)
+                self._ep_task = cache["ep_task"].astype(np.int32, copy=False)
+        else:
+            self._build_index()
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+            np.savez(
+                tmp_path,
+                ep_episode_idx=self._ep_episode_idx,
+                ep_tok_len=self._ep_tok_len,
+                ep_vid_len=self._ep_vid_len,
+                ep_task=self._ep_task,
+            )
+            written = tmp_path if os.path.exists(tmp_path) else f"{tmp_path}.npz"
+            os.replace(written, cache_path)
+
+        self._ep_lengths = self._ep_tok_len.astype(np.int64, copy=False)
+        self._finalize_index()
 
     def _collect_parquet_paths(self) -> list[str]:
         data_dir = os.path.join(self.data_root, "data")
@@ -82,42 +103,39 @@ class HEDataset(Dataset):
                     paths.append(os.path.join(chunk_path, fname))
         return paths
 
-    def _load_data(self):
-        # Index is stored as packed ``int32`` ndarrays in an .npz: at ~2e8
-        # frames the prior list-of-tuples layout was ~5 GB Python objects
-        # and slow to fork into workers. The arrays keep the same info
-        # under ~3 GB and give O(1) integer access in __getitem__.
-        # ``_50hz`` suffix bumps the cache so old 30 Hz indices don't get
-        # reused after the calc_sonic_tokens.py upsampling change.
-        cache_path = os.path.join(self.cache_root, "meta", "dataset_index_50hz.npz")
+    def _load_robot_type_map(self) -> dict[int, str]:
+        path = os.path.join(self.data_root, "meta", "episodes.jsonl")
+        out: dict[int, str] = {}
+        with open(path) as f:
+            for line in f:
+                entry = json.loads(line)
+                out[int(entry["episode_index"])] = str(entry.get("robot_type", "")).lower()
+        return out
 
-        if os.path.exists(cache_path):
-            self._load_from_cache(cache_path)
-        else:
-            self._build_and_cache(cache_path)
-
-    def _load_from_cache(self, cache_path: str):
-        with np.load(cache_path) as cache:
-            self._frame_ep = cache["frame_ep"].astype(np.int32, copy=False)
-            self._frame_ep_tok_len = cache["frame_ep_tok_len"].astype(np.int32, copy=False)
-            self._frame_ep_vid_len = cache["frame_ep_vid_len"].astype(np.int32, copy=False)
-            self._frame_local = cache["frame_local"].astype(np.int32, copy=False)
-            self._frame_task = cache["frame_task"].astype(np.int32, copy=False)
-
-    def _build_and_cache(self, cache_path: str):
+    def _build_index(self) -> None:
         parquet_paths = self._collect_parquet_paths()
 
-        # Read all parquets with polars (parallel internally, much faster than pandas)
+        if self.robot_type != "all":
+            rt_map = self._load_robot_type_map()
+            allowed = {idx for idx, rt in rt_map.items() if rt == self.robot_type}
+
+            def _ep_idx_from_path(p: str) -> int:
+                return int(os.path.basename(p)[len("episode_"):-len(".parquet")])
+
+            kept = [p for p in parquet_paths if _ep_idx_from_path(p) in allowed]
+            print(
+                f"[HEDataset] robot_type='{self.robot_type}': kept "
+                f"{len(kept)} / {len(parquet_paths)} episodes."
+            )
+            parquet_paths = kept
+
         dfs = [pl.read_parquet(p, columns=["episode_index", "task_index"]) for p in parquet_paths]
         df = pl.concat(dfs)
         del dfs
 
-        # Build per-episode (vid_len, tok_len, task) via groupby — handles
-        # non-contiguous episodes safely. ``vid_len`` is the parquet/video row
-        # count (30 Hz native); ``tok_len`` is the SONIC token row count, which
-        # is 50 Hz after calc_sonic_tokens.py's upsampling. The flat index is
-        # expanded along the token axis so ``frame_local`` is the 50 Hz time
-        # step, matching EgoDexDataset.
+        # Per-episode metadata. ``vid_len`` is the parquet/video row count
+        # (30 Hz native); ``tok_len`` is the SONIC token row count (50 Hz after
+        # calc_sonic_tokens.py's upsampling).
         ep_ids: list[int] = []
         ep_vid_lens: list[int] = []
         ep_tok_lens: list[int] = []
@@ -131,108 +149,31 @@ class HEDataset(Dataset):
             ep_tok_lens.append(tok_len)
             ep_tasks.append(int(group["task_index"][0]))
 
-        total = sum(ep_tok_lens)
-        frame_ep = np.empty(total, dtype=np.int32)
-        frame_ep_tok_len = np.empty(total, dtype=np.int32)
-        frame_ep_vid_len = np.empty(total, dtype=np.int32)
-        frame_local = np.empty(total, dtype=np.int32)
-        frame_task = np.empty(total, dtype=np.int32)
+        self._ep_episode_idx = np.asarray(ep_ids, dtype=np.int32)
+        self._ep_tok_len = np.asarray(ep_tok_lens, dtype=np.int32)
+        self._ep_vid_len = np.asarray(ep_vid_lens, dtype=np.int32)
+        self._ep_task = np.asarray(ep_tasks, dtype=np.int32)
 
-        cur = 0
-        for ep_id, vid_len, tok_len, task in zip(ep_ids, ep_vid_lens, ep_tok_lens, ep_tasks):
-            sl = slice(cur, cur + tok_len)
-            frame_ep[sl] = ep_id
-            frame_ep_tok_len[sl] = tok_len
-            frame_ep_vid_len[sl] = vid_len
-            frame_local[sl] = np.arange(tok_len, dtype=np.int32)
-            frame_task[sl] = task
-            cur += tok_len
+    # -- hooks ---------------------------------------------------------------
 
-        self._frame_ep = frame_ep
-        self._frame_ep_tok_len = frame_ep_tok_len
-        self._frame_ep_vid_len = frame_ep_vid_len
-        self._frame_local = frame_local
-        self._frame_task = frame_task
-
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        tmp_path = f"{cache_path}.tmp.{os.getpid()}"
-        np.savez(
-            tmp_path,
-            frame_ep=frame_ep,
-            frame_ep_tok_len=frame_ep_tok_len,
-            frame_ep_vid_len=frame_ep_vid_len,
-            frame_local=frame_local,
-            frame_task=frame_task,
-        )
-        # ``np.savez`` writes ``<tmp_path>.npz`` when given a path without
-        # the suffix; rename it onto the canonical location atomically so
-        # racing ranks don't see a half-written index.
-        written = tmp_path if os.path.exists(tmp_path) else f"{tmp_path}.npz"
-        os.replace(written, cache_path)
-
-    def _get_sonic_tokens(self, ep_idx: int) -> np.ndarray:
-        # mmap so the OS page cache is shared across workers/processes; LRU
-        # cache the mmap object itself so consecutive samples from the same
-        # episode skip the mmap setup syscall.
-        npy_path = os.path.join(self.sonic_tokens_dir, f"episode_{ep_idx:06d}.npy")
-        return _get_sonic_mmap(npy_path)
-
-    def __len__(self) -> int:
-        return int(self._frame_ep.shape[0])
-
-    def episode_spans(self) -> np.ndarray:
-        """Return ``[N, 2]`` int64 array of ``(start_idx, length)`` per episode.
-
-        ``_load_data`` builds the flat index so each episode occupies a
-        contiguous block in row order, so spans fall out of "where does
-        ``frame_local == 0``". Lengths are in 50 Hz token rows, matching
-        ``EgoDexDataset.episode_spans``.
-        """
-        starts = np.flatnonzero(self._frame_local == 0).astype(np.int64, copy=False)
-        if starts.size == 0:
-            return np.zeros((0, 2), dtype=np.int64)
-        lengths = self._frame_ep_tok_len[starts].astype(np.int64, copy=False)
-        out = np.empty((starts.size, 2), dtype=np.int64)
-        out[:, 0] = starts
-        out[:, 1] = lengths
-        return out
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        ep_idx = int(self._frame_ep[idx])
-        tok_len = int(self._frame_ep_tok_len[idx])
-        vid_len = int(self._frame_ep_vid_len[idx])
-        t = int(self._frame_local[idx])  # 50 Hz token index
-        task_idx = int(self._frame_task[idx])
-        text = self.task_map.get(task_idx, "perform the task")
-
-        # Map 50 Hz token index to 30 Hz video frame using the per-episode
-        # actual ratio rather than a fixed 30/50, so off-by-one rounding from
-        # the resampler stays in sync with the encoded token count.
-        frame_id = min(int(t * vid_len / max(tok_len, 1)), max(vid_len - 1, 0))
-        video_path = os.path.join(
+    def _video_for(self, ep: int, t: int) -> tuple[str, int]:
+        ep_idx = int(self._ep_episode_idx[ep])
+        tok_len = int(self._ep_tok_len[ep])
+        vid_len = int(self._ep_vid_len[ep])
+        # Use per-episode ratio rather than a fixed 30/50 so off-by-one
+        # rounding from the resampler stays in sync with the encoded count.
+        frame_idx = min(int(t * vid_len / max(tok_len, 1)), max(vid_len - 1, 0))
+        path = os.path.join(
             self.data_root,
             f"videos/chunk-{ep_idx // 1000:03d}/egocentric/episode_{ep_idx:06d}.mp4",
         )
-        pil_image = self._decode_frame(video_path, frame_id)
+        return path, frame_idx
 
-        sonic_all = self._get_sonic_tokens(ep_idx)
-        chunk_indices = [min(t + k, tok_len - 1) for k in range(self.action_chunk_size)]
-        sonic_tokens = sonic_all[chunk_indices]
-        sonic_mask = np.array(
-            [1.0 if t + k < tok_len else 0.0 for k in range(self.action_chunk_size)],
-            dtype=np.float32,
+    def _text(self, ep: int) -> str:
+        return self._task_map.get(int(self._ep_task[ep]), "perform the task")
+
+    def _tokens(self, ep: int) -> np.ndarray:
+        ep_idx = int(self._ep_episode_idx[ep])
+        return get_token_mmap(
+            os.path.join(self.sonic_tokens_dir, f"episode_{ep_idx:06d}.npy")
         )
-
-        return {
-            "image": pil_image,
-            "text": text,
-            "sonic_tokens": torch.from_numpy(sonic_tokens.copy()),
-            "sonic_mask": torch.from_numpy(sonic_mask),
-        }
-
-    @staticmethod
-    def _decode_frame(video_path: str, frame_idx: int) -> Image.Image:
-        from src.data.video_reader import decode_frame
-
-        frame = decode_frame(video_path, frame_idx, target_size=(640, 480))
-        return Image.fromarray(frame)

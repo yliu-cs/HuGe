@@ -64,7 +64,138 @@ def reset_frame_cache_stats() -> None:
     _FRAME_CACHE_MISSES = 0
 
 
+class _PyAVReader:
+    """decord-compatible shim over PyAV for codecs decord can't open (AV1).
+
+    Exposes ``__len__`` and ``__getitem__(i)`` returning an object with
+    ``.asnumpy()`` so callers don't branch on backend. Seeks are O(GOP) — the
+    same granularity decord offers for H.264/H.265 — so the existing reader
+    LRU + frame cache + ``BlockShuffleSampler`` all amortize cost identically.
+    """
+
+    class _Frame:
+        __slots__ = ("_arr",)
+        def __init__(self, arr: np.ndarray) -> None:
+            self._arr = arr
+        def asnumpy(self) -> np.ndarray:
+            return self._arr
+
+    def __init__(self, path: str, width: Optional[int], height: Optional[int]) -> None:
+        import av
+
+        self._path = path
+        self._width = width
+        self._height = height
+        # Force libdav1d threading to single — DataLoader workers parallelize
+        # at the sample level, oversubscribing here just thrashes the cache.
+        opts = {"threads": "1"}
+        self._container = av.open(path, options=opts)
+        self._stream = self._container.streams.video[0]
+        # PyAV stream.frames is the muxer-reported total; sometimes 0 for
+        # streams without an index, in which case fall back to time_base*duration.
+        self._n = int(self._stream.frames)
+        if self._n <= 0:
+            dur = self._stream.duration
+            tb = self._stream.time_base
+            avg = self._stream.average_rate
+            if dur is not None and tb is not None and avg is not None:
+                self._n = int(round(float(dur * tb) * float(avg)))
+        self._iter = None
+        self._next_idx = -1  # index of the frame the iterator will yield next
+
+    def __len__(self) -> int:
+        return max(0, self._n)
+
+    def _restart_iter(self) -> None:
+        self._container.seek(0, stream=self._stream)
+        self._iter = self._container.decode(video=0)
+        self._next_idx = 0
+
+    def _seek_near(self, target: int) -> None:
+        # av.seek wants stream-time-base PTS; convert from frame index using
+        # the stream's average rate. seek backward=True snaps to the nearest
+        # keyframe at or before the target.
+        avg = self._stream.average_rate
+        tb = self._stream.time_base
+        if avg is None or tb is None or avg == 0:
+            self._restart_iter()
+            return
+        ts = int(target / float(avg) / float(tb))
+        self._container.seek(ts, stream=self._stream, any_frame=False, backward=True)
+        self._iter = self._container.decode(video=0)
+        # We don't know exactly which frame the keyframe corresponds to until
+        # we read it; decode-forward will handle the offset using PTS below.
+        self._next_idx = -1  # unknown, resolve on the fly
+
+    def __getitem__(self, idx: int) -> "_PyAVReader._Frame":
+        target = max(0, min(int(idx), self._n - 1)) if self._n > 0 else 0
+
+        # Sequential case: just step the iterator forward.
+        if self._iter is not None and 0 <= self._next_idx <= target and (target - self._next_idx) < 64:
+            for _ in range(target - self._next_idx):
+                next(self._iter)
+            frame = next(self._iter)
+            self._next_idx = target + 1
+            return _PyAVReader._Frame(self._to_rgb(frame))
+
+        # Random access: seek to the keyframe before target, then decode forward
+        # using PTS to count frames precisely.
+        self._seek_near(target)
+        avg = self._stream.average_rate
+        tb = self._stream.time_base
+        chosen = None
+        last = None
+        for fr in self._iter:
+            last = fr
+            if fr.pts is None:
+                continue
+            cur_idx = int(round(float(fr.pts * tb) * float(avg))) if (avg and tb) else 0
+            if cur_idx >= target:
+                chosen = fr
+                self._next_idx = cur_idx + 1
+                break
+        if chosen is None:
+            chosen = last  # ran past end; serve the last decoded frame
+            self._next_idx = self._n
+        return _PyAVReader._Frame(self._to_rgb(chosen))
+
+    def _to_rgb(self, frame) -> np.ndarray:
+        if self._width is not None and self._height is not None:
+            frame = frame.reformat(width=self._width, height=self._height, format="rgb24")
+        else:
+            frame = frame.reformat(format="rgb24")
+        # to_ndarray returns (H, W, 3) uint8 in RGB layout.
+        return np.ascontiguousarray(frame.to_ndarray())
+
+
+# Codec probe results keyed by path. Cheap (one open() per file) and cached
+# for the lifetime of the worker.
+_CODEC_CACHE: dict[str, str] = {}
+
+
+def _probe_codec(path: str) -> str:
+    name = _CODEC_CACHE.get(path)
+    if name is not None:
+        return name
+    try:
+        import av
+        with av.open(path) as c:
+            name = c.streams.video[0].codec_context.name or ""
+    except Exception:
+        name = ""
+    _CODEC_CACHE[path] = name
+    return name
+
+
+# decord can't decode AV1 (its bundled ffmpeg lacks libdav1d); route those to
+# PyAV transparently. Any other codec keeps the decord fast path.
+_PYAV_CODECS = {"av1", "libdav1d"}
+
+
 def _open_reader(path: str, width: Optional[int] = None, height: Optional[int] = None):
+    if _probe_codec(path) in _PYAV_CODECS:
+        return _PyAVReader(path, width, height)
+
     import decord
 
     # num_threads=1 — DataLoader workers already give us process-level

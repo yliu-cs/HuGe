@@ -1,12 +1,16 @@
-"""
-Configuration system for kappa training.
+"""Base configuration classes for Kappa training.
+
+Per-source data configs live in sibling modules (``data_he.py``,
+``data_egodex.py``, ``data_wbt.py``, ``data_mix.py``) — this file only holds
+the cross-cutting base types (logging, train loop, abstract data, model,
+launch). New data sources should add a new ``data_<source>.py`` rather than
+extending this file.
 """
 from __future__ import annotations
 
-import os
 import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 from pydantic import BaseModel, Field, model_validator
 from typing_extensions import Self
@@ -118,61 +122,20 @@ class TrainConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
+    """Abstract base for per-source data configs.
+
+    Concrete subclasses live in ``data_<source>.py`` and override
+    ``__call__`` to construct the underlying raw dataset and wrap it in
+    ``src.data.dataset.Dataset`` with this config's ``transform`` pipeline.
+    """
     # Trainer dispatches on this name; subclasses override.
     dataset_name: str = "humanoid_everyday"
     # Per-sample pipeline: repack (source-specific) -> field (token-space) ->
-    # model (image augmentation). Default 224×224 lives on KappaModelTransform.
+    # model (image augmentation). Default 320×224 (W×H) lives on KappaModelTransform.
     transform: DataTransform = Field(default_factory=DataTransform)
 
     def __call__(self, split: str = "train", transform_kwargs: dict | None = None) -> Any:
         raise NotImplementedError
-
-
-class HEDataConfig(DataConfig):
-    dataset_name: str = "humanoid_everyday"
-    data_root: str = "resource/dataset/humanoid-everyday"
-    cache_root: str | None = None  # auto-resolved at runtime to writable parallel dir
-    action_chunk_size: int = 50
-
-    def __call__(self, split: str = "train", transform_kwargs: dict | None = None) -> Any:
-        from src.data import HEDataset
-        from src.data.dataset import Dataset
-
-        raw = HEDataset(
-            data_root=self.data_root,
-            action_chunk_size=self.action_chunk_size,
-            split=split,
-            cache_root=self.cache_root,
-        )
-        return Dataset(raw, self.transform, transform_kwargs=transform_kwargs)
-
-
-class EgoDexDataConfig(DataConfig):
-    dataset_name: str = "egodex"
-    data_root: str = "resource/dataset/EgoDex/egodex_repacked_simple"
-    cache_root: str | None = None  # auto-resolved at runtime to writable parallel dir
-    action_chunk_size: int = 50
-    sonic_dim: int = 66
-    # Optional cap on # episodes loaded (for fast smoke tests). None = use all.
-    max_episodes: int | None = None
-    # Number of threads to probe `token_state.npy` shape during the first index
-    # build. The cached JSON makes subsequent runs instant.
-    index_workers: int = 32
-
-    def __call__(self, split: str = "train", transform_kwargs: dict | None = None) -> Any:
-        from src.data import EgoDexDataset
-        from src.data.dataset import Dataset
-
-        raw = EgoDexDataset(
-            data_root=self.data_root,
-            action_chunk_size=self.action_chunk_size,
-            split=split,
-            cache_root=self.cache_root,
-            sonic_dim=self.sonic_dim,
-            max_episodes=self.max_episodes,
-            index_workers=self.index_workers,
-        )
-        return Dataset(raw, self.transform, transform_kwargs=transform_kwargs)
 
 
 class ModelConfig(BaseModel):

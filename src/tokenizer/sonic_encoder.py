@@ -117,10 +117,10 @@ def load_hand_thresholds(threshold_json_path: str) -> HandThresholds:
     """
     with open(threshold_json_path) as f:
         meta = json.load(f)
-    if meta.get("schema_version") != 2:
+    if meta.get("schema_version") != 3:
         raise ValueError(
             f"hand_threshold.json schema_version={meta.get('schema_version')} unsupported; "
-            f"expected 2. Re-run scripts/calc_hand_thresholds.py."
+            f"expected 3. Re-run scripts/calc_hand_thresholds.py."
         )
     return (
         float(meta["left"]["low_abs"]),

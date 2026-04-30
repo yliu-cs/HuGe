@@ -14,11 +14,8 @@ configs share ``KappaModelConfig`` with ``sonic_dim=66``).
 """
 from pydantic import Field
 
-from src.config.config import (
-    EgoDexDataConfig,
-    LaunchConfig,
-    TrainConfig,
-)
+from src.config.config import LaunchConfig, TrainConfig
+from src.config.data_egodex import EgoDexDataConfig
 from src.config.model_kappa import KappaModelConfig
 from src.data.transform import (
     DataTransform,
@@ -28,19 +25,19 @@ from src.data.transform import (
 )
 
 
-class DynamicDataTransform(DataTransform):
+class EgoDexDataTransform(DataTransform):
     repack: EgodexRepackTransform = Field(default_factory=EgodexRepackTransform)
     field: IdentityFieldTransform = Field(default_factory=IdentityFieldTransform)
     model: KappaModelTransform = Field(default_factory=KappaModelTransform)
 
 
-class DynamicDataConfig(EgoDexDataConfig):
-    transform: DynamicDataTransform = Field(default_factory=DynamicDataTransform)
+class EgoDexDataConfig(EgoDexDataConfig):
+    transform: EgoDexDataTransform = Field(default_factory=EgoDexDataTransform)
 
 
-class DynamicLaunchConfig(LaunchConfig):
+class EgoDexLaunchConfig(LaunchConfig):
     model: KappaModelConfig
-    data: DynamicDataConfig = Field(default_factory=DynamicDataConfig)
+    data: EgoDexDataConfig = Field(default_factory=EgoDexDataConfig)
 
     # Effective global batch = train_batch_size × world_size × grad_accum = 64
     # on 1 GPU and 512 on 8 GPUs (same as the previous (64, 1) config on 8 GPUs,
@@ -49,7 +46,7 @@ class DynamicLaunchConfig(LaunchConfig):
     train: TrainConfig = TrainConfig(
         name="kappa",
         num_train_epochs=1,
-        train_batch_size=96,
+        train_batch_size=128,
         gradient_accumulation_steps=1,
         num_workers=8,
         prefetch_factor=2,
@@ -59,11 +56,14 @@ class DynamicLaunchConfig(LaunchConfig):
         # token-to-video mapping reuses across adjacent token rows.
         block_shuffle_size=64,
         frame_cache_size=2,
-        checkpointing_steps=10000,
+        checkpointing_steps=30000,
         max_checkpoints_to_keep=5,
         validation_steps=0,
         mixed_precision="bf16",
-        learning_rate=4e-5,
+        learning_rate=5e-5,
         warmup_steps=0,
         warmup_ratio=0.01,
     )
+
+
+LaunchConfig = EgoDexLaunchConfig

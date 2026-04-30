@@ -1,11 +1,8 @@
 """Pretrain config for Kappa on Humanoid-Everyday."""
 from pydantic import Field
 
-from src.config.config import (
-    HEDataConfig,
-    LaunchConfig,
-    TrainConfig,
-)
+from src.config.config import LaunchConfig, TrainConfig
+from src.config.data_he import HEDataConfig
 from src.config.model_kappa import KappaModelConfig
 from src.data.transform import (
     DataTransform,
@@ -15,19 +12,19 @@ from src.data.transform import (
 )
 
 
-class DynamicDataTransform(DataTransform):
+class HEDataTransform(DataTransform):
     repack: HERepackTransform = Field(default_factory=HERepackTransform)
     field: IdentityFieldTransform = Field(default_factory=IdentityFieldTransform)
     model: KappaModelTransform = Field(default_factory=KappaModelTransform)
 
 
-class DynamicDataConfig(HEDataConfig):
-    transform: DynamicDataTransform = Field(default_factory=DynamicDataTransform)
+class HEDataConfig(HEDataConfig):
+    transform: HEDataTransform = Field(default_factory=HEDataTransform)
 
 
-class DynamicLaunchConfig(LaunchConfig):
+class HELaunchConfig(LaunchConfig):
     model: KappaModelConfig
-    data: DynamicDataConfig = Field(default_factory=DynamicDataConfig)
+    data: HEDataConfig = Field(default_factory=HEDataConfig)
 
     train: TrainConfig = TrainConfig(
         name="kappa",
@@ -51,3 +48,8 @@ class DynamicLaunchConfig(LaunchConfig):
         warmup_steps=500,
         warmup_ratio=0,
     )
+
+
+# Convention: scripts/train.py looks up a module-level `LaunchConfig` symbol
+# so it doesn't need to know the per-stage class name.
+LaunchConfig = HELaunchConfig

@@ -85,6 +85,7 @@ class MoTAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         n_latent: Optional[int] = None,
+        kv_cache_out: Optional[dict] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # ``n_latent`` is the count of language/vision tokens; action tokens
@@ -113,6 +114,15 @@ class MoTAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # Latent-prefix KV caching: post-RoPE K and V for the latent positions
+        # are cross-step invariant under the new mask (which forbids latent →
+        # action attention), so callers in the inference loop can populate the
+        # cache once and reuse it. ``v_latent`` would also be invariant pre-
+        # RoPE, but we keep the slicing symmetric here.
+        if kv_cache_out is not None:
+            kv_cache_out["k"] = key_states[:, :, :n_latent, :].detach().contiguous()
+            kv_cache_out["v"] = value_states[:, :, :n_latent, :].detach().contiguous()
+
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         from transformers.models.qwen3_vl.modeling_qwen3_vl import eager_attention_forward
         # Force SDPA: the action expert relies on a 4D float attention mask
@@ -140,6 +150,63 @@ class MoTAttention(nn.Module):
         action_out = self.o_proj_action(attn_output[:, n_latent:])
         return torch.cat([latent_out, action_out], dim=1), attn_weights
 
+    def forward_cached(
+        self,
+        action_h: torch.Tensor,
+        position_embeddings_action: tuple[torch.Tensor, torch.Tensor],
+        attention_mask_action: torch.Tensor,
+        kv_cache: dict,
+    ) -> torch.Tensor:
+        """Action-only attention reusing cached latent K/V.
+
+        ``action_h`` is the timestep+action tail (length ``T_action+1``).
+        ``position_embeddings_action`` is the rotary (cos, sin) sliced to that
+        tail. ``attention_mask_action`` is the row-sliced mask of shape
+        ``[B, 1, T_action+1, T_total]``. ``kv_cache`` holds post-RoPE
+        ``k``/``v`` of shape ``[B, num_kv_heads, T_text, head_dim]`` produced
+        by a prior full forward.
+
+        Returns ``[B, T_action+1, hidden_size]`` after ``o_proj_action``.
+        """
+        attn = self.original
+        head_dim = attn.head_dim
+        B, T_tail, _ = action_h.shape
+        hidden_shape_fn = lambda x: (*x.shape[:-1], -1, head_dim)
+
+        q_action = self.q_norm_action(
+            self.q_proj_action(action_h).view(hidden_shape_fn(action_h))
+        ).transpose(1, 2)
+        k_action = self.k_norm_action(
+            self.k_proj_action(action_h).view(hidden_shape_fn(action_h))
+        ).transpose(1, 2)
+        v_action = self.v_proj_action(action_h).view(hidden_shape_fn(action_h)).transpose(1, 2)
+
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+        cos_a, sin_a = position_embeddings_action
+        q_action, k_action = apply_rotary_pos_emb(q_action, k_action, cos_a, sin_a)
+
+        # Stitch cached latent K/V (already post-RoPE) with fresh action K/V.
+        key_states = torch.cat([kv_cache["k"], k_action], dim=2)
+        value_states = torch.cat([kv_cache["v"], v_action], dim=2)
+
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import eager_attention_forward
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            "sdpa", eager_attention_forward
+        )
+
+        attn_output, _ = attention_interface(
+            attn,
+            q_action,
+            key_states,
+            value_states,
+            attention_mask_action,
+            dropout=0.0,
+            scaling=attn.scaling,
+        )
+        attn_output = attn_output.reshape(B, T_tail, -1).contiguous()
+        return self.o_proj_action(attn_output)
+
 
 class MoTDecoderLayer(nn.Module):
     """Decoder layer with shared attention and independent MLP for action tokens."""
@@ -164,6 +231,7 @@ class MoTDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         n_latent: Optional[int] = None,
+        kv_cache_out: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # latent | action are kept contiguous along dim=1, so we slice
@@ -184,6 +252,7 @@ class MoTDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             n_latent=n_latent,
+            kv_cache_out=kv_cache_out,
             **kwargs,
         )
         hidden_states = residual + attn_out.to(hidden_states.dtype)
@@ -196,6 +265,32 @@ class MoTDecoderLayer(nn.Module):
         hidden_states = residual + torch.cat([mlp_latent, mlp_action], dim=1)
 
         return hidden_states
+
+    def forward_cached(
+        self,
+        action_h: torch.Tensor,
+        position_embeddings_action: tuple[torch.Tensor, torch.Tensor],
+        attention_mask_action: torch.Tensor,
+        kv_cache: dict,
+    ) -> torch.Tensor:
+        """Action-only layer step. Skips the latent path entirely — its
+        attention/MLP outputs are unchanged across denoising steps under the
+        latent→action mask, so the caller has cached the latent K/V from a
+        prior full forward and discarded the latent hidden states.
+        """
+        residual = action_h
+        normed = self.input_layernorm_action(action_h)
+        attn_out = self.self_attn.forward_cached(
+            action_h=normed,
+            position_embeddings_action=position_embeddings_action,
+            attention_mask_action=attention_mask_action,
+            kv_cache=kv_cache,
+        )
+        action_h = residual + attn_out.to(action_h.dtype)
+
+        residual = action_h
+        mlp_out = self.mlp_action(self.post_attention_layernorm_action(action_h)).to(action_h.dtype)
+        return residual + mlp_out
 
 
 class MoTKappaModel(nn.Module):
@@ -301,6 +396,12 @@ class MoTKappaModel(nn.Module):
         full_attn_mask = torch.zeros(B, 1, T_total, T_total, device=input_ids.device, dtype=all_embeds.dtype)
         causal_mask = torch.triu(torch.ones(T_text, T_text, device=input_ids.device, dtype=torch.bool), diagonal=1)
         full_attn_mask[:, 0, :T_text, :T_text].masked_fill_(causal_mask, float("-inf"))
+        # Block latent → (timestep + action): the latent prefix's hidden states
+        # depend only on (image, text) and are constant across denoising steps,
+        # which lets inference cache K_latent/V_latent once per observation
+        # (see ``encode_latent`` / ``denoise_step``). π₀ / SmolVLA use the same
+        # one-way attention between the VLM prefix and the action expert.
+        full_attn_mask[:, 0, :T_text, T_text:] = float("-inf")
         if attention_mask is not None:
             pad_positions = attention_mask == 0
             full_attn_mask[:, 0, :, :T_text].masked_fill_(pad_positions.unsqueeze(1), float("-inf"))
@@ -343,3 +444,127 @@ class MoTKappaModel(nn.Module):
             loss=torch.zeros((), device=velocity_pred.device),
             logits=velocity_pred,
         )
+
+    @torch.no_grad()
+    def encode_latent(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        T_action: int = 50,
+    ) -> dict:
+        """Run the latent prefix once and return a cache for ``denoise_step``.
+
+        Computes inputs_embeds (with image fusion), the full attention mask,
+        rotary position embeddings, and per-layer ``(K_latent, V_latent)``
+        post-RoPE — every quantity that the denoising loop would otherwise
+        recompute despite being constant across steps.
+
+        Run with a dummy zero tail in the action expert path: the latent →
+        action mask block ensures latent hidden states (and thus K_latent /
+        V_latent) are independent of timestep / noisy_sonic_tokens, so the
+        zeros do not affect what is cached. The action segment of the encode
+        pass is computed but discarded.
+        """
+        qwen_model = self.base_model.model
+        language_model = qwen_model.language_model
+
+        inputs_embeds = language_model.embed_tokens(input_ids)
+
+        if pixel_values is not None:
+            image_outputs = qwen_model.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
+            )
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = qwen_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        B, T_text, D = inputs_embeds.shape
+        T_total = T_text + 1 + T_action
+
+        # Dummy tail (timestep + action positions). The latent→action mask
+        # block makes latent_h independent of these zeros, so K_latent/V_latent
+        # are correct regardless of what we put here.
+        tail = torch.zeros(B, 1 + T_action, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        all_embeds = torch.cat([inputs_embeds, tail], dim=1)
+
+        full_attn_mask = torch.zeros(B, 1, T_total, T_total, device=input_ids.device, dtype=all_embeds.dtype)
+        causal_mask = torch.triu(
+            torch.ones(T_text, T_text, device=input_ids.device, dtype=torch.bool), diagonal=1
+        )
+        full_attn_mask[:, 0, :T_text, :T_text].masked_fill_(causal_mask, float("-inf"))
+        full_attn_mask[:, 0, :T_text, T_text:] = float("-inf")
+        if attention_mask is not None:
+            pad_positions = attention_mask == 0
+            full_attn_mask[:, 0, :, :T_text].masked_fill_(pad_positions.unsqueeze(1), float("-inf"))
+
+        position_ids = torch.arange(T_total, device=input_ids.device).unsqueeze(0).expand(B, -1)
+        position_embeddings = language_model.rotary_emb(all_embeds, position_ids)
+
+        layer_caches: list[dict] = []
+        hidden_states = all_embeds
+        for layer in language_model.layers:
+            cache: dict = {}
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=full_attn_mask,
+                n_latent=T_text,
+                kv_cache_out=cache,
+            )
+            layer_caches.append(cache)
+
+        # Pre-slice everything ``denoise_step`` needs for the action tail so
+        # the per-step path does no Python-side slicing. Cos/sin on the action
+        # rows; mask rows are the action queries.
+        cos_full, sin_full = position_embeddings
+        cos_action = cos_full[:, T_text:, :].contiguous()
+        sin_action = sin_full[:, T_text:, :].contiguous()
+        attention_mask_action = full_attn_mask[:, :, T_text:, :].contiguous()
+
+        return {
+            "T_text": T_text,
+            "T_action": T_action,
+            "T_total": T_total,
+            "B": B,
+            "device": input_ids.device,
+            "dtype": inputs_embeds.dtype,
+            "position_embeddings_action": (cos_action, sin_action),
+            "attention_mask_action": attention_mask_action,
+            "layer_caches": layer_caches,
+        }
+
+    @torch.no_grad()
+    def denoise_step(
+        self,
+        cache: dict,
+        noisy_sonic_tokens: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single flow-matching forward reusing the cached latent prefix.
+
+        Only the action expert (timestep token + ``T_action`` action tokens) is
+        re-evaluated each call; the language/vision prefix is read from the
+        cached per-layer K/V. Returns velocity prediction with shape
+        ``[B, T_action, sonic_dim]``.
+        """
+        language_model = self.base_model.model.language_model
+
+        t_emb = self.t_embedder(timesteps).unsqueeze(1)
+        action_embeds = self.action_embedder(noisy_sonic_tokens.to(cache["dtype"]))
+        action_h = torch.cat([t_emb, action_embeds], dim=1)
+
+        for layer, kv_cache in zip(language_model.layers, cache["layer_caches"]):
+            action_h = layer.forward_cached(
+                action_h=action_h,
+                position_embeddings_action=cache["position_embeddings_action"],
+                attention_mask_action=cache["attention_mask_action"],
+                kv_cache=kv_cache,
+            )
+
+        action_hidden = self.norm_action(action_h[:, 1:])  # drop timestep token
+        return self.velocity_head(action_hidden)

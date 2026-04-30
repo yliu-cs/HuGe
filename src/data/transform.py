@@ -1,7 +1,7 @@
 """Per-sample data transform pipeline (repack -> field -> model).
 
 Mirrors the Psi0 design (`psi.config.transform`) so config files can be tuned
-the same way (`--data.transform.model.resize.size 224 224`, etc.). The pipeline
+the same way (`--data.transform.model.resize.size 224`, etc.). The pipeline
 takes raw dataset output (HE / EgoDex) and emits a normalized dict that
 ``KappaCollator`` can batch-tokenize.
 
@@ -14,9 +14,13 @@ Stages
 * **Field**: a slot for token-space normalization. SONIC tokens are precomputed
   features that are already statistics-stable, so the default is an identity
   transform — kept as an extension point.
-* **Model**: image augmentation. ``Resize -> CenterCrop`` defaults to 224×224
-  (a 14×14 patch grid for Qwen3-VL with patch_size=16, ~196 vision tokens) and
-  is the main lever exposed via the launcher.
+* **Model**: image augmentation. ``Resize(short=224) -> CenterCrop(224, 320)``
+  emits landscape 320W×224H frames. 224 and 320 are both multiples of the
+  Qwen3-VL ``patch_size × merge_size = 32`` factor, so the patch grid is
+  exactly 14×20 = 280 patches → 7×10 = 70 merged vision tokens (vs 64 at 256²). The
+  area 224×320=71680 > processor ``shortest_edge=65536`` (an *area* threshold,
+  not edge length), so smart_resize is a no-op and the dataloader output is
+  consumed as-is.
 """
 from __future__ import annotations
 
@@ -48,7 +52,8 @@ class ResizeImage(BaseModel):
 
 
 class CenterCrop(BaseModel):
-    size: Union[int, Tuple[int, int]] = 224
+    # ``(H, W)`` — torchvision CenterCrop convention.
+    size: Union[int, Tuple[int, int]] = (224, 320)
 
     def __call__(self):
         from torchvision.transforms import v2
@@ -165,7 +170,7 @@ class KappaModelTransform(ModelTransform):
     """
 
     resize: ResizeImage = Field(default_factory=lambda: ResizeImage(size=224))
-    center_crop: CenterCrop = Field(default_factory=lambda: CenterCrop(size=224))
+    center_crop: CenterCrop = Field(default_factory=lambda: CenterCrop(size=(224, 320)))
     color_jitter: Optional[ColorJitter] = Field(default_factory=ColorJitter)
     img_aug: bool = False
 

@@ -34,6 +34,26 @@ def discover_episodes(data_root: str) -> list[tuple[int, str]]:
     return out
 
 
+def load_robot_type_map(data_root: str) -> dict[int, str]:
+    """Read meta/episodes.jsonl and return ``{episode_index: robot_type}``.
+
+    humanoid-everyday is a G1+H1 mix; we filter on this to avoid encoding two
+    incompatible joint layouts through the same SONIC encoder. The 29-dim
+    ``jp`` vector with arm starting at index 15 only matches G1 (leg=15,
+    arm=14); H1 (leg=13, arm=14) leaves indices 13/14 as zeros and shifts
+    semantics, which silently poisons the token distribution.
+    """
+    import json
+
+    path = os.path.join(data_root, "meta", "episodes.jsonl")
+    out: dict[int, str] = {}
+    with open(path) as f:
+        for line in f:
+            entry = json.loads(line)
+            out[int(entry["episode_index"])] = str(entry.get("robot_type", "")).lower()
+    return out
+
+
 def load_episode_arrays(parquet_path: str):
     import numpy as np
     import polars as pl
@@ -54,45 +74,13 @@ def load_episode_arrays(parquet_path: str):
     return jp, oq, ig, hj
 
 
-def _resample_linear(arr, n_src: int, n_tgt: int):
-    """Linear interpolation along axis=0 from length n_src to n_tgt. Preserves dtype."""
-    import numpy as np
-
-    if n_tgt == n_src:
-        return arr
-    if n_src == 1:
-        return np.repeat(arr, n_tgt, axis=0)
-    pos = np.linspace(0.0, n_src - 1, n_tgt)
-    lo = np.floor(pos).astype(np.int64)
-    hi = np.minimum(lo + 1, n_src - 1)
-    frac = (pos - lo).reshape((n_tgt,) + (1,) * (arr.ndim - 1))
-    out = (1.0 - frac) * arr[lo] + frac * arr[hi]
-    return out.astype(arr.dtype, copy=False)
-
-
-def _resample_quat_wxyz(q, n_src: int, n_tgt: int):
-    """Linear interpolation of WXYZ unit quaternions with sign canonicalization
-    + L2 renormalization. SLERP would be exact, but at 30→50 Hz the per-step
-    rotation is small (<<1 rad), so canonicalized lerp + renorm is within rounding.
-    """
-    import numpy as np
-
-    if n_tgt == n_src:
-        return q
-    # Canonicalize: flip signs so consecutive quats have nonneg dot — avoids
-    # lerp taking the long way around the hypersphere.
-    q = q.astype(np.float64, copy=True)
-    if n_src > 1:
-        dots = np.sum(q[1:] * q[:-1], axis=-1)
-        flips = np.cumprod(np.where(dots < 0.0, -1.0, 1.0))
-        q[1:] *= flips[:, None]
-    out = _resample_linear(q, n_src, n_tgt)
-    norms = np.linalg.norm(out, axis=-1, keepdims=True)
-    safe = norms >= 1e-10
-    normalized = np.divide(out, norms, out=np.zeros_like(out), where=safe)
-    identity = np.array([1.0, 0.0, 0.0, 0.0])
-    out = np.where(safe, normalized, identity)
-    return out.astype(np.float32, copy=False)
+# Resampling helpers live in src.data.preprocess so HE/WBT/future sources stay
+# bit-identical (the SONIC token distribution is sensitive to upsampling).
+from src.data.preprocess import (  # noqa: E402
+    atomic_save_npy,
+    resample_linear as _resample_linear,
+    resample_quat_wxyz as _resample_quat_wxyz,
+)
 
 
 def worker_main(
@@ -136,9 +124,7 @@ def worker_main(
                 hj = _resample_linear(hj, n_src, n_tgt)
             tokens = encoder.encode_episode(jp, oq, ig, hj, hand_thresholds, fps=target_fps)
             final = os.path.join(out_dir, f"episode_{ep_idx:06d}.npy")
-            tmp = final + ".tmp.npy"
-            np.save(tmp, tokens)
-            os.replace(tmp, final)
+            atomic_save_npy(tokens, final)
             result_q.put(("ok", ep_idx, len(tokens)))
         except Exception:
             result_q.put(("err", ep_idx, traceback.format_exc()))
@@ -174,6 +160,12 @@ def main() -> None:
         "--target-fps", type=float, default=50.0,
         help="Resample inputs to this rate before encoding so output tokens land on "
              "a 50 Hz timeline (matching EgoDex). Default 50.",
+    )
+    parser.add_argument(
+        "--robot-type", default="g1",
+        help="Filter episodes by meta/episodes.jsonl:robot_type before encoding. "
+             "Default 'g1' (skip H1 — its 13D leg + 12D hand layout is incompatible "
+             "with the 29D jp / shared hand_threshold pipeline). Pass 'all' to disable.",
     )
     args = parser.parse_args()
 
@@ -238,6 +230,18 @@ def main() -> None:
 
     print(f"Discovering episodes under {args.data_root}/data ...")
     all_episodes = discover_episodes(args.data_root)
+    discovered = len(all_episodes)
+
+    robot_type_filter = args.robot_type.lower()
+    if robot_type_filter != "all":
+        rt_map = load_robot_type_map(args.data_root)
+        all_episodes = [(i, p) for i, p in all_episodes if rt_map.get(i) == robot_type_filter]
+        dropped = discovered - len(all_episodes)
+        print(
+            f"Robot-type filter='{robot_type_filter}': kept {len(all_episodes)} / "
+            f"{discovered} episodes ({dropped} dropped)."
+        )
+
     existing = {fn for fn in os.listdir(out_dir) if fn.endswith(".npy")}
     pending = [
         (idx, path) for idx, path in all_episodes
@@ -245,7 +249,7 @@ def main() -> None:
     ]
     skipped = len(all_episodes) - len(pending)
     print(
-        f"{len(all_episodes)} episodes found, {skipped} already done, "
+        f"{len(all_episodes)} episodes selected, {skipped} already done, "
         f"{len(pending)} pending. Spawning {n_workers} workers "
         f"({'CPU' if n_gpus == 0 else f'{n_gpus} GPU × {workers_per_gpu}'})."
     )
