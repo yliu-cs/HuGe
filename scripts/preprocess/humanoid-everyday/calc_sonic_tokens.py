@@ -83,12 +83,51 @@ from src.data.preprocess import (  # noqa: E402
 )
 
 
+def _dump_g1_action_and_proprio(
+    jp: "np.ndarray",
+    oq: "np.ndarray",
+    hj: "np.ndarray",
+    hand_thresholds: tuple[float, float, float, float],
+    target_fps: float,
+    g1_action_path: str,
+    g1_proprio_path: str,
+) -> None:
+    """Dump 31-D G1 actions (jp + hand_bits) and 64-D proprio (jp + hand_bits +
+    jv + odom_quat_xyzw) on the SONIC token timeline.
+
+    Lives next to the SONIC tokens so the dataset can mmap them per-episode
+    just like ``sonic_tokens/``. ``hj`` is the raw 14-D HE hand_joints; the
+    bits go through the same threshold + reverse-scan binarizer that the SONIC
+    encoder uses, so action/proprio bits stay byte-identical to the trailing
+    two columns of the SONIC token (a useful invariant for unit tests).
+    """
+    import numpy as np
+    from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw, binarize_hands
+
+    n = jp.shape[0]
+    hand_bits = binarize_hands(hj, hand_thresholds).astype(np.float32)  # (n, 2)
+    jp32 = jp.astype(np.float32, copy=False)
+    g1_action = np.concatenate([jp32, hand_bits], axis=-1).astype(np.float32)  # (n, 31)
+    atomic_save_npy(g1_action, g1_action_path)
+
+    jv = np.zeros_like(jp32)
+    if n > 1:
+        jv[1:] = (jp32[1:] - jp32[:-1]) * float(target_fps)
+    quat_xyzw = _quat_wxyz_to_xyzw(oq.astype(np.float32, copy=False)).astype(np.float32)
+    proprio = np.concatenate(
+        [jp32, hand_bits, jv, quat_xyzw], axis=-1
+    ).astype(np.float32)  # (n, 29 + 2 + 29 + 4) = (n, 64)
+    atomic_save_npy(proprio, g1_proprio_path)
+
+
 def worker_main(
     gpu_id: int | None,
     work_q: mp.Queue,
     result_q: mp.Queue,
     encoder_path: str,
     out_dir: str,
+    g1_action_dir: str,
+    g1_proprio_dir: str,
     hand_thresholds: tuple[float, float, float, float],
     source_fps: float,
     target_fps: float,
@@ -112,7 +151,7 @@ def worker_main(
         item = work_q.get()
         if item is None:
             return
-        ep_idx, parquet_path = item
+        ep_idx, parquet_path, need_sonic = item
         try:
             jp, oq, ig, hj = load_episode_arrays(parquet_path)
             n_src = jp.shape[0]
@@ -122,10 +161,25 @@ def worker_main(
                 oq = _resample_quat_wxyz(oq, n_src, n_tgt)
                 ig = _resample_linear(ig, n_src, n_tgt)
                 hj = _resample_linear(hj, n_src, n_tgt)
-            tokens = encoder.encode_episode(jp, oq, ig, hj, hand_thresholds, fps=target_fps)
-            final = os.path.join(out_dir, f"episode_{ep_idx:06d}.npy")
-            atomic_save_npy(tokens, final)
-            result_q.put(("ok", ep_idx, len(tokens)))
+
+            if need_sonic:
+                tokens = encoder.encode_episode(
+                    jp, oq, ig, hj, hand_thresholds, fps=target_fps,
+                )
+                final = os.path.join(out_dir, f"episode_{ep_idx:06d}.npy")
+                atomic_save_npy(tokens, final)
+                token_len = len(tokens)
+            else:
+                token_len = n_tgt
+
+            g1_action_path = os.path.join(g1_action_dir, f"episode_{ep_idx:06d}.npy")
+            g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{ep_idx:06d}.npy")
+            if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
+                _dump_g1_action_and_proprio(
+                    jp, oq, hj, hand_thresholds, target_fps,
+                    g1_action_path, g1_proprio_path,
+                )
+            result_q.put(("ok", ep_idx, token_len))
         except Exception:
             result_q.put(("err", ep_idx, traceback.format_exc()))
 
@@ -214,6 +268,10 @@ def main() -> None:
     encoder_path = os.path.join(args.sonic_model_dir, "model_encoder.onnx")
     out_dir = os.path.join(cache_root, "sonic_tokens")
     os.makedirs(out_dir, exist_ok=True)
+    g1_action_dir = os.path.join(cache_root, "g1_actions")
+    g1_proprio_dir = os.path.join(cache_root, "g1_proprio")
+    os.makedirs(g1_action_dir, exist_ok=True)
+    os.makedirs(g1_proprio_dir, exist_ok=True)
 
     if args.gpus is None:
         n_gpus = torch.cuda.device_count()
@@ -242,11 +300,21 @@ def main() -> None:
             f"{discovered} episodes ({dropped} dropped)."
         )
 
-    existing = {fn for fn in os.listdir(out_dir) if fn.endswith(".npy")}
-    pending = [
-        (idx, path) for idx, path in all_episodes
-        if f"episode_{idx:06d}.npy" not in existing
-    ]
+    existing_sonic = {fn for fn in os.listdir(out_dir) if fn.endswith(".npy")}
+    existing_g1_action = {fn for fn in os.listdir(g1_action_dir) if fn.endswith(".npy")}
+    existing_g1_proprio = {fn for fn in os.listdir(g1_proprio_dir) if fn.endswith(".npy")}
+
+    # An episode is pending if any of {sonic, g1_action, g1_proprio} is missing.
+    # ``need_sonic=False`` lets workers skip the ONNX session for episodes where
+    # only the lightweight g1_action/proprio dumps are missing — those can be
+    # produced from parquet alone, no GPU needed.
+    pending: list[tuple[int, str, bool]] = []
+    for idx, path in all_episodes:
+        fn = f"episode_{idx:06d}.npy"
+        need_sonic = fn not in existing_sonic
+        need_g1 = (fn not in existing_g1_action) or (fn not in existing_g1_proprio)
+        if need_sonic or need_g1:
+            pending.append((idx, path, need_sonic))
     skipped = len(all_episodes) - len(pending)
     print(
         f"{len(all_episodes)} episodes selected, {skipped} already done, "
@@ -266,7 +334,11 @@ def main() -> None:
         gpu = gpu_ids[w % len(gpu_ids)]
         p = ctx.Process(
             target=worker_main,
-            args=(gpu, work_q, result_q, encoder_path, out_dir, hand_thresholds, source_fps, target_fps),
+            args=(
+                gpu, work_q, result_q, encoder_path, out_dir,
+                g1_action_dir, g1_proprio_dir, hand_thresholds,
+                source_fps, target_fps,
+            ),
             daemon=False,
         )
         p.start()
@@ -352,7 +424,7 @@ def main() -> None:
     )
 
 
-def _producer_main(work_q: mp.Queue, pending: list[tuple[int, str]], n_workers: int) -> None:
+def _producer_main(work_q: mp.Queue, pending: list[tuple], n_workers: int) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         for item in pending:

@@ -36,8 +36,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Multi-node failures often surface as "no logs at all" because the launcher
+# crashes before producing output. Dump the cluster scheduler / NCCL env
+# vars this script depends on (printed before we touch any of them) so the
+# failure mode is visible on every node.
+# echo "===================== Distributed Env Diagnostics ====================="
+# echo "  hostname=$(hostname)  pid=$$"
+# for _v in \
+#     NCCL_IB_QPS_PER_CONNECTION NCCL_GDR_LEVEL NCCL_IB_PCI_RELAXED_ORDERING \
+#     NCCL_IB_TC NCCL_NVLS_ENABLE NCCL_IB_GID_INDEX \
+#     GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME \
+#     NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT NCCL_IB_HCA \
+#     PET_NNODES PET_NODE_RANK MASTER_ADDR MASTER_PORT
+# do
+#     echo "  ${_v}=${!_v:-<unset>}"
+# done
+# echo "========================================================================"
+# unset _v
+
 PYTHON="${PROJECT_ROOT}/.venv/bin/python"
 DEEPSPEED="${PROJECT_ROOT}/.venv/bin/deepspeed"
+TORCHRUN="${PROJECT_ROOT}/.venv/bin/torchrun"
 TRAIN_SCRIPT="${PROJECT_ROOT}/scripts/train.py"
 
 STAGE=""
@@ -149,24 +168,6 @@ if [ "$NO_DEEPSPEED" = true ]; then
         --train.no-use-deepspeed \
         "${EXTRA_ARGS[@]}"
 else
-    DS_ARGS=(
-        --num_gpus="$NUM_GPUS"
-        --master_port="$MASTER_PORT"
-    )
-
-    if [ -n "$HOSTFILE" ]; then
-        NUM_NODES=$(grep -cve '^\s*$' "$HOSTFILE")
-        DS_ARGS+=(--hostfile="$HOSTFILE" --num_nodes="$NUM_NODES")
-        echo "==> Launching with DeepSpeed via hostfile (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs)"
-    else
-        DS_ARGS+=(
-            --num_nodes="$NUM_NODES"
-            --master_addr="$MASTER_ADDR"
-            --node_rank="$NODE_RANK"
-        )
-        echo "==> Launching with DeepSpeed (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs)"
-    fi
-
     TRAIN_ARGS=(
         "$CONFIG_NAME"
         --train.use-deepspeed
@@ -178,6 +179,35 @@ else
     fi
 
     TRAIN_ARGS+=("${EXTRA_ARGS[@]}")
+
+    # Multi-node without hostfile = PET_*-style cluster (each node runs this
+    # script independently with PET_NNODES / PET_NODE_RANK / MASTER_ADDR set).
+    # The `deepspeed` launcher requires a hostfile + SSH from a single master,
+    # which doesn't fit this submission model. Use torchrun instead and let
+    # DeepSpeed initialize inside the training script.
+    if [ "$NUM_NODES" -gt 1 ] && [ -z "$HOSTFILE" ]; then
+        echo "==> Launching with torchrun + DeepSpeed engine (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs, node_rank=${NODE_RANK})"
+        exec "$TORCHRUN" \
+            --nproc_per_node="$NUM_GPUS" \
+            --nnodes="$NUM_NODES" \
+            --node_rank="$NODE_RANK" \
+            --master_addr="$MASTER_ADDR" \
+            --master_port="$MASTER_PORT" \
+            "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
+    fi
+
+    DS_ARGS=(
+        --num_gpus="$NUM_GPUS"
+        --master_port="$MASTER_PORT"
+    )
+
+    if [ -n "$HOSTFILE" ]; then
+        NUM_NODES=$(grep -cve '^\s*$' "$HOSTFILE")
+        DS_ARGS+=(--hostfile="$HOSTFILE" --num_nodes="$NUM_NODES")
+        echo "==> Launching with DeepSpeed via hostfile (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs)"
+    else
+        echo "==> Launching with DeepSpeed (ZeRO-${ZERO_STAGE}, single node x ${NUM_GPUS} GPUs)"
+    fi
 
     exec "$DEEPSPEED" \
         "${DS_ARGS[@]}" \

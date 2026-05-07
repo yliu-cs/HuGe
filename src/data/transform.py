@@ -119,13 +119,20 @@ class HERepackTransform(RepackTransform):
     def __call__(self, data: dict[str, Any], **kwargs) -> dict[str, Any]:
         img = data["image"]
         observations: List[Image.Image] = [img] if isinstance(img, Image.Image) else list(img)
-        return {
+        out: dict[str, Any] = {
             "observations": observations,
             "instruction": str(data.get("text", "perform the task")),
             "sonic_tokens": data["sonic_tokens"],
             "sonic_mask": data["sonic_mask"],
             "dataset": self.dataset_name,
         }
+        # Post-train extras pass through unchanged. Only forwarded when the
+        # raw dataset emits them (e.g. when the post-train config enables
+        # ``emit_g1_actions`` / ``emit_proprio`` on HEDataset / WBTDataset).
+        for k in ("g1_actions", "g1_mask", "proprio"):
+            if k in data:
+                out[k] = data[k]
+        return out
 
 
 class EgodexRepackTransform(RepackTransform):
@@ -185,10 +192,14 @@ class KappaModelTransform(ModelTransform):
 
         observations = [pipeline(img) for img in data["observations"]]
 
-        return {
+        out = {
             "image": observations[0],
             "text": data["instruction"],
             "sonic_tokens": data["sonic_tokens"],
             "sonic_mask": data["sonic_mask"],
             "dataset_name": data.get("dataset", "unknown"),
         }
+        for k in ("g1_actions", "g1_mask", "proprio"):
+            if k in data:
+                out[k] = data[k]
+        return out

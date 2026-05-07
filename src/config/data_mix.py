@@ -34,12 +34,22 @@ class HEWBTMixDataConfig(DataConfig):
             split=split,
             cache_root=self.he.cache_root,
             robot_type=self.he.robot_type,
+            emit_g1_actions=self.he.emit_g1_actions,
+            emit_proprio=self.he.emit_proprio,
+            g1_action_stats=self.he._load_stats(self.he.g1_action_stats_path),
+            g1_proprio_stats=self.he._load_stats(self.he.g1_proprio_stats_path),
+            normalize_mode=self.he.normalize_mode,
         )
         raw_wbt = WBTDataset(
             data_root=self.wbt.data_root,
             action_chunk_size=self.wbt.action_chunk_size,
             cache_root=self.wbt.cache_root,
             subsets=self.wbt.subsets,
+            emit_g1_actions=self.wbt.emit_g1_actions,
+            emit_proprio=self.wbt.emit_proprio,
+            g1_action_stats=self.wbt._load_stats(self.wbt.g1_action_stats_path),
+            g1_proprio_stats=self.wbt._load_stats(self.wbt.g1_proprio_stats_path),
+            normalize_mode=self.wbt.normalize_mode,
         )
         mix = ConcatMixDataset([raw_he, raw_wbt])
         return Dataset(mix, self.transform, transform_kwargs=transform_kwargs)

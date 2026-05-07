@@ -37,9 +37,11 @@ tmux new -s pretrain_egodex -d "./scripts/train/pretrain_kappa.sh --stage egodex
 # Stage 1-2: Pre-Train on Humanoid-Everyday G1 + G1-WBT
 uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
 tmux new -s calc_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
-uv run python scripts/preprocess/g1-wbt/calc_wbt_hand_thresholds.py
 tmux new -s calc_wbt_sonic -d "uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py"
-tmux new -s pretrain_he_wbt -d "./scripts/train/pretrain_kappa.sh --stage he_wbt --train.pretrained-weights .runs/kappa/<egodex-run>"
+tmux new -s pretrain_he_wbt -d "./scripts/train/pretrain_kappa.sh --stage he_wbt --train.pretrained-weights .runs/kappa/exp.kappa.b1024.gpus8.2604301611 | tee pretrain_he_wbt.log"
+
+# Stage 2: Post-Train on Humanoid-Everyday G1 + G1-WBT
+tmux new -s posttrain_he_wbt -d "./scripts/train/posttrain_kappa.sh | tee posttrain_he_wbt.log"
 ```
 
 ## ❤️ Acknowledgment

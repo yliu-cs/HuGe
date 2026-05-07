@@ -6,13 +6,13 @@ Layout produced by ``scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py``::
         meta/episodes_meta.parquet                       # cross-subset index
         sonic_tokens/<subset>/episode_<NNNNNN>.npy       # [T_50hz, 66] tokens
 
-LeRobot v3 packs many episodes into a single ``data/file-NNN.parquet`` and the
-matching ``videos/.../file-NNN.mp4``. The episode's frames inside the mp4 start
-at ``round(video_from_ts * 30)`` (30 fps native). Sampling is in 50 Hz token
-space; the video frame at the same time is
+Videos are per-episode mp4s under
+``<data_root>/<subset>/[<nested>/]episode_videos/observation.images.<vk>/episode_NNNNNN.mp4``.
+Each mp4 starts at frame 0 and its frame count equals the meta ``length``
+(verified). Sampling is in 50 Hz token space; the video frame at the same
+time is
 
-    frame_in_mp4 = video_from_ts * 30
-                 + min(int(t_50 * vid_len_30 / tok_len_50), vid_len_30 - 1)
+    frame_in_mp4 = min(int(t_50 * vid_len_30 / tok_len_50), vid_len_30 - 1)
 
 The MainCamOnly subsets put the LeRobot tree inside an extra ``G1_WB_Dex5_<X>/``
 directory and use ``cam_0`` instead of ``head_stereo_left``. Both quirks are
@@ -27,6 +27,7 @@ import polars as pl
 
 from src.data.tokenized_video_dataset import (
     TokenizedVideoDataset,
+    _load_normalize_bounds,
     get_token_mmap,
     resolve_writable_cache_root,
 )
@@ -59,6 +60,11 @@ class WBTDataset(TokenizedVideoDataset):
         action_chunk_size: int = 50,
         cache_root: str | None = None,
         subsets: "str | list[str]" = "all",
+        emit_g1_actions: bool = False,
+        emit_proprio: bool = False,
+        g1_action_stats: dict | None = None,
+        g1_proprio_stats: dict | None = None,
+        normalize_mode: str = "bounds",
     ) -> None:
         super().__init__(action_chunk_size=action_chunk_size)
         self.data_root = data_root
@@ -75,6 +81,25 @@ class WBTDataset(TokenizedVideoDataset):
             raise FileNotFoundError(
                 f"Missing token dir {self.tokens_root}. Re-run the preprocess script."
             )
+
+        self._emit_g1_actions = emit_g1_actions
+        self._emit_proprio = emit_proprio
+        self.g1_action_root = os.path.join(self.cache_root, "g1_actions")
+        self.g1_proprio_root = os.path.join(self.cache_root, "g1_proprio")
+        if emit_g1_actions and not os.path.isdir(self.g1_action_root):
+            raise FileNotFoundError(
+                f"Missing {self.g1_action_root}; re-run calc_wbt_sonic_tokens.py."
+            )
+        if emit_proprio and not os.path.isdir(self.g1_proprio_root):
+            raise FileNotFoundError(
+                f"Missing {self.g1_proprio_root}; re-run calc_wbt_sonic_tokens.py."
+            )
+        self._g1_action_bounds = _load_normalize_bounds(
+            g1_action_stats, "action", self.g1_action_dim, normalize_mode,
+        )
+        self._proprio_bounds = _load_normalize_bounds(
+            g1_proprio_stats, "proprio", self.proprio_dim, normalize_mode,
+        )
 
         meta = pl.read_parquet(meta_path)
         if isinstance(subsets, str):
@@ -122,9 +147,6 @@ class WBTDataset(TokenizedVideoDataset):
         ep_episode_idx = np.empty(ep_count, dtype=np.int32)
         ep_tok_len = np.empty(ep_count, dtype=np.int32)
         ep_vid_len = np.empty(ep_count, dtype=np.int32)
-        ep_video_chunk = np.empty(ep_count, dtype=np.int32)
-        ep_video_file = np.empty(ep_count, dtype=np.int32)
-        ep_video_frame_offset = np.empty(ep_count, dtype=np.int32)
         ep_task: list[str] = [""] * ep_count
 
         for i, row in enumerate(meta.iter_rows(named=True)):
@@ -137,24 +159,18 @@ class WBTDataset(TokenizedVideoDataset):
             ep_episode_idx[i] = ep_idx
             ep_tok_len[i] = tok_len
             ep_vid_len[i] = int(row["length"])
-            ep_video_chunk[i] = int(row["video_chunk"])
-            ep_video_file[i] = int(row["video_file"])
-            ep_video_frame_offset[i] = int(round(float(row["video_from_ts"]) * _VIDEO_FPS))
             ep_task[i] = row["task"] or "perform the task"
 
         self._ep_subset_id = ep_subset_id
         self._ep_episode_idx = ep_episode_idx
         self._ep_tok_len = ep_tok_len
         self._ep_vid_len = ep_vid_len
-        self._ep_video_chunk = ep_video_chunk
-        self._ep_video_file = ep_video_file
-        self._ep_video_frame_offset = ep_video_frame_offset
         self._ep_task = ep_task
         self._ep_lengths = ep_tok_len.astype(np.int64, copy=False)
 
     # -- hooks ---------------------------------------------------------------
 
-    def _video_path(self, subset_id: int, vid_chunk: int, vid_file: int) -> str:
+    def _video_path(self, subset_id: int, episode_idx: int) -> str:
         sub = self._subset_names[subset_id]
         nested = self._subset_nested_dir[subset_id]
         vk = self._subset_video_key[subset_id]
@@ -162,23 +178,20 @@ class WBTDataset(TokenizedVideoDataset):
         if nested:
             parts.append(nested)
         parts += [
-            "videos", f"observation.images.{vk}",
-            f"chunk-{vid_chunk:03d}", f"file-{vid_file:03d}.mp4",
+            "episode_videos", f"observation.images.{vk}",
+            f"episode_{episode_idx:06d}.mp4",
         ]
         return os.path.join(*parts)
 
     def _video_for(self, ep: int, t: int) -> tuple[str, int]:
         tok_len = int(self._ep_tok_len[ep])
         vid_len = int(self._ep_vid_len[ep])
-        # 50 Hz token index -> 30 Hz frame within the per-episode video span,
-        # then add the offset that locates the episode inside the multi-episode
-        # mp4 (LeRobot v3 packs many episodes per mp4 file).
-        local_frame = min(int(t * vid_len / max(tok_len, 1)), max(vid_len - 1, 0))
-        frame_idx = int(self._ep_video_frame_offset[ep]) + local_frame
+        # 50 Hz token index -> 30 Hz frame within the per-episode mp4. Each
+        # mp4 is a single episode starting at frame 0, so no chunk offset.
+        frame_idx = min(int(t * vid_len / max(tok_len, 1)), max(vid_len - 1, 0))
         path = self._video_path(
             int(self._ep_subset_id[ep]),
-            int(self._ep_video_chunk[ep]),
-            int(self._ep_video_file[ep]),
+            int(self._ep_episode_idx[ep]),
         )
         return path, frame_idx
 
@@ -190,4 +203,22 @@ class WBTDataset(TokenizedVideoDataset):
         ep_idx = int(self._ep_episode_idx[ep])
         return get_token_mmap(
             os.path.join(self.tokens_root, sub, f"episode_{ep_idx:06d}.npy")
+        )
+
+    def _g1_actions(self, ep: int) -> np.ndarray | None:
+        if not self._emit_g1_actions:
+            return None
+        sub = self._subset_names[int(self._ep_subset_id[ep])]
+        ep_idx = int(self._ep_episode_idx[ep])
+        return get_token_mmap(
+            os.path.join(self.g1_action_root, sub, f"episode_{ep_idx:06d}.npy")
+        )
+
+    def _proprio(self, ep: int) -> np.ndarray | None:
+        if not self._emit_proprio:
+            return None
+        sub = self._subset_names[int(self._ep_subset_id[ep])]
+        ep_idx = int(self._ep_episode_idx[ep])
+        return get_token_mmap(
+            os.path.join(self.g1_proprio_root, sub, f"episode_{ep_idx:06d}.npy")
         )

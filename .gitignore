@@ -15,6 +15,7 @@ outputs
 
 # Project directories
 resource
+figure
 test
 Psi0
 humanoid everyday
@@ -26,4 +27,4 @@ Mixture-of-Transformers
 
 # Others
 *.log
-scripts/bench_dataloader.py
+bench_*.py

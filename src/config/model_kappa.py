@@ -39,3 +39,23 @@ class KappaModelConfig(ModelConfig):
     # back to Euler since the model wasn't trained at t=0); "euler" is the
     # original 1st-order scheme (1 NFE per step).
     solver: str = "heun"
+
+    # Post-train extras (3rd MoT expert + RTC + proprio). Defaults preserve
+    # the pretrain stage 1-2 layout exactly so existing configs keep working.
+    use_g1_expert: bool = False
+    g1_dim: int = 31
+    g1_loss_weight: float = 0.3
+    use_proprio: bool = False
+    proprio_dim: int = 64
+    use_rtc: bool = False
+    rtc_on_sonic: bool = True
+    g1_max_delay: int = 10
+    sonic_max_delay: int = 8
+    proprio_noise_std: float = 0.02
+    proprio_drop_prob: float = 0.0
+    g1_action_stats_path: str | None = None
+    g1_proprio_stats_path: str | None = None
+
+    # Post-train freeze toggles.
+    freeze_for_post_train: bool = False
+    init_g1_from_sonic: bool = False

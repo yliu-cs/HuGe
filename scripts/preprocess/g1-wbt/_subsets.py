@@ -1,10 +1,10 @@
 """Shared subset table + per-episode metadata helpers for G1-WBT preprocessing.
 
-LeRobot v3 layout: every G1-WBT subdataset packs many episodes into a small
-number of ``data/chunk-NNN/file-NNN.parquet`` files, with the per-episode index
-(length, video file/timestamp ranges) stored separately under
-``meta/episodes/chunk-NNN/file-NNN.parquet``. The 11 subsets vary along three
-axes:
+Layout: data tables stay in v3-style ``data/chunk-NNN/file-NNN.parquet``
+(many episodes per file), with the per-episode index in
+``meta/episodes/chunk-NNN/file-NNN.parquet``; videos are now per-episode,
+under ``episode_videos/observation.images.<key>/episode_NNNNNN.mp4`` (one
+mp4 per episode, starting at frame 0). The 11 subsets vary along three axes:
 
 * ``hand_type`` (``inspire`` / ``brainco`` / ``dex1``) — picks the columns of
   ``observation.state.hand_state`` that go through the open/close binarizer.
@@ -41,13 +41,52 @@ _SUBSETS: list[tuple[str, str, str, str | None]] = [
     ("G1_WBT_Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly","inspire", "cam_0", "G1_WB_Dex5_Put_Clothes_into_Washing_Machine"),
 ]
 
-# (left_idx, right_idx) into observation.state.hand_state for binarization.
-# Inspire/BrainCo: 12D = two 6D blocks; Dex1: 2D = one scalar per hand.
-HAND_INDEX_TABLE: dict[str, tuple[int, int]] = {
-    "inspire": (4, 10),  # thumb open/close (per analysis report §2.4)
-    "brainco": (0, 6),   # thumb open/close (BrainCo block ordering)
-    "dex1":    (0, 1),   # gripper open/close scalars
+# Per-vendor open/close binarization rule for ``observation.state.hand_state``,
+# read directly off each subset's README rather than fitted from the data:
+#
+#   Inspire (12D): per-finger scalar in [0.0, 1.0], 0 = open → 1 = closed.
+#                  Thumb open/close lives at index 4 (left) / 10 (right).
+#   BrainCo (12D): per-finger scalar in [0.0, 1.0], 0 = open → 1 = closed.
+#                  Thumb open/close at 0 (left) / 6 (right).
+#   Dex1    (2D):  single gripper scalar per hand at 0 (left) / 1 (right);
+#                  range is 5.5 = open → 0.0 = closed (NOTE: inverted polarity).
+#
+# Each row is ``(left_idx, right_idx, threshold, comparator)``; ``comparator``
+# is ``">"`` when "closed" means the value crossed above the threshold and
+# ``"<"`` when "closed" means the value dropped below it.
+HAND_RULES: dict[str, tuple[int, int, float, str]] = {
+    "inspire": (4, 10, 0.5,  ">"),
+    "brainco": (0, 6,  0.5,  ">"),
+    "dex1":    (0, 1,  2.75, "<"),
 }
+
+
+def compute_hand_bits(hand_state: "np.ndarray", hand_type: str) -> "np.ndarray":
+    """Return ``(n, 2)`` ``[left_closed, right_closed]`` float32 bits.
+
+    Applies the README-defined rule for ``hand_type``. Unlike the HE pipeline
+    we do *not* take ``abs()`` (the data is already non-negative) and we do
+    *not* run the Octo-style reverse-scan smoothing — the dataset's hand_state
+    is monotonic and bounded, so a fixed midpoint threshold gives a clean,
+    polarity-correct label without further filtering.
+    """
+    if hand_type not in HAND_RULES:
+        raise KeyError(f"Unknown hand_type {hand_type!r}; expected one of {list(HAND_RULES)}")
+    left_idx, right_idx, thr, cmp_ = HAND_RULES[hand_type]
+    if hand_state.ndim != 2 or hand_state.shape[1] <= max(left_idx, right_idx):
+        raise ValueError(
+            f"hand_state shape {hand_state.shape} too small for hand_type={hand_type!r} "
+            f"(needs > {max(left_idx, right_idx)})"
+        )
+    left = hand_state[:, left_idx]
+    right = hand_state[:, right_idx]
+    if cmp_ == ">":
+        l_closed = (left > thr)
+        r_closed = (right > thr)
+    else:
+        l_closed = (left < thr)
+        r_closed = (right < thr)
+    return np.stack([l_closed, r_closed], axis=1).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -107,14 +146,12 @@ def load_subset_episode_meta(subset: Subset, data_root: str) -> pl.DataFrame:
 
     Returns a DataFrame with columns:
 
-    ``episode_index``        i64 — episode index within the subset.
-    ``length``               i64 — frame count at native (30 Hz) rate.
+    ``episode_index``        i64 — episode index within the subset (also indexes
+                                   ``episode_videos/.../episode_NNNNNN.mp4``).
+    ``length``               i64 — frame count at native (30 Hz) rate; equals
+                                   the per-episode mp4 frame count.
     ``data_chunk``           i64 — points into ``data/chunk-NNN/``.
     ``data_file``            i64 — points into ``file-NNN.parquet``.
-    ``video_chunk``          i64 — points into ``videos/<key>/chunk-NNN/``.
-    ``video_file``           i64 — points into ``file-NNN.mp4``.
-    ``video_from_ts``        f32 — start timestamp inside the mp4 (seconds).
-    ``video_to_ts``          f32 — end timestamp inside the mp4 (seconds).
     ``task``                 str — concatenated task description(s) for the LLM prompt.
 
     The ``tasks`` column in LeRobot v3 is ``list[str]`` (multi-task episodes); we
@@ -125,16 +162,10 @@ def load_subset_episode_meta(subset: Subset, data_root: str) -> pl.DataFrame:
         raise FileNotFoundError(
             f"No episode meta files under {subset.abs_root(data_root)}/meta/episodes"
         )
-    vk = subset.video_key
-    vid_chunk_col = f"videos/observation.images.{vk}/chunk_index"
-    vid_file_col = f"videos/observation.images.{vk}/file_index"
-    vid_from_col = f"videos/observation.images.{vk}/from_timestamp"
-    vid_to_col   = f"videos/observation.images.{vk}/to_timestamp"
 
     keep = [
         "episode_index", "length", "tasks",
         "data/chunk_index", "data/file_index",
-        vid_chunk_col, vid_file_col, vid_from_col, vid_to_col,
     ]
     frames = [pl.read_parquet(p, columns=keep) for p in paths]
     df = pl.concat(frames).sort("episode_index")
@@ -144,10 +175,6 @@ def load_subset_episode_meta(subset: Subset, data_root: str) -> pl.DataFrame:
         pl.col("length"),
         pl.col("data/chunk_index").alias("data_chunk"),
         pl.col("data/file_index").alias("data_file"),
-        pl.col(vid_chunk_col).alias("video_chunk"),
-        pl.col(vid_file_col).alias("video_file"),
-        pl.col(vid_from_col).cast(pl.Float32).alias("video_from_ts"),
-        pl.col(vid_to_col).cast(pl.Float32).alias("video_to_ts"),
         pl.col("tasks").list.join(" / ").alias("task"),
     ])
 

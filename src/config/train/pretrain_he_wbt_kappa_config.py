@@ -38,22 +38,23 @@ class HEWBTLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        max_training_steps=1000000,
-        train_batch_size=96,
+        num_train_epochs=1,
+        train_batch_size=128,
         gradient_accumulation_steps=1,
-        num_workers=12,
+        num_workers=8,
+        prefetch_factor=2,
         # Same block_shuffle rationale as the pure HE config: random seek on
         # GOP-heavy mp4s (HE H.264 GOP=250, WBT AV1) is the dominant data cost,
         # and one-batch-per-episode access turns it into next-frame decodes.
         block_shuffle_size=64,
         frame_cache_size=2,
-        checkpointing_steps=10000,
+        checkpointing_steps=3000,
         max_checkpoints_to_keep=5,
         validation_steps=0,
         mixed_precision="bf16",
-        learning_rate=3e-6,
-        warmup_steps=500,
-        warmup_ratio=0,
+        learning_rate=5e-5,
+        warmup_steps=0,
+        warmup_ratio=0.01,
     )
 
 

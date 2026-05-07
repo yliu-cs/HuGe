@@ -38,8 +38,8 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from _subsets import (  # noqa: E402
-    HAND_INDEX_TABLE,
     Subset,
+    compute_hand_bits,
     list_subsets,
     load_episode_rows,
     load_subset_episode_meta,
@@ -59,39 +59,21 @@ from src.data.preprocess import (  # noqa: E402
 # Per-episode encode
 # ---------------------------------------------------------------------------
 
-def _build_synthetic_hand_joints(hs: "np.ndarray", hand_type: str) -> "np.ndarray":
-    """Pack the chosen left/right scalars into a 14D ``hand_joints`` array.
-
-    SONIC's ``binarize_hands`` is hard-coded to read indices 4 (left) and 11
-    (right) of a (n, 14) tensor. We build a synthetic (n, 14) buffer and place
-    the per-hand_type scalars there, so the existing thresholding code path
-    works unchanged regardless of vendor (Inspire/BrainCo 12D, Dex1 2D).
-    Other dims are zero — they're never read by ``binarize_hands``.
-    """
-    import numpy as np
-    from src.tokenizer.sonic_encoder import LEFT_HAND_JOINT_IDX, RIGHT_HAND_JOINT_IDX
-
-    left_idx, right_idx = HAND_INDEX_TABLE[hand_type]
-    if hs.shape[1] <= max(left_idx, right_idx):
-        raise ValueError(
-            f"hand_state dim {hs.shape[1]} too small for hand_type={hand_type!r} "
-            f"(needs > {max(left_idx, right_idx)})"
-        )
-    n = hs.shape[0]
-    out = np.zeros((n, 14), dtype=np.float32)
-    out[:, LEFT_HAND_JOINT_IDX] = hs[:, left_idx]
-    out[:, RIGHT_HAND_JOINT_IDX] = hs[:, right_idx]
-    return out
-
-
 def _encode_one(
     encoder,
     rows: dict,
     hand_type: str,
-    hand_thresholds: tuple[float, float, float, float],
     source_fps: float,
     target_fps: float,
+    need_sonic: bool,
 ):
+    """Resample to the SONIC timeline, derive open/close bits straight from the
+    dataset's documented hand_state range, and (optionally) run the SONIC encoder.
+
+    Returns ``(tokens_or_None, jp, oq, hand_bits, n_tgt)``. Caller uses ``jp``,
+    ``oq``, ``hand_bits`` to dump the 31-D G1 actions and 64-D proprio without
+    needing to redo resampling/binarization.
+    """
     import numpy as np
 
     jp = rows["joint_pos"]
@@ -104,10 +86,43 @@ def _encode_one(
         oq = _resample_quat_wxyz(oq, n_src, n_tgt)
         hs = _resample_linear(hs, n_src, n_tgt)
 
-    fake_hand = _build_synthetic_hand_joints(hs, hand_type)
-    imu_gyro = np.zeros((n_tgt, 3), dtype=np.float32)  # encoder ignores gyro (verified)
-    tokens = encoder.encode_episode(jp, oq, imu_gyro, fake_hand, hand_thresholds, fps=target_fps)
-    return tokens, n_tgt
+    hand_bits = compute_hand_bits(hs, hand_type)
+    tokens = None
+    if need_sonic:
+        imu_gyro = np.zeros((n_tgt, 3), dtype=np.float32)  # encoder ignores gyro (verified)
+        tokens = encoder.encode_episode_with_bits(
+            jp, oq, imu_gyro, hand_bits, fps=target_fps,
+        )
+    return tokens, jp, oq, hand_bits, n_tgt
+
+
+def _dump_g1_action_and_proprio(
+    jp: "np.ndarray",
+    oq: "np.ndarray",
+    hand_bits: "np.ndarray",
+    target_fps: float,
+    g1_action_path: str,
+    g1_proprio_path: str,
+) -> None:
+    """Dump 31-D G1 actions (jp + hand_bits) and 64-D proprio
+    (jp + hand_bits + jv + odom_quat_xyzw)."""
+    import numpy as np
+    from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw
+
+    jp32 = jp.astype(np.float32, copy=False)
+    bits = hand_bits.astype(np.float32, copy=False)
+    g1_action = np.concatenate([jp32, bits], axis=-1).astype(np.float32)
+    atomic_save_npy(g1_action, g1_action_path)
+
+    n = jp32.shape[0]
+    jv = np.zeros_like(jp32)
+    if n > 1:
+        jv[1:] = (jp32[1:] - jp32[:-1]) * float(target_fps)
+    quat_xyzw = _quat_wxyz_to_xyzw(oq.astype(np.float32, copy=False)).astype(np.float32)
+    proprio = np.concatenate(
+        [jp32, bits, jv, quat_xyzw], axis=-1
+    ).astype(np.float32)
+    atomic_save_npy(proprio, g1_proprio_path)
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +135,9 @@ def worker_main(
     result_q: "mp.Queue",
     encoder_path: str,
     out_root: str,
+    g1_action_root: str,
+    g1_proprio_root: str,
     data_root: str,
-    thresholds_by_type: dict[str, tuple[float, float, float, float]],
     source_fps: float,
     target_fps: float,
 ) -> None:
@@ -147,17 +163,29 @@ def worker_main(
         item = work_q.get()
         if item is None:
             return
-        subset_name, episode_index, data_chunk, data_file, hand_type = item
+        subset_name, episode_index, data_chunk, data_file, hand_type, need_sonic = item
         try:
             sub = subsets_by_name[subset_name]
             rows = load_episode_rows(data_root, sub, data_chunk, data_file, episode_index)
-            tokens, n_tgt = _encode_one(
-                encoder, rows, hand_type,
-                thresholds_by_type[hand_type], source_fps, target_fps,
+            tokens, jp, oq, hand_bits, n_tgt = _encode_one(
+                encoder, rows, hand_type, source_fps, target_fps, need_sonic,
             )
-            out_dir = os.path.join(out_root, subset_name)
-            final = os.path.join(out_dir, f"episode_{episode_index:06d}.npy")
-            atomic_save_npy(tokens, final)
+            if need_sonic:
+                out_dir = os.path.join(out_root, subset_name)
+                final = os.path.join(out_dir, f"episode_{episode_index:06d}.npy")
+                atomic_save_npy(tokens, final)
+
+            g1_action_dir = os.path.join(g1_action_root, subset_name)
+            g1_proprio_dir = os.path.join(g1_proprio_root, subset_name)
+            os.makedirs(g1_action_dir, exist_ok=True)
+            os.makedirs(g1_proprio_dir, exist_ok=True)
+            g1_action_path = os.path.join(g1_action_dir, f"episode_{episode_index:06d}.npy")
+            g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{episode_index:06d}.npy")
+            if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
+                _dump_g1_action_and_proprio(
+                    jp, oq, hand_bits, target_fps,
+                    g1_action_path, g1_proprio_path,
+                )
             result_q.put(("ok", subset_name, episode_index, int(n_tgt)))
         except Exception:
             result_q.put((
@@ -179,20 +207,6 @@ def _producer_main(work_q: "mp.Queue", pending: list[tuple], n_workers: int) -> 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def _load_thresholds(cache_root: str, hand_types: list[str]) -> dict[str, tuple]:
-    from src.tokenizer.sonic_encoder import load_hand_thresholds
-
-    out: dict[str, tuple] = {}
-    for ht in hand_types:
-        path = os.path.join(cache_root, "meta", f"hand_threshold_{ht}.json")
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Missing {path}. Run scripts/preprocess/g1-wbt/calc_wbt_hand_thresholds.py first."
-            )
-        out[ht] = load_hand_thresholds(path)
-    return out
-
 
 def _build_episode_meta(data_root: str, subsets: list[Subset]):
     """Concatenate per-subset episode metadata into a single DataFrame and
@@ -218,7 +232,7 @@ def _build_episode_meta(data_root: str, subsets: list[Subset]):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--data-root", default="resource/dataset/G1-WBT")
+    parser.add_argument("--data-root", default="resource/dataset/G1_WBT")
     parser.add_argument(
         "--cache-root", default=None,
         help="Writable output dir. Defaults to <data-root> if writable else <data-root>-cache.",
@@ -256,13 +270,7 @@ def main() -> None:
                 f"{[s.name for s in list_subsets(args.data_root)]}"
             )
 
-    hand_types_present = sorted({s.hand_type for s in subsets})
-    thresholds = _load_thresholds(cache_root, hand_types_present)
-    print("Loaded thresholds:")
-    for ht, (ll, lh, rl, rh) in thresholds.items():
-        print(f"  {ht}: left=({ll:.4f}, {lh:.4f})  right=({rl:.4f}, {rh:.4f})")
-
-    print(f"\nSubsets ({len(subsets)}):")
+    print(f"Subsets ({len(subsets)}):")
     for s in subsets:
         print(f"  {s.name}  hand_type={s.hand_type}  video={s.video_key}"
               + (f"  nested={s.nested_dir}" if s.nested_dir else ""))
@@ -277,22 +285,32 @@ def main() -> None:
 
     encoder_path = os.path.join(args.sonic_model_dir, "model_encoder.onnx")
     out_root = os.path.join(cache_root, "sonic_tokens")
+    g1_action_root = os.path.join(cache_root, "g1_actions")
+    g1_proprio_root = os.path.join(cache_root, "g1_proprio")
     os.makedirs(out_root, exist_ok=True)
+    os.makedirs(g1_action_root, exist_ok=True)
+    os.makedirs(g1_proprio_root, exist_ok=True)
 
-    # Build pending list, skipping episodes whose token file already exists.
+    # Build pending list. An episode is pending when *any* of {sonic, g1_action,
+    # g1_proprio} is missing; ``need_sonic`` is False when only the lightweight
+    # parquet-derived dumps are missing — the worker can skip the ONNX session.
     pending: list[tuple] = []
     skipped = 0
     for row in meta_df.iter_rows(named=True):
-        target = os.path.join(
-            out_root, row["subset"], f"episode_{row['episode_index']:06d}.npy"
-        )
-        if os.path.exists(target):
+        sub = row["subset"]
+        ep_fn = f"episode_{row['episode_index']:06d}.npy"
+        sonic_path = os.path.join(out_root, sub, ep_fn)
+        g1a_path = os.path.join(g1_action_root, sub, ep_fn)
+        g1p_path = os.path.join(g1_proprio_root, sub, ep_fn)
+        need_sonic = not os.path.exists(sonic_path)
+        need_g1 = not (os.path.exists(g1a_path) and os.path.exists(g1p_path))
+        if not (need_sonic or need_g1):
             skipped += 1
             continue
         pending.append((
-            row["subset"], int(row["episode_index"]),
+            sub, int(row["episode_index"]),
             int(row["data_chunk"]), int(row["data_file"]),
-            row["hand_type"],
+            row["hand_type"], need_sonic,
         ))
     print(f"{meta_df.height} episodes total; {skipped} already done; {len(pending)} pending.")
     if not pending:
@@ -322,8 +340,11 @@ def main() -> None:
         gpu = gpu_ids[w % len(gpu_ids)]
         p = ctx.Process(
             target=worker_main,
-            args=(gpu, work_q, result_q, encoder_path, out_root, args.data_root,
-                  thresholds, args.source_fps, args.target_fps),
+            args=(
+                gpu, work_q, result_q, encoder_path, out_root,
+                g1_action_root, g1_proprio_root, args.data_root,
+                args.source_fps, args.target_fps,
+            ),
             daemon=False,
         )
         p.start()

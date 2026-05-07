@@ -186,6 +186,21 @@ class SonicEncoder:
             )
         self.device_id = device_id
 
+    def _encode_latents(
+        self,
+        joint_pos_mujoco: np.ndarray,
+        odom_quat: np.ndarray,
+        imu_gyro: np.ndarray,
+        fps: float,
+    ) -> np.ndarray:
+        obs = _build_encoder_batch(joint_pos_mujoco, odom_quat, imu_gyro, fps)
+        n = len(obs)
+        out = np.empty((n, SONIC_LATENT_DIM), dtype=np.float32)
+        run = self.session.run
+        for i in range(n):
+            out[i] = run(None, {"obs_dict": obs[i:i + 1]})[0][0]
+        return out
+
     def encode_episode(
         self,
         joint_pos_mujoco: np.ndarray,
@@ -195,15 +210,38 @@ class SonicEncoder:
         hand_thresholds: HandThresholds,
         fps: float,
     ) -> np.ndarray:
-        obs = _build_encoder_batch(joint_pos_mujoco, odom_quat, imu_gyro, fps)
-        n = len(obs)
+        latents = self._encode_latents(joint_pos_mujoco, odom_quat, imu_gyro, fps)
+        n = latents.shape[0]
         if hand_joints.shape[0] != n:
             raise ValueError(
                 f"hand_joints length {hand_joints.shape[0]} != joint_pos length {n}"
             )
         tokens = np.empty((n, TOKEN_DIM), dtype=np.float32)
-        run = self.session.run
-        for i in range(n):
-            tokens[i, :SONIC_LATENT_DIM] = run(None, {"obs_dict": obs[i:i + 1]})[0][0]
+        tokens[:, :SONIC_LATENT_DIM] = latents
         tokens[:, SONIC_LATENT_DIM:] = binarize_hands(hand_joints, hand_thresholds)
+        return tokens
+
+    def encode_episode_with_bits(
+        self,
+        joint_pos_mujoco: np.ndarray,
+        odom_quat: np.ndarray,
+        imu_gyro: np.ndarray,
+        hand_bits: np.ndarray,
+        fps: float,
+    ) -> np.ndarray:
+        """Like ``encode_episode`` but takes precomputed (n, 2) binary
+        ``[left_closed, right_closed]`` bits. Use when the dataset already
+        provides per-frame open/close labels (e.g., G1-WBT, where
+        ``observation.state.hand_state`` is a calibrated, monotonic open/close
+        scalar with a documented range).
+        """
+        latents = self._encode_latents(joint_pos_mujoco, odom_quat, imu_gyro, fps)
+        n = latents.shape[0]
+        if hand_bits.ndim != 2 or hand_bits.shape != (n, HAND_BITS):
+            raise ValueError(
+                f"hand_bits expected shape ({n}, {HAND_BITS}), got {hand_bits.shape}"
+            )
+        tokens = np.empty((n, TOKEN_DIM), dtype=np.float32)
+        tokens[:, :SONIC_LATENT_DIM] = latents
+        tokens[:, SONIC_LATENT_DIM:] = hand_bits.astype(np.float32, copy=False)
         return tokens
