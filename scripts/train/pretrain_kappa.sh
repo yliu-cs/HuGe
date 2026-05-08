@@ -3,19 +3,18 @@
 # Auto-detects GPU count for single-node; auto-disables DeepSpeed on single GPU.
 # Stage selection:
 #   --stage egodex                                                                # stage 1-1 (EgoDex pretrain)
-#   --stage he                                                                    # stage 1-2 (Humanoid-Everyday G1 only)
 #   --stage he_wbt                                                                # stage 1-2 mixed (HE-G1 + G1-WBT)
 #   --config <name>                                                               # arbitrary config under src/config/train/
 # Exactly one of --stage / --config must be provided.
 # Usage:
 #   ./scripts/train/pretrain_kappa.sh --stage egodex                              # auto-detect GPUs
-#   ./scripts/train/pretrain_kappa.sh --stage he --num_gpus 4                     # 4 GPUs, DeepSpeed ZeRO-2
-#   ./scripts/train/pretrain_kappa.sh --stage he --num_gpus 8 \
+#   ./scripts/train/pretrain_kappa.sh --stage he_wbt --num_gpus 4                 # 4 GPUs, DeepSpeed ZeRO-2
+#   ./scripts/train/pretrain_kappa.sh --stage he_wbt --num_gpus 8 \
 #                                     --num_nodes 2 --master_addr X               # multi-node (manual)
-#   ./scripts/train/pretrain_kappa.sh --stage he --hostfile hostfile.txt          # multi-node (hostfile)
+#   ./scripts/train/pretrain_kappa.sh --stage he_wbt --hostfile hostfile.txt      # multi-node (hostfile)
 #   ./scripts/train/pretrain_kappa.sh --stage egodex --no_deepspeed               # force plain DDP
 #   ./scripts/train/pretrain_kappa.sh --stage egodex --deepspeed                  # force DeepSpeed (even single GPU)
-#   ./scripts/train/pretrain_kappa.sh --stage he \
+#   ./scripts/train/pretrain_kappa.sh --stage he_wbt \
 #       --train.pretrained-weights .runs/kappa/<egodex-run>                       # stage 2 from stage 1 weights
 #
 # Cluster scheduler (PET_*) usage:
@@ -99,10 +98,9 @@ fi
 if [ -z "$CONFIG_NAME" ]; then
     case "$STAGE" in
         egodex) CONFIG_NAME="pretrain_egodex_kappa_config" ;;
-        he)     CONFIG_NAME="pretrain_he_kappa_config" ;;
         he_wbt) CONFIG_NAME="pretrain_he_wbt_kappa_config" ;;
-        "")     echo "Error: must specify --stage {egodex|he|he_wbt} or --config <name>" >&2; exit 1 ;;
-        *)      echo "Error: unknown --stage '$STAGE' (expected 'egodex', 'he', or 'he_wbt')" >&2; exit 1 ;;
+        "")     echo "Error: must specify --stage {egodex|he_wbt} or --config <name>" >&2; exit 1 ;;
+        *)      echo "Error: unknown --stage '$STAGE' (expected 'egodex' or 'he_wbt')" >&2; exit 1 ;;
     esac
 fi
 

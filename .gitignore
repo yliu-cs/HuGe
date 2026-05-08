@@ -28,3 +28,5 @@ Mixture-of-Transformers
 # Others
 *.log
 bench_*.py
+*.TXT
+*.zip

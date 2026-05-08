@@ -52,7 +52,10 @@ class KappaModelConfig(ModelConfig):
     g1_max_delay: int = 10
     sonic_max_delay: int = 8
     proprio_noise_std: float = 0.02
-    proprio_drop_prob: float = 0.0
+    # Proprio now lives in the latent prefix (visible to BOTH SONIC and G1
+    # via attention), so a non-zero default drop avoids the experts collapsing
+    # onto proprio and ignoring the visual conditioning.
+    proprio_drop_prob: float = 0.1
     g1_action_stats_path: str | None = None
     g1_proprio_stats_path: str | None = None
 

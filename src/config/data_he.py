@@ -25,6 +25,11 @@ class HEDataConfig(DataConfig):
     g1_proprio_stats_path: str | None = None
     normalize_mode: str = "bounds"
 
+    # Restrict the dataset to a fixed list of HE episode indices. ``None``
+    # keeps the full split; used by fine-tune configs that overfit a single
+    # episode for diagnostic / sanity-check runs.
+    episode_indices: list[int] | None = None
+
     def _load_stats(self, path: str | None) -> dict | None:
         if path is None or not os.path.exists(path):
             return None
@@ -46,5 +51,6 @@ class HEDataConfig(DataConfig):
             g1_action_stats=self._load_stats(self.g1_action_stats_path),
             g1_proprio_stats=self._load_stats(self.g1_proprio_stats_path),
             normalize_mode=self.normalize_mode,
+            episode_indices=self.episode_indices,
         )
         return Dataset(raw, self.transform, transform_kwargs=transform_kwargs)

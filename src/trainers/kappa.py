@@ -42,7 +42,7 @@ class KappaCollator:
         g1_max_delay: int = 10,
         sonic_max_delay: int = 8,
         proprio_noise_std: float = 0.02,
-        proprio_drop_prob: float = 0.0,
+        proprio_drop_prob: float = 0.1,
         proprio_dim: int = 64,
     ):
         self.processor = processor
@@ -303,7 +303,7 @@ class KappaTrainer(Trainer):
             g1_max_delay=getattr(model_cfg, "g1_max_delay", 10),
             sonic_max_delay=getattr(model_cfg, "sonic_max_delay", 8),
             proprio_noise_std=getattr(model_cfg, "proprio_noise_std", 0.02),
-            proprio_drop_prob=getattr(model_cfg, "proprio_drop_prob", 0.0),
+            proprio_drop_prob=getattr(model_cfg, "proprio_drop_prob", 0.1),
             proprio_dim=getattr(model_cfg, "proprio_dim", 64),
         )
 
@@ -466,7 +466,9 @@ class KappaTrainer(Trainer):
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if "_g1" in name or "proprio_embedder" in name:
+            # ``proprio_embedder`` is a latent-prefix Linear, no longer part of
+            # the G1 expert — let it follow the default LR rather than g1_lr.
+            if "_g1" in name:
                 g1_params.append(param)
             elif "mlp1" in name or "projector" in name or "merger" in name:
                 projector_params.append(param)

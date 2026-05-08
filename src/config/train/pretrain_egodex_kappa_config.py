@@ -5,12 +5,12 @@ bits). The dataset right-pads tokens to ``sonic_dim=66`` and emits a per-dim
 ``sonic_mask`` that zeros out the trailing two hand-bit dims, so the loss
 ignores them.
 
-Stage 2 (Humanoid-Everyday) launches via ``pretrain_he_kappa_config`` with
-``--train.pretrained-weights`` pointing at this run's ``model.safetensors``
-(file, ``ckpt_*`` dir, or run dir — latest ckpt auto-picked). Optimizer,
-scheduler, and global_step start fresh; weights are loaded with
-``strict=False`` so the architectures must already match (they do: both
-configs share ``KappaModelConfig`` with ``sonic_dim=66``).
+Stage 2 (HE-G1 + G1-WBT mix) launches via ``pretrain_he_wbt_kappa_config``
+with ``--train.pretrained-weights`` pointing at this run's
+``model.safetensors`` (file, ``ckpt_*`` dir, or run dir — latest ckpt
+auto-picked). Optimizer, scheduler, and global_step start fresh; weights
+are loaded with ``strict=False`` so the architectures must already match
+(they do: both configs share ``KappaModelConfig`` with ``sonic_dim=66``).
 """
 from pydantic import Field
 

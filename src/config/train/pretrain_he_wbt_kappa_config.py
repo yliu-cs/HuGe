@@ -1,10 +1,9 @@
 """Pretrain config for Kappa Stage 1-2 (mixed): HE-G1 + G1-WBT.
 
-Mirrors ``pretrain_he_kappa_config`` but swaps in ``HEWBTMixDataConfig`` so a
-single trainer step draws from both sources at the natural frame ratio
-(HE-G1 ~1.7M : WBT ~2.48M ≈ 1 : 1.46). BlockShuffle still works because
-``ConcatMixDataset`` exposes a unified ``episode_spans`` over the concatenated
-index space.
+Uses ``HEWBTMixDataConfig`` so a single trainer step draws from both sources
+at the natural frame ratio (HE-G1 ~1.7M : WBT ~2.48M ≈ 1 : 1.46).
+BlockShuffle still works because ``ConcatMixDataset`` exposes a unified
+``episode_spans`` over the concatenated index space.
 """
 from pydantic import Field
 

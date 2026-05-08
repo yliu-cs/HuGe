@@ -4,14 +4,17 @@ Two expert configurations are supported:
 
 * **2-expert (legacy / pretrain)** — latent (text+vision) | sonic-action.
   Sequence layout: ``[image+text | t_emb (1) | sonic (T_s)]``.
-* **3-expert (post-train)** — latent | sonic-action | proprio+g1.
+* **3-expert (post-train)** — latent (text+vision[+proprio]) | sonic-action | g1.
   Sequence layout when proprio is on:
-    ``[image+text | t_emb_s (1) | sonic (T_s) | proprio (T_p=1) | g1 (T_g)]``
+    ``[image+text (T_text) | proprio (T_p=1) | t_emb_s + sonic (T_s) | g1 (T_g)]``
   When proprio is off: ``[image+text | t_emb_s (1) | sonic (T_s) | g1 (T_g)]``.
 
-The G1 expert adds per-layer ``*_g1`` attention/MLP/norm副本 plus top-level
-``action_embedder_g1`` / ``t_embedder_g1`` / ``norm_action_g1`` /
-``velocity_head_g1`` / ``proprio_embedder_g1``. Proprio shares the G1 path.
+Proprio joins the **latent prefix** (Qwen base expert), so both SONIC and G1
+attend to it via the per-layer attention. The G1 expert adds per-layer
+``*_g1`` attention/MLP/norm副本 plus top-level ``action_embedder_g1`` /
+``t_embedder_g1`` / ``norm_action_g1`` / ``velocity_head_g1``. The 64-D
+proprio is projected once via ``proprio_embedder`` (a top-level Linear) and
+its K/V are cached together with text/image into the prefix KV cache.
 
 Real-Time Chunking (RTC) is supported by giving the G1 timestep a per-token
 2-D shape and substituting clean prefix actions in the noisy input.
@@ -90,11 +93,12 @@ class MoTAttention(nn.Module):
     """Shared joint attention with one or two extra expert paths.
 
     ``forward`` accepts ``hidden_states`` already laid out as
-    ``[latent (T_text) | sonic (T_s) | g1 (T_p + T_g)]``. The caller passes
-    the segment boundaries as ``n_latent`` and ``n_sonic_end``; tokens after
-    ``n_sonic_end`` go through the ``*_g1`` projections (proprio + g1 share
-    the path). When ``n_sonic_end == n_total`` the legacy 2-expert layout is
-    used (no G1 path constructed at runtime).
+    ``[latent (T_text + T_p) | sonic (T_s) | g1 (T_g)]``. The caller passes
+    the segment boundaries as ``n_latent`` and ``n_sonic_end``; tokens before
+    ``n_latent`` (text + image + proprio) go through the base Qwen
+    projections, and tokens at ``[n_sonic_end:]`` go through the ``*_g1``
+    projections. When ``n_sonic_end == n_total`` the legacy 2-expert layout
+    is used (no G1 path constructed at runtime).
     """
 
     def __init__(self, original_attn: Qwen3VLTextAttention, has_g1: bool = False):
@@ -421,10 +425,11 @@ class MoTKappaModel(nn.Module):
     """Kappa MoT model with flow matching action expert(s).
 
     See module docstring for sequence layouts. ``use_g1_expert`` activates the
-    third expert; ``use_proprio`` adds a single 64-D proprio token between
-    SONIC and G1 segments. ``use_rtc`` switches the G1 timestep into a per-
-    token tensor and enables prefix substitution in the collator/inference
-    paths.
+    third expert; ``use_proprio`` adds a single 64-D proprio token at the end
+    of the latent prefix (between text/image and the SONIC segment), so both
+    SONIC and G1 attend to proprio via the per-layer attention. ``use_rtc``
+    switches the G1 timestep into a per-token tensor and enables prefix
+    substitution in the collator/inference paths.
     """
 
     def __init__(
@@ -463,10 +468,11 @@ class MoTKappaModel(nn.Module):
             self.t_embedder_g1 = TimestepEmbedder(hidden_size)
             self.velocity_head_g1 = VelocityHead(hidden_size, g1_dim)
             self.norm_action_g1 = Qwen3VLTextRMSNorm(hidden_size, eps=1e-6)
-            if self.use_proprio:
-                self.proprio_embedder_g1 = nn.Linear(proprio_dim, hidden_size)
-                nn.init.normal_(self.proprio_embedder_g1.weight, std=0.02)
-                nn.init.zeros_(self.proprio_embedder_g1.bias)
+
+        if self.use_proprio:
+            self.proprio_embedder = nn.Linear(proprio_dim, hidden_size)
+            nn.init.normal_(self.proprio_embedder.weight, std=0.02)
+            nn.init.zeros_(self.proprio_embedder.bias)
 
         text_model = base_model.model.language_model
         new_layers = nn.ModuleList()
@@ -502,50 +508,54 @@ class MoTKappaModel(nn.Module):
         sonic_causal: bool,
     ) -> torch.Tensor:
         """4-section attention mask covering the full layout
-        ``[text | t_emb_s + sonic | proprio | g1]``.
+        ``[text | proprio | t_emb_s + sonic | g1]``.
+
+        Proprio sits inside the latent prefix so its K/V are cached together
+        with text/image and the SONIC + G1 experts can both attend to it.
 
         Constraints:
 
-        * ``text → text`` causal; ``text → tail`` blocked (KV cache invariant).
-        * ``sonic → text`` full; ``sonic → sonic`` bidirectional (or causal if
-          ``rtc_on_sonic``); ``sonic → proprio/g1`` blocked.
-        * ``proprio → text+sonic`` full; ``proprio → g1`` blocked.
-        * ``g1 → text+sonic+proprio`` full; ``g1 → g1`` causal (RTC).
+        * ``text → text`` causal; ``text → proprio/sonic/g1`` blocked
+          (KV cache invariant + protect Qwen text representations from
+          proprio feedback).
+        * ``proprio → text`` full; ``proprio → proprio`` self;
+          ``proprio → sonic/g1`` blocked (KV cache invariant).
+        * ``sonic → text + proprio`` full; ``sonic → sonic`` bidirectional
+          (or causal if ``rtc_on_sonic``); ``sonic → g1`` blocked.
+        * ``g1 → text + proprio + sonic`` full; ``g1 → g1`` causal (RTC).
         """
-        T_total = T_text + T_s + T_p + T_g
+        T_total = T_text + T_p + T_s + T_g
         mask = torch.zeros(B, 1, T_total, T_total, device=device, dtype=dtype)
 
         n_text_end = T_text
-        n_sonic_end = n_text_end + T_s
-        n_proprio_end = n_sonic_end + T_p
-        # n_g1_end = n_proprio_end + T_g  (== T_total)
+        n_proprio_end = n_text_end + T_p          # == n_latent
+        n_sonic_end = n_proprio_end + T_s
+        # n_g1_end = n_sonic_end + T_g  (== T_total)
 
         # text causal among text rows.
         mask[:, 0, :n_text_end, :n_text_end].masked_fill_(
             _causal_mask(T_text, device, dtype), float("-inf"),
         )
-        # text → tail blocked.
+        # text → tail (proprio + sonic + g1) blocked.
         mask[:, 0, :n_text_end, n_text_end:] = float("-inf")
+
+        # proprio → sonic + proprio → g1 blocked.
+        if T_p > 0:
+            mask[:, 0, n_text_end:n_proprio_end, n_proprio_end:] = float("-inf")
 
         # sonic intra-segment.
         if sonic_causal and T_s > 1:
-            sonic_self = mask[:, 0, n_text_end:n_sonic_end, n_text_end:n_sonic_end]
+            sonic_self = mask[:, 0, n_proprio_end:n_sonic_end, n_proprio_end:n_sonic_end]
             sonic_self.masked_fill_(
                 _causal_mask(T_s, device, dtype), float("-inf"),
             )
-        # sonic → proprio + sonic → g1 blocked.
-        if T_p > 0:
-            mask[:, 0, n_text_end:n_sonic_end, n_sonic_end:n_proprio_end] = float("-inf")
+        # sonic → g1 blocked.
         if T_g > 0:
-            mask[:, 0, n_text_end:n_sonic_end, n_proprio_end:] = float("-inf")
-
-        # proprio → g1 blocked.
-        if T_p > 0 and T_g > 0:
-            mask[:, 0, n_sonic_end:n_proprio_end, n_proprio_end:] = float("-inf")
+            mask[:, 0, n_proprio_end:n_sonic_end, n_sonic_end:] = float("-inf")
 
         # g1 segment causal.
         if T_g > 1:
-            g1_self = mask[:, 0, n_proprio_end:, n_proprio_end:]
+            g1_self = mask[:, 0, n_sonic_end:, n_sonic_end:]
             g1_self.masked_fill_(_causal_mask(T_g, device, dtype), float("-inf"))
 
         if attention_mask is not None:
@@ -624,6 +634,12 @@ class MoTKappaModel(nn.Module):
         proprio_segment: Optional[torch.Tensor] = None
         g1_segment: Optional[torch.Tensor] = None
 
+        if self.use_proprio and proprio is not None:
+            proprio_segment = self.proprio_embedder(
+                proprio.to(inputs_embeds.dtype)
+            ).reshape(B, 1, D)
+            T_p = 1
+
         if self.use_g1_expert and noisy_g1_tokens is not None:
             T_g = noisy_g1_tokens.shape[1]
             g1_action_emb = self.action_embedder_g1(noisy_g1_tokens.to(inputs_embeds.dtype))
@@ -636,22 +652,19 @@ class MoTKappaModel(nn.Module):
                 g1_t_emb = g1_t_emb.unsqueeze(1).expand(-1, T_g, -1)
             g1_segment = (g1_action_emb + g1_t_emb).to(inputs_embeds.dtype)
 
-            if self.use_proprio and proprio is not None:
-                proprio_segment = self.proprio_embedder_g1(
-                    proprio.to(inputs_embeds.dtype)
-                ).reshape(B, 1, D)
-                T_p = 1
-
-        parts = [inputs_embeds, sonic_segment]
+        # Layout: [text | proprio? | sonic | g1?]. Proprio is part of the
+        # latent prefix so SONIC and G1 both attend to it.
+        parts = [inputs_embeds]
         if T_p > 0:
             parts.append(proprio_segment)
+        parts.append(sonic_segment)
         if T_g > 0:
             parts.append(g1_segment)
         all_embeds = torch.cat(parts, dim=1)
 
-        T_total = T_text + T_s + T_p + T_g
-        n_latent = T_text
-        n_sonic_end = T_text + T_s
+        T_total = T_text + T_p + T_s + T_g
+        n_latent = T_text + T_p
+        n_sonic_end = n_latent + T_s
 
         sonic_causal = bool(self.rtc_on_sonic and self.use_rtc)
         full_attn_mask = self._build_mask(
@@ -673,8 +686,8 @@ class MoTKappaModel(nn.Module):
                 n_sonic_end=n_sonic_end,
             )
 
-        # SONIC velocity prediction (skip leading timestep token).
-        sonic_hidden = self.norm_action(hidden_states[:, T_text + 1:n_sonic_end])
+        # SONIC velocity prediction (skip leading t_emb_s within sonic seg).
+        sonic_hidden = self.norm_action(hidden_states[:, n_latent + 1:n_sonic_end])
         velocity_pred = self.velocity_head(sonic_hidden)
 
         loss_total = torch.zeros((), device=velocity_pred.device, dtype=torch.float32)
@@ -698,7 +711,7 @@ class MoTKappaModel(nn.Module):
 
         velocity_pred_g1 = None
         if T_g > 0:
-            g1_hidden = self.norm_action_g1(hidden_states[:, T_text + T_s + T_p:])
+            g1_hidden = self.norm_action_g1(hidden_states[:, n_sonic_end:])
             velocity_pred_g1 = self.velocity_head_g1(g1_hidden)
             if g1_velocity_target is not None:
                 target_g = g1_velocity_target.to(velocity_pred_g1.dtype)
@@ -740,6 +753,7 @@ class MoTKappaModel(nn.Module):
         T_action: int = 50,
         T_g1: int = 0,
         T_proprio: int = 0,
+        proprio: Optional[torch.Tensor] = None,
     ) -> dict:
         qwen_model = self.base_model.model
         language_model = qwen_model.language_model
@@ -763,13 +777,27 @@ class MoTKappaModel(nn.Module):
         T_s = 1 + T_action  # t_emb_s token + sonic chunk
         T_p = T_proprio
         T_g = T_g1
-        T_total = T_text + T_s + T_p + T_g
+        T_total = T_text + T_p + T_s + T_g
+
+        # Embed proprio into the latent prefix so its K/V are baked into the
+        # KV cache once and reused for every denoise step.
+        if T_p > 0:
+            assert proprio is not None, "T_proprio>0 but proprio tensor not provided"
+            proprio_embed = self.proprio_embedder(
+                proprio.to(inputs_embeds.dtype)
+            ).reshape(B, T_p, D)
+            prefix_embeds = torch.cat([inputs_embeds, proprio_embed], dim=1)
+        else:
+            prefix_embeds = inputs_embeds
+
+        n_latent = T_text + T_p
+        n_sonic_end = n_latent + T_s
 
         tail = torch.zeros(
-            B, T_s + T_p + T_g, D,
+            B, T_s + T_g, D,
             device=inputs_embeds.device, dtype=inputs_embeds.dtype,
         )
-        all_embeds = torch.cat([inputs_embeds, tail], dim=1)
+        all_embeds = torch.cat([prefix_embeds, tail], dim=1)
 
         full_attn_mask = self._build_mask(
             B=B, T_text=T_text, T_s=T_s, T_p=T_p, T_g=T_g,
@@ -789,16 +817,16 @@ class MoTKappaModel(nn.Module):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=full_attn_mask,
-                n_latent=T_text,
-                n_sonic_end=T_text + T_s,
+                n_latent=n_latent,
+                n_sonic_end=n_sonic_end,
                 kv_cache_out=cache,
             )
             layer_caches.append(cache)
 
         cos_full, sin_full = position_embeddings
-        cos_action = cos_full[:, T_text:, :].contiguous()
-        sin_action = sin_full[:, T_text:, :].contiguous()
-        attention_mask_action = full_attn_mask[:, :, T_text:, :].contiguous()
+        cos_action = cos_full[:, n_latent:, :].contiguous()
+        sin_action = sin_full[:, n_latent:, :].contiguous()
+        attention_mask_action = full_attn_mask[:, :, n_latent:, :].contiguous()
 
         return {
             "T_text": T_text,
@@ -807,6 +835,7 @@ class MoTKappaModel(nn.Module):
             "T_g": T_g,
             "T_action": T_action,
             "T_total": T_total,
+            "n_latent": n_latent,
             "B": B,
             "device": input_ids.device,
             "dtype": inputs_embeds.dtype,
@@ -852,7 +881,6 @@ class MoTKappaModel(nn.Module):
         timesteps_sonic: torch.Tensor,
         noisy_g1_tokens: torch.Tensor,
         timesteps_g1: torch.Tensor,
-        proprio: Optional[torch.Tensor] = None,
         prev_g1: Optional[torch.Tensor] = None,
         delay_g1: Optional[torch.Tensor] = None,
         prev_sonic: Optional[torch.Tensor] = None,
@@ -863,6 +891,10 @@ class MoTKappaModel(nn.Module):
         Performs prefix substitution on ``noisy_g1_tokens`` (and optionally on
         ``noisy_sonic_tokens`` when ``rtc_on_sonic`` is enabled) using
         ``prev_*`` plus ``delay_*``. Returns ``(velocity_sonic, velocity_g1)``.
+
+        Proprio is not handed to this step — it was embedded into the latent
+        prefix during ``encode_latent`` so its K/V already live in the
+        per-layer KV cache.
         """
         language_model = self.base_model.model.language_model
         B = cache["B"]
@@ -908,13 +940,8 @@ class MoTKappaModel(nn.Module):
         g1_t_emb = self.t_embedder_g1(t_per_pos_g)
         g1_seg = (g1_action_emb + g1_t_emb).to(cache["dtype"])
 
-        parts = [sonic_seg]
-        if cache["T_p"] > 0:
-            assert proprio is not None, "Proprio cache slot present but no input given"
-            proprio_seg = self.proprio_embedder_g1(proprio.to(cache["dtype"])).reshape(B, 1, D)
-            parts.append(proprio_seg)
-        parts.append(g1_seg)
-        action_h = torch.cat(parts, dim=1)
+        # Tail layout: [sonic | g1]. Proprio is in the cached prefix, not here.
+        action_h = torch.cat([sonic_seg, g1_seg], dim=1)
 
         for layer, kv_cache in zip(language_model.layers, cache["layer_caches"]):
             action_h = layer.forward_cached(
@@ -929,8 +956,7 @@ class MoTKappaModel(nn.Module):
         sonic_hidden = self.norm_action(action_h[:, 1:T_s_tail])
         v_sonic = self.velocity_head(sonic_hidden)
 
-        # G1 velocity (skip proprio if present).
-        g1_start = T_s_tail + cache["T_p"]
-        g1_hidden = self.norm_action_g1(action_h[:, g1_start:])
+        # G1 velocity.
+        g1_hidden = self.norm_action_g1(action_h[:, T_s_tail:])
         v_g1 = self.velocity_head_g1(g1_hidden)
         return v_sonic, v_g1

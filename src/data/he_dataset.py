@@ -30,6 +30,7 @@ class HEDataset(TokenizedVideoDataset):
         g1_action_stats: dict | None = None,
         g1_proprio_stats: dict | None = None,
         normalize_mode: str = "bounds",
+        episode_indices: list[int] | None = None,
     ):
         super().__init__(action_chunk_size=action_chunk_size)
         self.data_root = data_root
@@ -38,6 +39,9 @@ class HEDataset(TokenizedVideoDataset):
         # G1). Default to G1; pass "all" to opt out once the pipeline supports
         # cross-embodiment encoding.
         self.robot_type = robot_type.lower()
+        self._episode_filter: set[int] | None = (
+            {int(i) for i in episode_indices} if episode_indices else None
+        )
         self.cache_root = resolve_writable_cache_root(data_root, cache_root)
         self.sonic_tokens_dir = os.path.join(self.cache_root, "sonic_tokens")
         if not os.path.isdir(self.sonic_tokens_dir):
@@ -87,8 +91,13 @@ class HEDataset(TokenizedVideoDataset):
         # Bumped from "dataset_index_50hz_*" so old per-frame cache files
         # (different .npz schema) get rebuilt on first load instead of
         # raising KeyError on the new column names.
+        suffix = ""
+        if self._episode_filter is not None:
+            ep_list = "_".join(str(i) for i in sorted(self._episode_filter))
+            suffix = f"_filter_ep{ep_list}"
         return os.path.join(
-            self.cache_root, "meta", f"episode_index_50hz_{self.robot_type}.npz"
+            self.cache_root, "meta",
+            f"episode_index_50hz_{self.robot_type}{suffix}.npz",
         )
 
     def _load_index(self) -> None:
@@ -140,19 +149,33 @@ class HEDataset(TokenizedVideoDataset):
     def _build_index(self) -> None:
         parquet_paths = self._collect_parquet_paths()
 
+        def _ep_idx_from_path(p: str) -> int:
+            return int(os.path.basename(p)[len("episode_"):-len(".parquet")])
+
         if self.robot_type != "all":
             rt_map = self._load_robot_type_map()
             allowed = {idx for idx, rt in rt_map.items() if rt == self.robot_type}
-
-            def _ep_idx_from_path(p: str) -> int:
-                return int(os.path.basename(p)[len("episode_"):-len(".parquet")])
-
             kept = [p for p in parquet_paths if _ep_idx_from_path(p) in allowed]
             print(
                 f"[HEDataset] robot_type='{self.robot_type}': kept "
                 f"{len(kept)} / {len(parquet_paths)} episodes."
             )
             parquet_paths = kept
+
+        if self._episode_filter is not None:
+            before = len(parquet_paths)
+            parquet_paths = [
+                p for p in parquet_paths if _ep_idx_from_path(p) in self._episode_filter
+            ]
+            print(
+                f"[HEDataset] episode_indices filter "
+                f"{sorted(self._episode_filter)}: kept {len(parquet_paths)} / {before} episodes."
+            )
+            if not parquet_paths:
+                raise ValueError(
+                    f"episode_indices={sorted(self._episode_filter)} matched no "
+                    f"episodes (after robot_type='{self.robot_type}' filter)."
+                )
 
         dfs = [pl.read_parquet(p, columns=["episode_index", "task_index"]) for p in parquet_paths]
         df = pl.concat(dfs)

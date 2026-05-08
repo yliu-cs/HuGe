@@ -184,7 +184,7 @@ class KappaModelWrapper(nn.Module):
             "t_embedder",       # both t_embedder + t_embedder_g1
             "velocity_head",    # both velocity_head + velocity_head_g1
             "norm_action",      # final norms (both experts)
-            "proprio_embedder_g1",
+            "proprio_embedder", # latent-prefix proprio Linear (no _g1 suffix)
         )
         n_total = 0
         n_trainable = 0

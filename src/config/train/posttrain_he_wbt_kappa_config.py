@@ -103,8 +103,10 @@ class PostTrainHEWBTLaunchConfig(LaunchConfig):
         learning_rate=2e-5,
         warmup_steps=0,
         warmup_ratio=0.01,
-        # Set this to a valid stage 1-2 ckpt before launching.
-        pretrained_weights=".runs/kappa/exp.kappa.b1024.gpus8.2605070240/checkpoints/ckpt_6931",
+        # No default seed: pass --train.pretrained-weights at the CLI (or let
+        # scripts/train/run_kappa_pipeline.sh thread the previous stage's run
+        # dir in automatically).
+        pretrained_weights=None,
     )
 
 
