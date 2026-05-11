@@ -12,6 +12,7 @@ outputs
 .runs
 .claude
 .sii
+.baks
 
 # Project directories
 resource

@@ -107,6 +107,12 @@ TOKEN_DIM = 64  # only the 64-D SONIC latent goes into ``token_state``; the
                 # to a separate hand controller and are not part of the
                 # decoder's obs.
 OBS_DIM = 994
+# Safety bound on decoder output (IsaacLab action). Deploy actions sit in
+# roughly [-1.5, 1.5]; this leaves >5× headroom for legitimate transients
+# but stops a single OOD obs (e.g. mid-fall) from being amplified through
+# the ``last_action`` history into a runaway. Mirrors the deploy's
+# ``body_dq > 35`` abort in spirit but without crashing the eval run.
+_ACTION_SAFETY_BOUND = 10.0
 
 
 def _quat_inv_rotate(quat_wxyz: np.ndarray, vec: np.ndarray) -> np.ndarray:
@@ -251,7 +257,12 @@ class SonicDecoder:
         latent = np.asarray(sonic_token, dtype=np.float32)[:TOKEN_DIM]
         obs = self._build_obs(latent)
         out = self.session.run(["action"], {"obs_dict": obs})[0][0]  # (29,)
-        action_il = out.astype(np.float64)
+        # Clamp before the history append so a single OOD-state response
+        # cannot bootstrap a positive-feedback runaway through
+        # ``his_last_actions``.
+        action_il = np.clip(
+            out.astype(np.float64), -_ACTION_SAFETY_BOUND, _ACTION_SAFETY_BOUND,
+        )
         self._hist_act.append(action_il.copy())
         scaled_mj = action_il[ISAACLAB_TO_MUJOCO] * G1_ACTION_SCALE_MUJOCO
         q_target_mj = DEFAULT_ANGLES_MUJOCO + scaled_mj

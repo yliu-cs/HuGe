@@ -2,7 +2,7 @@
 
 ## TODO
 
-- [] Adapting RTC
+`claude --resume 6d23b57c-4410-4240-87ff-dc11ea5d0721`
 
 ## 🏠 Installation
 
@@ -32,25 +32,27 @@ mkdir -p sonic
 ```
 # Stage 1-1: Pre-Train on EgoDex
 uv run python scripts/preprocess/egodex/build_index.py
-tmux new -s pretrain_egodex -d "./scripts/train/pretrain_kappa.sh --stage egodex 2>&1 | tee pretrain_egodex.log"
+tmux new -s pretrain_egodex -d "script -q -c './scripts/train/pretrain_kappa.sh --stage egodex' pretrain_egodex.log"
 
 # Stage 1-2: Pre-Train on Humanoid-Everyday G1 + G1-WBT
 uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
 tmux new -s calc_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
 tmux new -s calc_wbt_sonic -d "uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py"
-tmux new -s pretrain_he_wbt -d "./scripts/train/pretrain_kappa.sh --stage he_wbt --train.pretrained-weights .runs/kappa/exp.kappa.b1024.gpus8.2604301611 | tee pretrain_he_wbt.log"
+tmux new -s pretrain_he_wbt -d "script -q -c './scripts/train/pretrain_kappa.sh --stage he_wbt' pretrain_he_wbt.log"
 
 # Stage 2: Post-Train on Humanoid-Everyday G1 + G1-WBT
-tmux new -s posttrain_he_wbt -d "./scripts/train/posttrain_kappa.sh | tee posttrain_he_wbt.log"
+tmux new -s posttrain_he_wbt -d "script -q -c './scripts/train/posttrain_kappa.sh' posttrain_he_wbt.log"
 
 # Stage 3: Fine-Tune on Proprietary Data
-tmux new -s finetune_prop -d "./scripts/train/finetune_kappa.sh | tee finetune_prop.log"
+tmux new -s finetune_prop -d "script -q -c './scripts/train/finetune_kappa.sh' finetune_prop.log"
+
+# tmux new -s train_kappa -d "script -q -c './scripts/train/train_kappa.sh' train_kappa.log"
 ```
 
-## Evaluation
+## 🎯 Evaluation
 
 ```
-MUJOCO_GL=egl uv run python scripts/eval/sim_validate.py --num-episodes 1 --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
+uv run python scripts/eval/sim_validate.py --heads gt_wbc g1_expert_wbc --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
 ```
 
 ## ❤️ Acknowledgment

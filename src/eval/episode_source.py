@@ -66,6 +66,15 @@ class HEEpisodeSource:
             if g1_action_cache_root is not None
             else self.proprio_cache_root.parent / "g1_actions"
         )
+        # Lazy per-episode pelvis pose cache. Built on first ``pelvis_pose_at``
+        # call by reading the parquet's ``observation.odometry.{position,quat}``
+        # at 30 Hz and upsampling to the 50 Hz token timeline. Not part of
+        # ``g1_proprio`` because position is only needed for the GT-replay
+        # visualization, not for policy input.
+        self._pelvis_pose: dict[int, np.ndarray] = {}
+        # Per-episode (vx_body, vy_body, wz) timelines derived from pelvis_pose
+        # via finite differencing; built lazily on first ``loco_cmd_at`` call.
+        self._loco_cmd: dict[int, np.ndarray] = {}
         self.robot_type = robot_type.lower()
         episodes_path = self.data_root / "meta" / "episodes.jsonl"
         tasks_path = self.data_root / "meta" / "tasks.jsonl"
@@ -164,6 +173,139 @@ class HEEpisodeSource:
         idx = int(round(t_seconds * HE_PROPRIO_FPS))
         idx = max(0, min(idx, arr.shape[0] - 1))
         return np.asarray(arr[idx], dtype=np.float32)
+
+    def pelvis_pose_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
+        """Return the dataset's pelvis pose at sim time ``t_seconds``.
+
+        Layout: ``(7,) float32 = [x, y, z, qw, qx, qy, qz]`` in HE world frame.
+        Loaded on demand from the source parquet's
+        ``observation.odometry.{position,quat}`` and upsampled from the native
+        30 Hz parquet rate to the 50 Hz token timeline so it lines up with
+        ``g1_action_at`` / ``proprio_at`` indexing.
+
+        Used by the GT-replay head in the sim validator to make the floating
+        base actually translate / rotate the way the recorded episode did,
+        instead of staying pinned to the spawn pose (which makes a walking
+        episode look like in-place stepping).
+        """
+        ep = int(episode_index)
+        arr = self._pelvis_pose.get(ep)
+        if arr is None:
+            arr = self._load_pelvis_pose(ep)
+            self._pelvis_pose[ep] = arr
+        idx = int(round(t_seconds * HE_PROPRIO_FPS))
+        idx = max(0, min(idx, arr.shape[0] - 1))
+        return np.asarray(arr[idx], dtype=np.float32)
+
+    def loco_cmd_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
+        """Return (vx_body, vy_body, wz) derived from the dataset's pelvis odometry.
+
+        Used to feed the WBC head an apples-to-apples replay command: at time
+        ``t``, what velocity was the operator commanding via the real
+        platform's WBC. The dataset doesn't store loco_cmd directly, so we
+        reconstruct it by finite-differencing ``pelvis_pose_at`` over a 5-frame
+        centered window (~100 ms at 50 Hz; smoother than ±1 frame, sharper
+        than ±5).
+
+        Output is in the robot's body frame at frame ``t``, clipped to the
+        WBC's training range (±1.0 m/s linear, ±1.5 rad/s yaw). Values outside
+        that range push the policy OOD.
+        """
+        ep = int(episode_index)
+        arr = self._loco_cmd.get(ep)
+        if arr is None:
+            arr = self._build_loco_cmd(ep)
+            self._loco_cmd[ep] = arr
+        idx = int(round(t_seconds * HE_PROPRIO_FPS))
+        idx = max(0, min(idx, arr.shape[0] - 1))
+        return np.asarray(arr[idx], dtype=np.float32)
+
+    def _build_loco_cmd(self, episode_index: int) -> np.ndarray:
+        """Compute the full (T, 3) body-frame loco_cmd timeline for an episode.
+
+        Pipeline:
+          1. Pull 50 Hz pelvis pose (pos[T,3] + quat_wxyz[T,4]).
+          2. Extract yaw, unwrap to remove ±π jumps.
+          3. Centered finite difference (window=5 frames) → world-frame
+             linear velocity + yaw rate.
+          4. Project linear velocity into body frame via current yaw.
+          5. Clip to WBC training range.
+        """
+        pose = self.pelvis_pose_at(episode_index, 0.0)  # warms the cache
+        full = self._pelvis_pose[int(episode_index)]
+        pos = full[:, :3].astype(np.float64)
+        quat = full[:, 3:7].astype(np.float64)  # wxyz
+        T = pos.shape[0]
+        dt = 1.0 / HE_PROPRIO_FPS
+
+        # Yaw from wxyz quat, then unwrap.
+        qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        yaw_unwrapped = np.unwrap(yaw)
+
+        # Centered finite difference, window=5 (= ±2 frames). At the edges fall
+        # back to a forward/backward diff so the timeline length is preserved.
+        W = 2
+        v_world = np.zeros((T, 2), dtype=np.float64)
+        wz = np.zeros(T, dtype=np.float64)
+        for i in range(T):
+            i0 = max(0, i - W)
+            i1 = min(T - 1, i + W)
+            span = (i1 - i0) * dt
+            if span <= 0:
+                continue
+            v_world[i] = (pos[i1, :2] - pos[i0, :2]) / span
+            wz[i] = (yaw_unwrapped[i1] - yaw_unwrapped[i0]) / span
+
+        # Project world-frame planar velocity into body frame using yaw at i.
+        c, s = np.cos(yaw), np.sin(yaw)
+        vx_body = v_world[:, 0] * c + v_world[:, 1] * s
+        vy_body = -v_world[:, 0] * s + v_world[:, 1] * c
+
+        cmd = np.stack([vx_body, vy_body, wz], axis=1)
+        # WBC training range: ±1.0 m/s linear, ±1.5 rad/s yaw. Outside these
+        # the policy is OOD; clipping is safer than letting it extrapolate.
+        cmd[:, 0] = np.clip(cmd[:, 0], -1.0, 1.0)
+        cmd[:, 1] = np.clip(cmd[:, 1], -1.0, 1.0)
+        cmd[:, 2] = np.clip(cmd[:, 2], -1.5, 1.5)
+        return cmd.astype(np.float32)
+
+    def _load_pelvis_pose(self, episode_index: int) -> np.ndarray:
+        """Read parquet odometry for ``episode_index`` and upsample to 50 Hz."""
+        import os
+
+        os.environ.setdefault(
+            "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage",
+        )
+        import polars as pl
+        from src.data.preprocess import resample_linear, resample_quat_wxyz
+
+        chunk = episode_index // 1000
+        parquet_path = (
+            self.data_root
+            / "data"
+            / f"chunk-{chunk:03d}"
+            / f"episode_{episode_index:06d}.parquet"
+        )
+        if not parquet_path.exists():
+            raise FileNotFoundError(
+                f"Missing parquet for pelvis pose lookup: {parquet_path}"
+            )
+        df = pl.read_parquet(
+            parquet_path,
+            columns=["observation.odometry.position", "observation.odometry.quat"],
+        )
+        pos = np.asarray(df["observation.odometry.position"].to_list(), dtype=np.float32)
+        quat_wxyz = np.asarray(df["observation.odometry.quat"].to_list(), dtype=np.float32)
+        n_src = pos.shape[0]
+        # Match the resampling pass calc_sonic_tokens.py applies to jp/proprio
+        # so the pelvis pose lands on the same indices as ``g1_action_at(t)``.
+        n_tgt = max(1, int(round(n_src * HE_PROPRIO_FPS / HE_VIDEO_FPS)))
+        if n_tgt != n_src:
+            pos = resample_linear(pos.astype(np.float64), n_src, n_tgt).astype(np.float32)
+            quat_wxyz = resample_quat_wxyz(quat_wxyz, n_src, n_tgt)
+        pose = np.concatenate([pos, quat_wxyz], axis=-1).astype(np.float32)
+        return pose
 
     def _make(self, list_idx: int) -> HEEpisode:
         return self._make_from_meta(self._episodes[list_idx])

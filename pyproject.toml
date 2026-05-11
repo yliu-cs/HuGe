@@ -21,6 +21,7 @@ dependencies = [
     "mujoco>=3.7.0",
     "decord>=0.6.0",
     "gpustat>=1.1.1",
+    "mediapy>=1.2.6",
 ]
 
 [build-system]

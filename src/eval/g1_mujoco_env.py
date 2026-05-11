@@ -137,6 +137,35 @@ def _look_at_quat_wxyz(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.array([w, x, y, z], dtype=np.float64)
 
 
+# Joint dynamics taken verbatim from the per-class defaults in the older
+# ``g1_29dof_old.xml`` (the one ``gear_sonic`` actually trains and validates
+# SONIC against). Wrists used ``frictionloss=0.1`` instead of 0.2 there.
+_DEFAULT_ARMATURE = 0.01
+_DEFAULT_DAMPING = 0.05
+_DEFAULT_FRICTIONLOSS = 0.2
+_WRIST_FRICTIONLOSS = 0.1
+
+
+def _inject_joint_dynamics(spec: mujoco.MjSpec) -> None:
+    """Apply armature/damping/frictionloss to every hinge joint in ``spec``.
+
+    Skips the free root joint (no scalar dof). Values mirror the
+    ``<default class="leg_motor"/arm_motor/...>`` block of
+    ``g1_29dof_old.xml`` so the joint dynamics match the model SONIC was
+    trained on.
+    """
+    for joint in spec.joints:
+        if joint.type != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        joint.armature = _DEFAULT_ARMATURE
+        # ``damping`` is exposed as a 3-vector for SDF compatibility; hinge
+        # only consumes element 0.
+        joint.damping[0] = _DEFAULT_DAMPING
+        joint.frictionloss = (
+            _WRIST_FRICTIONLOSS if "wrist" in joint.name else _DEFAULT_FRICTIONLOSS
+        )
+
+
 def _add_tracking_camera(spec: mujoco.MjSpec) -> None:
     """Add a third-person camera placed slightly above and in front of the
     robot, automatically rotating to keep the pelvis centered.
@@ -259,6 +288,17 @@ class G1MujocoEnv:
         # resolves correctly. Add tracking + head-mounted cameras to the spec
         # before compiling.
         spec = mujoco.MjSpec.from_file(str(self.xml_path))
+        # The shipped ``g1_29dof.xml`` strips the per-joint ``<default class="...">``
+        # block that the older ``g1_29dof_old.xml`` carried, so all 29 hinge joints
+        # land with armature=0/damping=0/frictionloss=0. The deploy PD gains were
+        # designed for the armatured model (STIFFNESS = armature × (2π·10)²), so
+        # missing armature collapses the effective joint inertia to just the
+        # rigid-body chain — orders of magnitude smaller than the design point.
+        # PD then drives the under-damped distal joints (wrists, ankles) into
+        # 200+ rad/s oscillations from step 0 and the sim numerically diverges
+        # within ~15 ticks. Inject the old defaults onto every hinge so the
+        # joint dynamics match what SONIC and the action stats were trained for.
+        _inject_joint_dynamics(spec)
         _add_tracking_camera(spec)
         self._has_ego_camera = _try_attach_head_camera(spec)
         self.model = spec.compile()
@@ -300,6 +340,14 @@ class G1MujocoEnv:
         # Cached commanded targets (held between policy queries).
         self._target_qpos = DEFAULT_QPOS.copy()
         self._last_hand_bits = np.zeros(2, dtype=np.float32)
+
+        # WBC head state. Off by default; switched on via ``enable_wbc_mode``,
+        # which retunes sim_dt to the WBC training resolution (0.005 s) and
+        # exposes ``step_with_wbc``. Other heads (g1_expert, sonic, gt_*) are
+        # untouched.
+        self._wbc = None  # set by enable_wbc_mode
+        self._wbc_decimation = 4  # WBC fires every N sim substeps (20 ms at 5 ms)
+        self._wbc_sub_counter = 0
 
         self.reset()
 
@@ -383,7 +431,11 @@ class G1MujocoEnv:
             self._step_physics_once()
         return self._collect_stats()
 
-    def kinematic_step(self, action_31: np.ndarray) -> StepStats:
+    def kinematic_step(
+        self,
+        action_31: np.ndarray,
+        base_qpos: Optional[np.ndarray] = None,
+    ) -> StepStats:
         """Visualize one control step by writing joint angles directly.
 
         No physics integration, no PD loop — used for replaying a recorded
@@ -394,6 +446,12 @@ class G1MujocoEnv:
         off the constraint). Direct kinematic replay sidesteps that — what
         gets rendered is exactly the dataset's joint trajectory, which is the
         useful visualization for "what does the GT look like in sim?".
+
+        ``base_qpos`` is the 7-D MuJoCo free-joint qpos for the pelvis
+        ``[x, y, z, qw, qx, qy, qz]``. When provided, the floating base is
+        moved to this pose so a walking episode actually translates across
+        the scene; when None, the base is pinned to ``_base_qpos_init``
+        (legacy behavior, useful for joint-only visualization).
         """
         if action_31.shape != (31,):
             raise ValueError(f"action shape must be (31,), got {action_31.shape}")
@@ -403,13 +461,90 @@ class G1MujocoEnv:
         for i, addr in enumerate(self._joint_qposadr):
             self.data.qpos[addr] = target[i]
             self.data.qvel[self._joint_dofadr[i]] = 0.0
-        if self.fixed_base:
+        if base_qpos is not None:
+            base = np.asarray(base_qpos, dtype=np.float64)
+            if base.shape != (7,):
+                raise ValueError(f"base_qpos must be (7,), got {base.shape}")
+            self.data.qpos[self._free_qposadr : self._free_qposadr + 7] = base
+            self.data.qvel[self._free_dofadr : self._free_dofadr + 6] = 0.0
+        elif self.fixed_base:
             self.data.qpos[self._free_qposadr : self._free_qposadr + 7] = (
                 self._base_qpos_init
             )
             self.data.qvel[self._free_dofadr : self._free_dofadr + 6] = 0.0
         mujoco.mj_forward(self.model, self.data)
         self.data.time += self.ctrl_dt
+        return self._collect_stats()
+
+    def enable_wbc_mode(self, wbc, sim_dt: float = 0.005) -> None:
+        """Switch this env into WBC head mode.
+
+        Retunes ``sim_dt`` to the WBC training resolution (default 0.005 s, the
+        IsaacLab → MuJoCo deploy timestep) and attaches the locomotion network
+        so ``step_with_wbc`` can drive legs+waist. Other env heads are
+        unaffected — they continue to call ``step`` / ``kinematic_step`` and
+        will be running at whatever sim_dt was set at construction.
+
+        The ``substeps`` count is recomputed so the outer ctrl_dt stays close
+        to its original value (slight drift is acceptable; the WBC training
+        period of 20 ms is preserved exactly via ``wbc_decimation = 4``).
+        """
+        self._wbc = wbc
+        self.sim_dt = float(sim_dt)
+        self.substeps = max(1, int(round(self.ctrl_dt / self.sim_dt)))
+        self.model.opt.timestep = self.sim_dt
+        self._wbc_sub_counter = 0
+
+    def step_with_wbc(
+        self,
+        arm_target_14: np.ndarray,
+        hand_bits_2: np.ndarray,
+        loco_cmd_3: np.ndarray,
+        height_cmd: float,
+        rpy_cmd_3: np.ndarray,
+    ) -> StepStats:
+        """Advance physics one control step with split PD.
+
+        Legs + waist (joints 0..14) tracked by the WBC's 15-D target output;
+        arms (joints 15..28) tracked by ``arm_target_14``. Both share the env's
+        ``self.kp`` / ``self.kd`` (same gains as ``step``).
+
+        The WBC fires every ``_wbc_decimation`` substeps (20 ms at sim_dt=5 ms,
+        matching the deployment script). Between firings the legs+waist target
+        is held at the last value the WBC produced.
+        """
+        if self._wbc is None:
+            raise RuntimeError("WBC not attached; call enable_wbc_mode() first.")
+        if arm_target_14.shape != (14,):
+            raise ValueError(f"arm_target must be (14,); got {arm_target_14.shape}")
+        if hand_bits_2.shape != (2,):
+            raise ValueError(f"hand_bits must be (2,); got {hand_bits_2.shape}")
+        self._last_hand_bits = hand_bits_2.astype(np.float32)
+
+        loco = np.asarray(loco_cmd_3, dtype=np.float64)
+        rpy = np.asarray(rpy_cmd_3, dtype=np.float64)
+        arm_target = arm_target_14.astype(np.float64)
+
+        for _ in range(self.substeps):
+            if self._wbc_sub_counter % self._wbc_decimation == 0:
+                target_15 = self._wbc.step(
+                    qpos_29=self.joint_pos(),
+                    qvel_29=self.joint_vel(),
+                    base_quat_wxyz=self.root_quat_wxyz(),
+                    base_omega_body=self.base_angular_velocity_body(),
+                    loco_cmd_3=loco,
+                    height_cmd=float(height_cmd),
+                    rpy_cmd_3=rpy,
+                )
+                self._target_qpos = np.concatenate(
+                    [target_15.astype(np.float64), arm_target]
+                )
+            else:
+                # Refresh arms only; legs+waist hold last WBC target.
+                self._target_qpos[15:29] = arm_target
+            self._wbc_sub_counter += 1
+            self._apply_pd_torque(self._target_qpos)
+            self._step_physics_once()
         return self._collect_stats()
 
     def _step_physics_once(self) -> None:
