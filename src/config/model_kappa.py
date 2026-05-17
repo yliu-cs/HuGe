@@ -34,16 +34,14 @@ class KappaModelConfig(ModelConfig):
     action_loss_weight: float = 1.0
 
     num_inference_steps: int = 4
-    # ODE solver for the flow-matching denoise loop. "heun" is a 2nd-order
-    # predictor-corrector (2 NFE per step except the final t=0 step which falls
-    # back to Euler since the model wasn't trained at t=0); "euler" is the
-    # original 1st-order scheme (1 NFE per step).
-    solver: str = "heun"
 
     # Post-train extras (3rd MoT expert + RTC + proprio). Defaults preserve
     # the pretrain stage 1-2 layout exactly so existing configs keep working.
     use_g1_expert: bool = False
-    g1_dim: int = 31
+    # 23-D = arms(14) + hand_bits(2) + loco_cmd(7). Legs+waist are not
+    # predicted (WBC handles them at deployment); see
+    # ``src.data.preprocess.build_g1_action_23`` for the channel layout.
+    g1_dim: int = 23
     g1_loss_weight: float = 0.3
     use_proprio: bool = False
     proprio_dim: int = 64

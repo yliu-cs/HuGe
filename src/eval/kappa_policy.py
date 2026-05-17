@@ -2,7 +2,8 @@
 
 Wraps the KappaModelWrapper + MoT post-train conversion behind a single
 ``predict_chunk(image, text, proprio, prev_g1, delay)`` method that returns
-the de-normalized 31-D G1 action chunk. Mirrors the inference path used by
+the de-normalized 23-D G1 action chunk (arms[14] + hand_bits[2] +
+loco_cmd/height/rpy[7]). Mirrors the inference path used by
 :mod:`src.inference.kappa_rtc_controller` minus the threading model — for
 offline rollout we step the policy synchronously inside the eval loop.
 """
@@ -27,6 +28,12 @@ class KappaPolicyConfig:
     backbone: str = "resource/model/Qwen3-VL-2B-Instruct"
     action_stats: str = "resource/dataset/G1_WBT-cache/meta/g1_action_stats.json"
     proprio_stats: str = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
+    # Must match the training-time ``data.normalize_mode``. ``bounds_q99`` reads
+    # q01/q99 (the default Kappa training pipeline); ``bounds`` reads min/max.
+    # A mismatch silently rescales the policy's denormalized action by the
+    # (max-min) / (q99-q01) ratio, which on G1 is ~2x — actions blow past the
+    # WBC's training range without warning.
+    normalize_mode: str = "bounds_q99"
     use_proprio: bool = True
     use_rtc: bool = True
     rtc_on_sonic: bool = True
@@ -128,12 +135,20 @@ class KappaPolicy:
         with open(self.cfg.proprio_stats) as f:
             pstats = json.load(f).get("proprio", {})
 
+        mode = self.cfg.normalize_mode
+        if mode == "bounds":
+            lo_key, hi_key = "min", "max"
+        elif mode == "bounds_q99":
+            lo_key, hi_key = "q01", "q99"
+        else:
+            raise ValueError(f"unknown normalize_mode {mode!r}")
+
         def _bounds(d: dict) -> tuple[np.ndarray, np.ndarray]:
-            mn = np.asarray(d["min"], dtype=np.float32)
-            mx = np.asarray(d["max"], dtype=np.float32)
-            ill = np.abs(mx - mn) < 1e-4 * (np.abs(mx) + np.abs(mn) + 1e-8)
-            mx = np.where(ill, mn + 1.0, mx)
-            return mn, mx
+            lo = np.asarray(d[lo_key], dtype=np.float32)
+            hi = np.asarray(d[hi_key], dtype=np.float32)
+            ill = np.abs(hi - lo) < 1e-4 * (np.abs(hi) + np.abs(lo) + 1e-8)
+            hi = np.where(ill, lo + 1.0, hi)
+            return lo, hi
 
         self.action_min, self.action_max = _bounds(astats)
         self.proprio_min, self.proprio_max = _bounds(pstats)
@@ -143,13 +158,23 @@ class KappaPolicy:
     # ------------------------------------------------------------------
 
     def normalize_proprio(self, proprio_64: np.ndarray) -> np.ndarray:
-        """Map raw 64-D proprio to [-1, 1] using the cached bounds."""
+        """Map raw 64-D proprio to [-1, 1] using the cached bounds.
+
+        Saturates at ±1 to match ``_normalize_to_pm1`` in
+        :mod:`src.data.tokenized_video_dataset` — the policy never saw
+        magnitudes >1 during training, so passing through OOD values just
+        feeds the model a distribution it can't interpret.
+        """
         rng = self.proprio_max - self.proprio_min
         out = (proprio_64.astype(np.float32) - self.proprio_min) / rng * 2.0 - 1.0
-        return np.clip(out, -3.0, 3.0)  # leave headroom in case of OOD values
+        return np.clip(out, -1.0, 1.0)
 
     def denormalize_action(self, action_norm: np.ndarray) -> np.ndarray:
-        """Map a 31-D normalized action back to raw joint+grip space."""
+        """Map a 23-D normalized G1 action back to raw command space.
+
+        Layout: arms(14, rad) + hand_bits(2, [0,1]) + loco_cmd(3, m/s & rad/s)
+        + base_height(1, m) + rpy_cmd(3, rad).
+        """
         rng = self.action_max - self.action_min
         return ((action_norm.astype(np.float32) + 1.0) / 2.0) * rng + self.action_min
 
@@ -205,11 +230,11 @@ class KappaPolicy:
 
         Returns ``(g1_norm, g1_denorm, sonic_chunk)``:
 
-        - ``g1_norm`` (H, 31) — G1-expert action chunk in [-1, 1] space.
+        - ``g1_norm`` (H, 23) — G1-expert action chunk in [-1, 1] space.
           Pass back as ``prev_g1_norm`` next call to enable RTC.
-        - ``g1_denorm`` (H, 31) — same chunk de-normalized to raw joint+grip
-          space (radians for joints, [0/1] for grippers); what the env's PD
-          loop consumes directly.
+        - ``g1_denorm`` (H, 23) — same chunk de-normalized: arms[14] +
+          hand_bits[2] + loco_cmd[3] + base_height[1] + rpy_cmd[3], in the
+          raw command units the WBC step API consumes.
         - ``sonic_chunk`` (H, sonic_dim) — predicted SONIC tokens. Layout is
           ``[64-D SONIC latent | 2-D hand bits]``. Pass back as
           ``prev_sonic`` to RTC-pin the SONIC prefix.
@@ -313,7 +338,7 @@ class KappaPolicy:
             prefix_mask_s = arange[None, :] < delay_sonic_t[:, None]
             sonic = torch.where(prefix_mask_s[..., None], prev_sonic_t, sonic)
 
-        actions_norm = g1[0].float().cpu().numpy()  # (H, 31)
+        actions_norm = g1[0].float().cpu().numpy()  # (H, g1_dim=23)
         actions_denorm = np.stack([self.denormalize_action(a) for a in actions_norm])
         sonic_chunk = sonic[0].float().cpu().numpy()  # (H, sonic_dim)
         return actions_norm, actions_denorm, sonic_chunk

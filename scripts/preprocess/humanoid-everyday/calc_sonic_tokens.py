@@ -68,16 +68,18 @@ def load_episode_arrays(parquet_path: str):
         a = np.asarray(arm[i], dtype=np.float64)
         jp[i, :l.shape[0]] = l
         jp[i, 15:15 + a.shape[0]] = a
+    op = np.asarray(df["observation.odometry.position"].to_list(), dtype=np.float32)
     oq = np.asarray(df["observation.odometry.quat"].to_list(), dtype=np.float32)
     ig = np.asarray(df["observation.imu.gyroscope"].to_list(), dtype=np.float32)
     hj = np.asarray(df["observation.hand_joints"].to_list(), dtype=np.float32)
-    return jp, oq, ig, hj
+    return jp, op, oq, ig, hj
 
 
 # Resampling helpers live in src.data.preprocess so HE/WBT/future sources stay
 # bit-identical (the SONIC token distribution is sensitive to upsampling).
 from src.data.preprocess import (  # noqa: E402
     atomic_save_npy,
+    build_g1_action_23,
     resample_linear as _resample_linear,
     resample_quat_wxyz as _resample_quat_wxyz,
 )
@@ -85,6 +87,7 @@ from src.data.preprocess import (  # noqa: E402
 
 def _dump_g1_action_and_proprio(
     jp: "np.ndarray",
+    op: "np.ndarray",
     oq: "np.ndarray",
     hj: "np.ndarray",
     hand_thresholds: tuple[float, float, float, float],
@@ -92,24 +95,27 @@ def _dump_g1_action_and_proprio(
     g1_action_path: str,
     g1_proprio_path: str,
 ) -> None:
-    """Dump 31-D G1 actions (jp + hand_bits) and 64-D proprio (jp + hand_bits +
-    jv + odom_quat_xyzw) on the SONIC token timeline.
+    """Dump 23-D G1 actions (arms + hand_bits + loco_cmd) and 64-D proprio
+    (full-body jp + hand_bits + jv + odom_quat_xyzw) on the SONIC timeline.
 
-    Lives next to the SONIC tokens so the dataset can mmap them per-episode
-    just like ``sonic_tokens/``. ``hj`` is the raw 14-D HE hand_joints; the
-    bits go through the same threshold + reverse-scan binarizer that the SONIC
-    encoder uses, so action/proprio bits stay byte-identical to the trailing
-    two columns of the SONIC token (a useful invariant for unit tests).
+    23-D action layout (see ``build_g1_action_23``):
+        [0:14] arms, [14:16] hand_bits, [16:19] navigate_cmd,
+        [19:20] base_height, [20:23] rpy_cmd(roll, pitch, 0).
+
+    Legs+waist are dropped from the action target — WBC drives them at
+    deployment. They remain in the 64-D proprio so the model sees full body
+    state as observation; that separation matches the deployment surface.
     """
     import numpy as np
     from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw, binarize_hands
 
-    n = jp.shape[0]
     hand_bits = binarize_hands(hj, hand_thresholds).astype(np.float32)  # (n, 2)
     jp32 = jp.astype(np.float32, copy=False)
-    g1_action = np.concatenate([jp32, hand_bits], axis=-1).astype(np.float32)  # (n, 31)
+
+    g1_action = build_g1_action_23(jp32, hand_bits, op, oq, fps=target_fps)
     atomic_save_npy(g1_action, g1_action_path)
 
+    n = jp32.shape[0]
     jv = np.zeros_like(jp32)
     if n > 1:
         jv[1:] = (jp32[1:] - jp32[:-1]) * float(target_fps)
@@ -153,11 +159,12 @@ def worker_main(
             return
         ep_idx, parquet_path, need_sonic = item
         try:
-            jp, oq, ig, hj = load_episode_arrays(parquet_path)
+            jp, op, oq, ig, hj = load_episode_arrays(parquet_path)
             n_src = jp.shape[0]
             n_tgt = max(1, int(round(n_src * target_fps / source_fps)))
             if n_tgt != n_src:
                 jp = _resample_linear(jp, n_src, n_tgt)
+                op = _resample_linear(op, n_src, n_tgt)
                 oq = _resample_quat_wxyz(oq, n_src, n_tgt)
                 ig = _resample_linear(ig, n_src, n_tgt)
                 hj = _resample_linear(hj, n_src, n_tgt)
@@ -176,7 +183,7 @@ def worker_main(
             g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{ep_idx:06d}.npy")
             if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
                 _dump_g1_action_and_proprio(
-                    jp, oq, hj, hand_thresholds, target_fps,
+                    jp, op, oq, hj, hand_thresholds, target_fps,
                     g1_action_path, g1_proprio_path,
                 )
             result_q.put(("ok", ep_idx, token_len))

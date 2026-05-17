@@ -149,14 +149,14 @@ class HEEpisodeSource:
         return np.asarray(arr[idx], dtype=np.float32)  # copy out of mmap
 
     def g1_action_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
-        """Return the cached 31-D training-time G1 action at the frame closest
+        """Return the cached 23-D training-time G1 action at the frame closest
         to ``t_seconds`` (50 Hz timeline).
 
-        Layout matches what the policy was trained to predict and what the
-        env's PD loop consumes: ``[jp(29 MuJoCo-order), hand_bits(2)]``. Used
-        by the sim-validation plot to overlay the dataset's ground-truth
-        action against the model's commanded action and the sim's actual
-        qpos, so the model's fit quality is visible at a glance.
+        Layout matches what the Kappa G1 head was trained to predict:
+        ``[arms(14), hand_bits(2), loco_cmd(3), base_height(1), rpy_cmd(3)]``.
+        Used by sim-validation plots to overlay the dataset's ground-truth
+        action against the model's commanded action so fit quality is visible
+        at a glance.
         """
         ep = int(episode_index)
         arr = self._g1_action_mmap.get(ep)

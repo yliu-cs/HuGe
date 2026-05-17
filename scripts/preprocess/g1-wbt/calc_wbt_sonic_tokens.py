@@ -50,6 +50,7 @@ from _subsets import (  # noqa: E402
 # upsampling), and so the dataset-side path manipulation hack is gone.
 from src.data.preprocess import (  # noqa: E402
     atomic_save_npy,
+    build_g1_action_23,
     resample_linear as _resample_linear,
     resample_quat_wxyz as _resample_quat_wxyz,
 )
@@ -70,19 +71,21 @@ def _encode_one(
     """Resample to the SONIC timeline, derive open/close bits straight from the
     dataset's documented hand_state range, and (optionally) run the SONIC encoder.
 
-    Returns ``(tokens_or_None, jp, oq, hand_bits, n_tgt)``. Caller uses ``jp``,
-    ``oq``, ``hand_bits`` to dump the 31-D G1 actions and 64-D proprio without
-    needing to redo resampling/binarization.
+    Returns ``(tokens_or_None, jp, op, oq, hand_bits, n_tgt)``. Caller uses
+    ``jp``, ``op``, ``oq``, ``hand_bits`` to dump the 23-D G1 actions and 64-D
+    proprio without needing to redo resampling/binarization.
     """
     import numpy as np
 
     jp = rows["joint_pos"]
+    op = rows["odom_pos"]
     oq = rows["odom_quat"]
     hs = rows["hand_state"]
     n_src = jp.shape[0]
     n_tgt = max(1, int(round(n_src * target_fps / source_fps)))
     if n_tgt != n_src:
         jp = _resample_linear(jp, n_src, n_tgt)
+        op = _resample_linear(op, n_src, n_tgt)
         oq = _resample_quat_wxyz(oq, n_src, n_tgt)
         hs = _resample_linear(hs, n_src, n_tgt)
 
@@ -93,25 +96,32 @@ def _encode_one(
         tokens = encoder.encode_episode_with_bits(
             jp, oq, imu_gyro, hand_bits, fps=target_fps,
         )
-    return tokens, jp, oq, hand_bits, n_tgt
+    return tokens, jp, op, oq, hand_bits, n_tgt
 
 
 def _dump_g1_action_and_proprio(
     jp: "np.ndarray",
+    op: "np.ndarray",
     oq: "np.ndarray",
     hand_bits: "np.ndarray",
     target_fps: float,
     g1_action_path: str,
     g1_proprio_path: str,
 ) -> None:
-    """Dump 31-D G1 actions (jp + hand_bits) and 64-D proprio
-    (jp + hand_bits + jv + odom_quat_xyzw)."""
+    """Dump 23-D G1 actions (arms + hand_bits + loco_cmd) and 64-D proprio
+    (full-body jp + hand_bits + jv + odom_quat_xyzw).
+
+    See ``src.data.preprocess.build_g1_action_23`` for the 23-D layout. Legs+
+    waist are dropped from the action target (WBC drives them) but remain in
+    the 64-D proprio, so the model still sees full body state as observation.
+    """
     import numpy as np
     from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw
 
     jp32 = jp.astype(np.float32, copy=False)
     bits = hand_bits.astype(np.float32, copy=False)
-    g1_action = np.concatenate([jp32, bits], axis=-1).astype(np.float32)
+
+    g1_action = build_g1_action_23(jp32, bits, op, oq, fps=target_fps)
     atomic_save_npy(g1_action, g1_action_path)
 
     n = jp32.shape[0]
@@ -167,7 +177,7 @@ def worker_main(
         try:
             sub = subsets_by_name[subset_name]
             rows = load_episode_rows(data_root, sub, data_chunk, data_file, episode_index)
-            tokens, jp, oq, hand_bits, n_tgt = _encode_one(
+            tokens, jp, op, oq, hand_bits, n_tgt = _encode_one(
                 encoder, rows, hand_type, source_fps, target_fps, need_sonic,
             )
             if need_sonic:
@@ -183,7 +193,7 @@ def worker_main(
             g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{episode_index:06d}.npy")
             if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
                 _dump_g1_action_and_proprio(
-                    jp, oq, hand_bits, target_fps,
+                    jp, op, oq, hand_bits, target_fps,
                     g1_action_path, g1_proprio_path,
                 )
             result_q.put(("ok", subset_name, episode_index, int(n_tgt)))

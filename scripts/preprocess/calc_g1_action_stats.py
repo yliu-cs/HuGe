@@ -1,4 +1,4 @@
-"""Compute per-dim min/max + q01/q99 stats for the 31-D G1 action target.
+"""Compute per-dim min/max + q01/q99 stats for the 23-D G1 action target.
 
 Reads ``g1_actions/episode_*.npy`` from both Humanoid-Everyday and G1-WBT
 caches (already produced by ``calc_sonic_tokens.py`` / ``calc_wbt_sonic_tokens.py``)
@@ -8,11 +8,23 @@ and dumps a single shared stats JSON consumed by ``WBTDataset`` / ``HEDataset``
 Schema follows Psi0's ``ActionStateTransform`` with two overlapping bound
 families so the dataset can pick at load time:
 
-  {"action": {"min": [...31], "max": [...31], "q01": [...31], "q99": [...31]}}
+  {"action": {"min": [...23], "max": [...23], "q01": [...23], "q99": [...23]}}
 
-Hand-bit columns (idx 29, 30) are 0/1; their min == 0 / max == 1 stays well
-outside the ``ill_mask`` threshold so the normalizer maps them straight to
-``2*x - 1 ∈ {-1, +1}`` without surprises.
+23-D layout (see ``src.data.preprocess.build_g1_action_23``):
+  [0:14]  arms                     (rad)
+  [14:16] hand_bits                ∈ {0, 1}
+  [16:19] navigate_cmd(vx, vy, ωz) clipped to (±1, ±1, ±1.5)
+  [19:20] base_height              (m, absolute pelvis z)
+  [20:23] rpy_cmd(roll, pitch, 0)  (rad)
+
+Hand-bit columns (idx 14, 15) stay in {0, 1}; their min == 0 / max == 1
+keeps them outside the ``ill_mask`` threshold so the normalizer maps them
+straight to ``2*x - 1 ∈ {-1, +1}``. The yaw column (idx 22) is a constant
+zero today — the dataset's ``_load_normalize_bounds`` ill-mask path collapses
+constant cols safely (subtract-lo path, no division by zero).
+
+Posttrain uses ``normalize_mode="bounds_q99"`` so use the q01/q99 columns
+for the loco_cmd channels rather than min/max (odometry long-tail).
 """
 from __future__ import annotations
 
@@ -26,7 +38,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-G1_ACTION_DIM = 31
+G1_ACTION_DIM = 23
 
 
 def _iter_action_files(root: str) -> List[str]:

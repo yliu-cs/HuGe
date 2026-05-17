@@ -31,6 +31,9 @@ from src.data.transform import (
 # Default stats paths sit next to the WBT cache (post-train uses HE+WBT
 # combined stats; WBT is typically the larger of the two so the meta dir
 # already exists there).
+#
+# Stats describe the 23-D action schema (arms + hand_bits + loco_cmd); the
+# old 31-D file was deleted alongside the cache regen.
 _DEFAULT_ACTION_STATS = "resource/dataset/G1_WBT-cache/meta/g1_action_stats.json"
 _DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
 
@@ -46,6 +49,10 @@ class PostTrainHEWBTDataConfig(HEWBTMixDataConfig):
     transform: PostTrainHEWBTDataTransform = Field(
         default_factory=PostTrainHEWBTDataTransform,
     )
+    # ``bounds_q99`` clips the long-tail odometry-derived loco_cmd channels
+    # (post-train action dims 16:23) at the 1/99 percentiles before mapping
+    # to [-1, 1]; plain min/max would let rare ±2 m/s spikes squeeze the
+    # walking distribution into a tiny fraction of the normalized range.
     he: HEDataConfig = Field(
         default_factory=lambda: HEDataConfig(
             robot_type="g1",
@@ -53,6 +60,7 @@ class PostTrainHEWBTDataConfig(HEWBTMixDataConfig):
             emit_proprio=True,
             g1_action_stats_path=_DEFAULT_ACTION_STATS,
             g1_proprio_stats_path=_DEFAULT_PROPRIO_STATS,
+            normalize_mode="bounds_q99",
         )
     )
     wbt: WBTDataConfig = Field(
@@ -61,11 +69,17 @@ class PostTrainHEWBTDataConfig(HEWBTMixDataConfig):
             emit_proprio=True,
             g1_action_stats_path=_DEFAULT_ACTION_STATS,
             g1_proprio_stats_path=_DEFAULT_PROPRIO_STATS,
+            normalize_mode="bounds_q99",
         )
     )
 
 
 class PostTrainHEWBTLaunchConfig(LaunchConfig):
+    # ``g1_dim=23`` comes from ``KappaModelConfig`` default (WBC-coupled
+    # deployment target). ``action_embedder_g1`` / ``velocity_head_g1`` are
+    # randomly initialized; ``init_g1_from_sonic=True`` still copies the
+    # per-layer attention/MLP from SONIC since those operate on hidden_size
+    # and don't depend on g1_dim.
     model: KappaModelConfig = Field(
         default_factory=lambda: KappaModelConfig(
             use_g1_expert=True,

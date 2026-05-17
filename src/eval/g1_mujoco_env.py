@@ -341,6 +341,14 @@ class G1MujocoEnv:
         self._target_qpos = DEFAULT_QPOS.copy()
         self._last_hand_bits = np.zeros(2, dtype=np.float32)
 
+        # Baseline for the policy-facing finite-diff jv (matches training's
+        # 50 Hz ``(jp[t]-jp[t-1])*fps`` recipe). The closed-loop sim proprio
+        # assembler calls ``latch_proprio_baseline`` once per outer tick so
+        # ``proprio_64_with_jv`` reports rad/s in the same units as training,
+        # independent of the inner MuJoCo sim_dt or any data.qvel artifacts.
+        self._jp_baseline: Optional[np.ndarray] = None
+        self._jp_baseline_t: Optional[float] = None
+
         # WBC head state. Off by default; switched on via ``enable_wbc_mode``,
         # which retunes sim_dt to the WBC training resolution (0.005 s) and
         # exposes ``step_with_wbc``. Other heads (g1_expert, sonic, gt_*) are
@@ -355,11 +363,20 @@ class G1MujocoEnv:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def reset(self, qpos_init: Optional[np.ndarray] = None) -> None:
+    def reset(
+        self,
+        qpos_init: Optional[np.ndarray] = None,
+        init_hand_bits: Optional[np.ndarray] = None,
+    ) -> None:
         """Reset the simulator to a default standing pose. Auto-computes the
         spawn height so the lowest foot geom rests on the floor (the bent-knee
         default pose puts the feet ~5cm above the MJCF nominal pelvis height,
         causing free-fall otherwise), then settles for ~0.5s with PD active.
+
+        ``init_hand_bits`` seeds ``_last_hand_bits`` (the 2-D hand_bits mirror
+        consumed by ``proprio_64_with_jv``) so the first policy-facing proprio
+        vector lands in-distribution. Pass the dataset's frame-0 GT bits when
+        running closed-loop sim proprio; leave None for the legacy zeros init.
         """
         mujoco.mj_resetData(self.model, self.data)
         q = qpos_init if qpos_init is not None else DEFAULT_QPOS
@@ -404,7 +421,12 @@ class G1MujocoEnv:
         ].copy()
 
         self._target_qpos = q.copy().astype(np.float64)
-        self._last_hand_bits = np.zeros(2, dtype=np.float32)
+        if init_hand_bits is not None:
+            self._last_hand_bits = (
+                np.asarray(init_hand_bits, dtype=np.float32)[:2].copy()
+            )
+        else:
+            self._last_hand_bits = np.zeros(2, dtype=np.float32)
 
         # Settle: hold the default pose for ~0.5s so passive contacts converge
         # before the rollout begins.
@@ -412,6 +434,13 @@ class G1MujocoEnv:
         for _ in range(n_settle):
             self._apply_pd_torque(self._target_qpos)
             self._step_physics_once()
+
+        # Latch the post-settle jp as the baseline for the next finite-diff
+        # jv computation. Without this, the first ``proprio_64_with_jv`` after
+        # reset would have to invent a dt and would report a degenerate zero
+        # jv (or worse, a junk value if t_prev is None).
+        self._jp_baseline = self.joint_pos().copy()
+        self._jp_baseline_t = float(self.data.time)
 
     def step(self, action_31: np.ndarray) -> StepStats:
         """Advance physics one control-step under PD position tracking.
@@ -624,6 +653,10 @@ class G1MujocoEnv:
         jv[29] + odom_quat_xyzw[4]) used by the training data pipeline.
 
         ``hand_bits`` defaults to the last commanded bits.
+
+        Note: jv here is ``data.qvel`` (continuous-time sim velocity). For
+        closed-loop policy feed prefer ``proprio_64_with_jv`` so the jv units
+        match the training cache's ``(jp[t]-jp[t-1])*fps`` finite-diff.
         """
         bits = self._last_hand_bits if hand_bits is None else np.asarray(hand_bits, np.float32)
         return np.concatenate([
@@ -631,6 +664,49 @@ class G1MujocoEnv:
             bits.astype(np.float32),
             self.joint_vel().astype(np.float32),
             self.root_quat_xyzw().astype(np.float32),
+        ])
+
+    def latch_proprio_baseline(self) -> None:
+        """Snapshot the current jp + sim time for the next finite-diff jv.
+
+        Called by ``SimProprioAssembler`` after every outer control tick (and
+        during WBC warmup, so the first post-warmup inference's jv has the
+        right ``t_prev``). Keeping the baseline on the env means callers don't
+        have to track jp between rollout fns.
+        """
+        self._jp_baseline = self.joint_pos().copy()
+        self._jp_baseline_t = float(self.data.time)
+
+    def proprio_64_with_jv(
+        self,
+        jv_29: np.ndarray,
+        quat_xyzw: np.ndarray,
+        hand_bits: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Same 64-D layout as ``proprio_64`` but with explicit ``jv`` and
+        ``quat_xyzw`` injection.
+
+        Used by the closed-loop sim proprio path so the assembler can supply
+        finite-diff jv (matching the training cache's ``(jp[t]-jp[t-1])*fps``
+        units) and a frame-aligned quat (sim spawn → dataset frame-0 system),
+        without this method having to know about the dataset.
+        """
+        jv = np.asarray(jv_29, dtype=np.float32)
+        q = np.asarray(quat_xyzw, dtype=np.float32)
+        if jv.shape != (29,):
+            raise ValueError(f"jv_29 must be (29,), got {jv.shape}")
+        if q.shape != (4,):
+            raise ValueError(f"quat_xyzw must be (4,), got {q.shape}")
+        bits = (
+            self._last_hand_bits
+            if hand_bits is None
+            else np.asarray(hand_bits, np.float32)
+        )
+        return np.concatenate([
+            self.joint_pos().astype(np.float32),
+            bits.astype(np.float32),
+            jv,
+            q,
         ])
 
     def render(self, camera: str = "track") -> np.ndarray:

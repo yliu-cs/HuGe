@@ -1,8 +1,6 @@
 # $\kappa_{0}$: A Foundation Vision-Language-Action Model for General Humanoid Robot Loco-Manipulation Control
 
-## TODO
-
-`claude --resume 6d23b57c-4410-4240-87ff-dc11ea5d0721`
+claude --resume 0e4c450b-3c00-471f-b451-7c00b18ca485
 
 ## 🏠 Installation
 
@@ -47,6 +45,8 @@ tmux new -s posttrain_he_wbt -d "script -q -c './scripts/train/posttrain_kappa.s
 tmux new -s finetune_prop -d "script -q -c './scripts/train/finetune_kappa.sh' finetune_prop.log"
 
 # tmux new -s train_kappa -d "script -q -c './scripts/train/train_kappa.sh' train_kappa.log"
+
+tmux new -s train_kappa -d "script -q -c './scripts/train/train_kappa.sh --from posttrain --pretrained-weights .runs/kappa/exp.kappa.b1024.gpus8.2605100801' train_kappa_resume.log"
 ```
 
 ## 🎯 Evaluation

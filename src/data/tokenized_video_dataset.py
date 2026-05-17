@@ -136,7 +136,11 @@ class TokenizedVideoDataset(Dataset):
     # G1 / proprio configuration. Defaults correspond to "no post-train" —
     # ``__getitem__`` only emits SONIC tokens unless the post-train caller
     # turns these on via the constructor / config.
-    g1_action_dim: int = 31
+    #
+    # G1 action target is 23-D (arms 14 + hand_bits 2 + loco_cmd 7); legs+waist
+    # are not predicted — WBC drives them at deployment. See
+    # ``src.data.preprocess.build_g1_action_23`` for the channel layout.
+    g1_action_dim: int = 23
     proprio_dim: int = 64
     _g1_action_bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     _proprio_bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None

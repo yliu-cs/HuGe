@@ -205,6 +205,7 @@ def load_episode_rows(
 
     Returns dict with:
         joint_pos: (n, 29) float64 — robot_q_current[:, 7:36], MuJoCo ordering.
+        odom_pos:  (n, 3)  float32 — robot_q_current[:, 0:3], pelvis xyz.
         odom_quat: (n, 4)  float32 — robot_q_current[:, 3:7], WXYZ.
         hand_state: (n, D) float32 — raw, dims depend on ``subset.hand_type``.
 
@@ -233,5 +234,11 @@ def load_episode_rows(
         raise ValueError(f"robot_q_current expected 36D, got {rq.shape[1]} in {parquet_path}")
 
     joint_pos = rq[:, 7:36].astype(np.float64, copy=False)
+    odom_pos = rq[:, 0:3].astype(np.float32, copy=False)
     odom_quat = rq[:, 3:7].astype(np.float32, copy=False)
-    return {"joint_pos": joint_pos, "odom_quat": odom_quat, "hand_state": hs}
+    return {
+        "joint_pos": joint_pos,
+        "odom_pos": odom_pos,
+        "odom_quat": odom_quat,
+        "hand_state": hs,
+    }

@@ -42,6 +42,7 @@ class FineTuneHEDataConfig(HEDataConfig):
     emit_proprio: bool = True
     g1_action_stats_path: str = _DEFAULT_ACTION_STATS
     g1_proprio_stats_path: str = _DEFAULT_PROPRIO_STATS
+    normalize_mode: str = "bounds_q99"
     episode_indices: list[int] = Field(default_factory=lambda: [7831])
 
 
