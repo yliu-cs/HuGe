@@ -4,9 +4,9 @@ All three current sources (HE, EgoDex, G1-WBT) share the same shape:
 
 * sampling space is 50 Hz SONIC tokens, one row per dataset index;
 * each token row maps to a video frame in a 30 fps mp4;
-* a sample returns ``{image, text, sonic_tokens, sonic_mask}`` plus optional
-  post-train extras (``g1_actions``, ``g1_mask``, ``proprio``) when the
-  subclass exposes ``_g1_actions(ep)`` / ``_proprio(ep)`` hooks.
+* a sample returns ``{image, text, sonic_tokens, sonic_mask}`` plus an
+  optional 64-D ``proprio`` vector when the subclass exposes a ``_proprio(ep)``
+  hook.
 
 The differences are surface-level — where the mp4 lives on disk, whether
 many episodes are packed into one mp4 (LeRobot v3) or one mp4 per episode,
@@ -27,14 +27,13 @@ per episode) plus any source-specific arrays the hooks need, then calls
 * ``_build_chunk(ep, t, tokens) -> (chunk, sonic_mask)`` — defaults to
   clamp-tail repeat with a 1-D time mask; EgoDex overrides for 64→66
   padding + 2-D per-dim mask.
-* ``_g1_actions(ep) -> np.ndarray | None`` (optional) — 31-D G1 action array.
 * ``_proprio(ep) -> np.ndarray | None`` (optional) — 64-D proprio array.
 
-Post-train normalization
-------------------------
-When ``g1_action_stats`` / ``g1_proprio_stats`` are passed to the constructor
-the dataset normalizes both streams to ``[-1, 1]`` (ActionStateTransform
-style: ``ill_mask`` collapses degenerate dims and clip after rescale).
+Proprio normalization
+---------------------
+When ``proprio_stats`` is passed to the constructor the dataset normalizes
+the stream to ``[-1, 1]`` (ActionStateTransform style: ``ill_mask`` collapses
+degenerate dims and clip after rescale).
 """
 from __future__ import annotations
 
@@ -80,11 +79,10 @@ def _load_normalize_bounds(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Pre-compute (lo, hi, ill_mask) from a stats dict.
 
-    ``stats`` is the parsed JSON written by ``calc_g1_action_stats.py`` /
-    ``calc_g1_proprio_stats.py``. ``mode`` selects between ``"bounds"``
-    (uses ``min``/``max``) and ``"bounds_q99"`` (uses ``q01``/``q99``).
-    Returns ``None`` if ``stats`` is missing — datasets fall back to raw
-    pass-through.
+    ``stats`` is the parsed JSON written by ``calc_g1_proprio_stats.py``.
+    ``mode`` selects between ``"bounds"`` (uses ``min``/``max``) and
+    ``"bounds_q99"`` (uses ``q01``/``q99``). Returns ``None`` if ``stats`` is
+    missing — datasets fall back to raw pass-through.
     """
     if stats is None:
         return None
@@ -133,16 +131,10 @@ class TokenizedVideoDataset(Dataset):
     # Populated by subclass __init__ before calling _finalize_index().
     _ep_lengths: np.ndarray  # int64 [N_ep], token-row count per episode
 
-    # G1 / proprio configuration. Defaults correspond to "no post-train" —
-    # ``__getitem__`` only emits SONIC tokens unless the post-train caller
-    # turns these on via the constructor / config.
-    #
-    # G1 action target is 23-D (arms 14 + hand_bits 2 + loco_cmd 7); legs+waist
-    # are not predicted — WBC drives them at deployment. See
-    # ``src.data.preprocess.build_g1_action_23`` for the channel layout.
-    g1_action_dim: int = 23
+    # Proprio configuration. Defaults correspond to "proprio off" —
+    # ``__getitem__`` only emits SONIC tokens unless the subclass turns it on
+    # via the constructor / config.
     proprio_dim: int = 64
-    _g1_action_bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     _proprio_bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
     def __init__(self, action_chunk_size: int) -> None:
@@ -209,29 +201,9 @@ class TokenizedVideoDataset(Dataset):
         )
         return chunk, mask
 
-    def _g1_actions(self, ep: int) -> np.ndarray | None:
-        """Optional hook for the 31-D G1 action target. Default disabled."""
-        return None
-
     def _proprio(self, ep: int) -> np.ndarray | None:
         """Optional hook for the 64-D proprio vector. Default disabled."""
         return None
-
-    def _build_g1_chunk(
-        self, ep: int, t: int, g1_actions: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Mirrors ``_build_chunk`` but for the G1 stream and applies the
-        configured ``[-1, 1]`` normalization. Returns ``(chunk, time_mask)``.
-        """
-        n = int(self._ep_lengths[ep])
-        chunk_indices = [min(t + k, n - 1) for k in range(self.action_chunk_size)]
-        raw = g1_actions[chunk_indices].astype(np.float32, copy=False)
-        chunk = _normalize_to_pm1(raw, self._g1_action_bounds)
-        mask = np.array(
-            [1.0 if t + k < n else 0.0 for k in range(self.action_chunk_size)],
-            dtype=np.float32,
-        )
-        return chunk, mask
 
     def _build_proprio_at(self, ep: int, t: int, proprio: np.ndarray) -> np.ndarray:
         """Single-row proprio at ``t`` (clamped to last frame), normalized."""
@@ -258,15 +230,8 @@ class TokenizedVideoDataset(Dataset):
             "sonic_mask": torch.from_numpy(np.ascontiguousarray(sonic_mask)),
         }
 
-        # Post-train extras: G1 action chunk + (optionally) per-tick proprio.
-        # Subclasses opt in by returning non-``None`` from the hooks; the
-        # collator guards on key presence so these stay backward-compatible.
-        g1_arr = self._g1_actions(ep)
-        if g1_arr is not None:
-            g1_chunk, g1_mask = self._build_g1_chunk(ep, t, g1_arr)
-            out["g1_actions"] = torch.from_numpy(np.ascontiguousarray(g1_chunk))
-            out["g1_mask"] = torch.from_numpy(np.ascontiguousarray(g1_mask))
-
+        # Optional per-tick proprio. Subclasses opt in by returning non-``None``
+        # from the hook; the collator guards on key presence.
         proprio_arr = self._proprio(ep)
         if proprio_arr is not None:
             proprio_now = self._build_proprio_at(ep, t, proprio_arr)

@@ -1,15 +1,19 @@
-"""Real-Time Chunking controller for the Kappa post-train model.
+"""Real-Time Chunking controller for the Kappa model (SONIC token output).
 
 Adapted from Psi0's ``RealTimeChunkController``. Two threads share state:
 
 * **Control thread** (fixed-rate, ``CTRL_HZ`` Hz): each tick reads the next
-  step out of ``A_cur`` and returns it; never blocks on the model.
+  step out of ``A_cur`` (a chunk of SONIC tokens) and returns it; never blocks
+  on the model.
 * **Inference thread** (asynchronous): once at least ``s_min`` ticks have
   been consumed, runs a full RTC denoise pass to produce a new chunk
   (``A_new``). The actual delay ``d`` is estimated from past iterations as
   ``max(Q)``; the new chunk's first ``d`` positions are pinned to the
   carried-over tail of the old chunk via training-time RTC prefix
   substitution.
+
+The chunk emitted by ``step`` is a single SONIC token (shape ``(sonic_dim,)``)
+— downstream consumers run the SONIC ONNX decoder to recover joint targets.
 
 The controller is model-agnostic *except* for the inference call signature.
 We wrap a ``MoTKappaModel`` (or any object with ``encode_latent`` /
@@ -18,7 +22,6 @@ We wrap a ``MoTKappaModel`` (or any object with ``encode_latent`` /
 from __future__ import annotations
 
 import threading
-import time
 from collections import deque
 from typing import Any, Optional
 
@@ -27,22 +30,19 @@ import torch
 
 
 class RealTimeChunkController:
-    """Async chunk controller for the Kappa MoT G1 expert.
+    """Async chunk controller emitting SONIC token chunks.
 
     Parameters
     ----------
     model : MoTKappaModel-like
         Must expose ``encode_latent`` returning a cache dict and
-        ``denoise_step_rtc(cache, ...)`` returning ``(v_sonic, v_g1)``.
+        ``denoise_step_rtc(cache, ...)`` returning the SONIC velocity.
     processor : transformers AutoProcessor
         Used to tokenize the text + image prompt for ``encode_latent``.
     scheduler : diffusers FlowMatchEulerDiscreteScheduler-like
         Provides ``timesteps`` and a ``step(model_pred, t, sample)`` API.
-    cfg : object with the post-train flags (use_proprio, action_chunk_size,
-        num_inference_steps, ...).
-    g1_action_stats : dict | None
-        Loaded from ``g1_action_stats.json``; used to denormalize predicted
-        chunks back into the raw 31-D joint+hand space before publishing.
+    cfg : object with the SONIC inference flags (use_proprio, sonic_dim,
+        action_chunk_size, num_inference_steps, ...).
     """
 
     def __init__(
@@ -51,7 +51,6 @@ class RealTimeChunkController:
         processor,
         scheduler,
         cfg,
-        g1_action_stats: Optional[dict] = None,
         ctrl_hz: float = 30.0,
         s_min: int = 15,
         delay_buffer_size: int = 6,
@@ -62,32 +61,19 @@ class RealTimeChunkController:
         self.scheduler = scheduler
         self.cfg = cfg
         self.H = int(cfg.action_chunk_size)
-        self.G1_DIM = int(getattr(cfg, "g1_dim", 31))
+        self.SONIC_DIM = int(getattr(cfg, "sonic_dim", 66))
         self.PROPRIO_DIM = int(getattr(cfg, "proprio_dim", 64))
         self.use_proprio = bool(getattr(cfg, "use_proprio", False))
-        self.use_rtc_on_sonic = bool(getattr(cfg, "rtc_on_sonic", True))
         self.num_inference_steps = int(getattr(cfg, "num_inference_steps", 8))
 
         self.ctrl_period = 1.0 / float(ctrl_hz)
         self.s_min = int(s_min)
         self.Q: deque[int] = deque([int(d_init)] * delay_buffer_size, maxlen=delay_buffer_size)
 
-        # Action normalization (for de-normalizing model output).
-        self.action_min = None
-        self.action_max = None
-        if g1_action_stats is not None and "action" in g1_action_stats:
-            section = g1_action_stats["action"]
-            mn = np.asarray(section["min"], dtype=np.float32)
-            mx = np.asarray(section["max"], dtype=np.float32)
-            ill = np.abs(mx - mn) < 1e-4 * (np.abs(mx) + np.abs(mn) + 1e-8)
-            mx = np.where(ill, mn + 1.0, mx)
-            self.action_min = mn
-            self.action_max = mx
-
         # Shared state.
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
-        self.A_cur: np.ndarray = np.zeros((self.H, self.G1_DIM), dtype=np.float32)
+        self.A_cur: np.ndarray = np.zeros((self.H, self.SONIC_DIM), dtype=np.float32)
         self.t: int = 0
         self._latest_obs: dict[str, Any] | None = None
         self._stop = threading.Event()
@@ -115,7 +101,7 @@ class RealTimeChunkController:
         # init costs before the live loop sees them.
         prev = self._make_prev_actions(self.A_cur, s=self.s_min)
         for _ in range(2):
-            _ = self._predict_chunk_rtc(obs, prev_g1=prev, delay=int(max(self.Q)))
+            _ = self._predict_chunk_rtc(obs, prev_sonic=prev, delay=int(max(self.Q)))
 
         self._stop.clear()
         self._infer_th = threading.Thread(target=self._inference_loop, daemon=True)
@@ -133,7 +119,7 @@ class RealTimeChunkController:
     # ------------------------------------------------------------------
 
     def step(self, obs: dict[str, Any]) -> np.ndarray:
-        """One control tick. Returns a single 31-D action (raw, denormalized).
+        """One control tick. Returns a single SONIC token vector.
 
         Always non-blocking on inference: even if the inference thread is
         still running, ``A_cur`` is consumed step-by-step; the loop's
@@ -143,15 +129,9 @@ class RealTimeChunkController:
             self._latest_obs = obs
             self.t = min(self.t + 1, self.H)
             idx = self.t - 1
-            action_norm = self.A_cur[idx].copy()
+            sonic_token = self.A_cur[idx].copy()
             self._cond.notify_all()
-        if self.action_min is not None and self.action_max is not None:
-            return self._denormalize(action_norm)
-        return action_norm
-
-    def _denormalize(self, action_norm: np.ndarray) -> np.ndarray:
-        rng = self.action_max - self.action_min
-        return ((action_norm + 1.0) / 2.0 * rng + self.action_min).astype(np.float32)
+        return sonic_token
 
     # ------------------------------------------------------------------
     # Inference thread
@@ -171,7 +151,7 @@ class RealTimeChunkController:
             d = int(max(self.Q))
             prev = self._make_prev_actions(A_cur_snapshot, s=s)
             try:
-                A_new = self._predict_chunk_rtc(obs, prev_g1=prev, delay=d)
+                A_new = self._predict_chunk_rtc(obs, prev_sonic=prev, delay=d)
             except Exception as e:  # noqa: BLE001
                 print(f"[RTC] inference error: {e!r}; reusing current chunk")
                 continue
@@ -245,95 +225,83 @@ class RealTimeChunkController:
         """Cold-start chunk via plain flow matching (no RTC prefix)."""
         prompt = self._build_inputs(obs)
         T_p = 1 if self.use_proprio else 0
+        proprio = self._proprio_tensor(obs, B=1, dtype=self.dtype, device=self.device)
         cache = self.model.encode_latent(
             input_ids=prompt["input_ids"],
             attention_mask=prompt["attention_mask"],
             pixel_values=prompt["pixel_values"],
             image_grid_thw=prompt["image_grid_thw"],
             T_action=self.cfg.action_chunk_size,
-            T_g1=self.cfg.action_chunk_size,
             T_proprio=T_p,
+            proprio=proprio,
         )
         B = cache["B"]
-        T_g = self.cfg.action_chunk_size
+        T = self.cfg.action_chunk_size
         device = self.device
-        sonic = torch.randn(B, T_g, self.cfg.sonic_dim, device=device, dtype=cache["dtype"])
-        g1 = torch.randn(B, T_g, self.G1_DIM, device=device, dtype=cache["dtype"])
-        proprio = self._proprio_tensor(obs, B, cache["dtype"], device)
+        sonic = torch.randn(B, T, self.SONIC_DIM, device=device, dtype=cache["dtype"])
 
         self.scheduler.set_timesteps(self.num_inference_steps, device=device)
         for timestep in self.scheduler.timesteps:
             t_scalar = (timestep / self.scheduler.config.num_train_timesteps).to(cache["dtype"])
             t_sonic = t_scalar.expand(B)
-            t_g1 = t_scalar.expand(B)
-            v_sonic, v_g1 = self.model.denoise_step_rtc(
+            v_sonic = self.model.denoise_step_rtc(
                 cache=cache,
                 noisy_sonic_tokens=sonic,
                 timesteps_sonic=t_sonic,
-                noisy_g1_tokens=g1,
-                timesteps_g1=t_g1,
-                proprio=proprio,
             )
             sonic = self.scheduler.step(v_sonic, timestep, sonic).prev_sample
-            g1 = self.scheduler.step(v_g1, timestep, g1).prev_sample
-        return g1[0].float().cpu().numpy()
+        return sonic[0].float().cpu().numpy()
 
     @torch.no_grad()
     def _predict_chunk_rtc(
-        self, obs: dict[str, Any], prev_g1: np.ndarray, delay: int,
+        self, obs: dict[str, Any], prev_sonic: np.ndarray, delay: int,
     ) -> np.ndarray:
         prompt = self._build_inputs(obs)
         T_p = 1 if self.use_proprio else 0
+        proprio = self._proprio_tensor(obs, B=1, dtype=self.dtype, device=self.device)
         cache = self.model.encode_latent(
             input_ids=prompt["input_ids"],
             attention_mask=prompt["attention_mask"],
             pixel_values=prompt["pixel_values"],
             image_grid_thw=prompt["image_grid_thw"],
             T_action=self.cfg.action_chunk_size,
-            T_g1=self.cfg.action_chunk_size,
             T_proprio=T_p,
+            proprio=proprio,
         )
         B = cache["B"]
-        T_g = self.cfg.action_chunk_size
+        T = self.cfg.action_chunk_size
         device = self.device
         dtype = cache["dtype"]
 
-        sonic = torch.randn(B, T_g, self.cfg.sonic_dim, device=device, dtype=dtype)
-        g1 = torch.randn(B, T_g, self.G1_DIM, device=device, dtype=dtype)
-        proprio = self._proprio_tensor(obs, B, dtype, device)
-        prev_g1_t = torch.from_numpy(prev_g1).to(device=device, dtype=dtype).unsqueeze(0)
+        sonic = torch.randn(B, T, self.SONIC_DIM, device=device, dtype=dtype)
+        prev_sonic_t = torch.from_numpy(prev_sonic).to(device=device, dtype=dtype).unsqueeze(0)
         delay_t = torch.tensor([int(delay)], device=device, dtype=torch.long)
 
         self.scheduler.set_timesteps(self.num_inference_steps, device=device)
-        for i, timestep in enumerate(self.scheduler.timesteps):
+        for timestep in self.scheduler.timesteps:
             t_scalar = (timestep / self.scheduler.config.num_train_timesteps).to(dtype)
             t_sonic = t_scalar.expand(B)
-            t_g1 = t_scalar.expand(B)
             # Hard-overwrite the prefix at the start of every step so
             # ``scheduler.step`` cannot drift it.
-            arange_g = torch.arange(T_g, device=device)
-            prefix_mask = arange_g[None, :] < delay_t[:, None]
-            g1 = torch.where(prefix_mask[..., None], prev_g1_t, g1)
+            arange_t = torch.arange(T, device=device)
+            prefix_mask = arange_t[None, :] < delay_t[:, None]
+            sonic = torch.where(prefix_mask[..., None], prev_sonic_t, sonic)
 
-            v_sonic, v_g1 = self.model.denoise_step_rtc(
+            v_sonic = self.model.denoise_step_rtc(
                 cache=cache,
                 noisy_sonic_tokens=sonic,
                 timesteps_sonic=t_sonic,
-                noisy_g1_tokens=g1,
-                timesteps_g1=t_g1,
-                proprio=proprio,
-                prev_g1=prev_g1_t,
-                delay_g1=delay_t,
+                prev_sonic=prev_sonic_t,
+                delay_sonic=delay_t,
             )
             sonic = self.scheduler.step(v_sonic, timestep, sonic).prev_sample
-            g1 = self.scheduler.step(v_g1, timestep, g1).prev_sample
 
         # Final pin so even diffusers' last-step rounding doesn't move the
-        # prefix off ``prev_g1``.
-        arange_g = torch.arange(T_g, device=device)
-        prefix_mask = arange_g[None, :] < delay_t[:, None]
-        g1 = torch.where(prefix_mask[..., None], prev_g1_t, g1)
-        return g1[0].float().cpu().numpy()
+        # prefix off ``prev_sonic``.
+        arange_t = torch.arange(T, device=device)
+        prefix_mask = arange_t[None, :] < delay_t[:, None]
+        sonic = torch.where(prefix_mask[..., None], prev_sonic_t, sonic)
+        return sonic[0].float().cpu().numpy()
 
     def _proprio_tensor(
         self, obs: dict[str, Any], B: int, dtype, device,

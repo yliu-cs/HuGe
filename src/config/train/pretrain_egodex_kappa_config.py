@@ -3,14 +3,16 @@
 EgoDex is the first stage of pretraining: SONIC tokens are 64-D (no hand-binary
 bits). The dataset right-pads tokens to ``sonic_dim=66`` and emits a per-dim
 ``sonic_mask`` that zeros out the trailing two hand-bit dims, so the loss
-ignores them.
+ignores them. RTC and proprio are off at this stage.
 
-Stage 2 (HE-G1 + G1-WBT mix) launches via ``pretrain_he_wbt_kappa_config``
-with ``--train.pretrained-weights`` pointing at this run's
-``model.safetensors`` (file, ``ckpt_*`` dir, or run dir — latest ckpt
-auto-picked). Optimizer, scheduler, and global_step start fresh; weights
+Stage 2 (HE-G1 + G1-WBT Post-Train) launches via
+``posttrain_he_wbt_kappa_config`` with ``--train.pretrained-weights`` pointing
+at this run's ``model.safetensors`` (file, ``ckpt_*`` dir, or run dir — latest
+ckpt auto-picked). Optimizer, scheduler, and global_step start fresh; weights
 are loaded with ``strict=False`` so the architectures must already match
-(they do: both configs share ``KappaModelConfig`` with ``sonic_dim=66``).
+(they do: both share ``KappaModelConfig`` with ``sonic_dim=66`` — the
+Post-Train just additionally enables ``use_rtc`` / ``use_proprio``, which
+adds new parameters that initialize from scratch).
 """
 from pydantic import Field
 

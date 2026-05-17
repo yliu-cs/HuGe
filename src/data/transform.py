@@ -126,12 +126,10 @@ class HERepackTransform(RepackTransform):
             "sonic_mask": data["sonic_mask"],
             "dataset": self.dataset_name,
         }
-        # Post-train extras pass through unchanged. Only forwarded when the
-        # raw dataset emits them (e.g. when the post-train config enables
-        # ``emit_g1_actions`` / ``emit_proprio`` on HEDataset / WBTDataset).
-        for k in ("g1_actions", "g1_mask", "proprio"):
-            if k in data:
-                out[k] = data[k]
+        # Proprio passes through unchanged when the raw dataset emits it
+        # (HEDataset / WBTDataset with ``emit_proprio=True``).
+        if "proprio" in data:
+            out["proprio"] = data["proprio"]
         return out
 
 
@@ -199,7 +197,6 @@ class KappaModelTransform(ModelTransform):
             "sonic_mask": data["sonic_mask"],
             "dataset_name": data.get("dataset", "unknown"),
         }
-        for k in ("g1_actions", "g1_mask", "proprio"):
-            if k in data:
-                out[k] = data[k]
+        if "proprio" in data:
+            out["proprio"] = data["proprio"]
         return out

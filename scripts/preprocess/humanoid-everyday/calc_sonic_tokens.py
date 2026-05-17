@@ -79,41 +79,27 @@ def load_episode_arrays(parquet_path: str):
 # bit-identical (the SONIC token distribution is sensitive to upsampling).
 from src.data.preprocess import (  # noqa: E402
     atomic_save_npy,
-    build_g1_action_23,
     resample_linear as _resample_linear,
     resample_quat_wxyz as _resample_quat_wxyz,
 )
 
 
-def _dump_g1_action_and_proprio(
+def _dump_proprio(
     jp: "np.ndarray",
-    op: "np.ndarray",
     oq: "np.ndarray",
     hj: "np.ndarray",
     hand_thresholds: tuple[float, float, float, float],
     target_fps: float,
-    g1_action_path: str,
-    g1_proprio_path: str,
+    proprio_path: str,
 ) -> None:
-    """Dump 23-D G1 actions (arms + hand_bits + loco_cmd) and 64-D proprio
+    """Dump the 64-D robot proprio vector
     (full-body jp + hand_bits + jv + odom_quat_xyzw) on the SONIC timeline.
-
-    23-D action layout (see ``build_g1_action_23``):
-        [0:14] arms, [14:16] hand_bits, [16:19] navigate_cmd,
-        [19:20] base_height, [20:23] rpy_cmd(roll, pitch, 0).
-
-    Legs+waist are dropped from the action target — WBC drives them at
-    deployment. They remain in the 64-D proprio so the model sees full body
-    state as observation; that separation matches the deployment surface.
     """
     import numpy as np
     from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw, binarize_hands
 
     hand_bits = binarize_hands(hj, hand_thresholds).astype(np.float32)  # (n, 2)
     jp32 = jp.astype(np.float32, copy=False)
-
-    g1_action = build_g1_action_23(jp32, hand_bits, op, oq, fps=target_fps)
-    atomic_save_npy(g1_action, g1_action_path)
 
     n = jp32.shape[0]
     jv = np.zeros_like(jp32)
@@ -123,7 +109,7 @@ def _dump_g1_action_and_proprio(
     proprio = np.concatenate(
         [jp32, hand_bits, jv, quat_xyzw], axis=-1
     ).astype(np.float32)  # (n, 29 + 2 + 29 + 4) = (n, 64)
-    atomic_save_npy(proprio, g1_proprio_path)
+    atomic_save_npy(proprio, proprio_path)
 
 
 def worker_main(
@@ -132,8 +118,7 @@ def worker_main(
     result_q: mp.Queue,
     encoder_path: str,
     out_dir: str,
-    g1_action_dir: str,
-    g1_proprio_dir: str,
+    proprio_dir: str,
     hand_thresholds: tuple[float, float, float, float],
     source_fps: float,
     target_fps: float,
@@ -179,12 +164,10 @@ def worker_main(
             else:
                 token_len = n_tgt
 
-            g1_action_path = os.path.join(g1_action_dir, f"episode_{ep_idx:06d}.npy")
-            g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{ep_idx:06d}.npy")
-            if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
-                _dump_g1_action_and_proprio(
-                    jp, op, oq, hj, hand_thresholds, target_fps,
-                    g1_action_path, g1_proprio_path,
+            proprio_path = os.path.join(proprio_dir, f"episode_{ep_idx:06d}.npy")
+            if not os.path.exists(proprio_path):
+                _dump_proprio(
+                    jp, oq, hj, hand_thresholds, target_fps, proprio_path,
                 )
             result_q.put(("ok", ep_idx, token_len))
         except Exception:
@@ -275,10 +258,10 @@ def main() -> None:
     encoder_path = os.path.join(args.sonic_model_dir, "model_encoder.onnx")
     out_dir = os.path.join(cache_root, "sonic_tokens")
     os.makedirs(out_dir, exist_ok=True)
-    g1_action_dir = os.path.join(cache_root, "g1_actions")
-    g1_proprio_dir = os.path.join(cache_root, "g1_proprio")
-    os.makedirs(g1_action_dir, exist_ok=True)
-    os.makedirs(g1_proprio_dir, exist_ok=True)
+    # ``g1_proprio/`` references the G1 *robot's* joint state cache; the
+    # directory name is preserved across the G1-expert removal.
+    proprio_dir = os.path.join(cache_root, "g1_proprio")
+    os.makedirs(proprio_dir, exist_ok=True)
 
     if args.gpus is None:
         n_gpus = torch.cuda.device_count()
@@ -308,19 +291,18 @@ def main() -> None:
         )
 
     existing_sonic = {fn for fn in os.listdir(out_dir) if fn.endswith(".npy")}
-    existing_g1_action = {fn for fn in os.listdir(g1_action_dir) if fn.endswith(".npy")}
-    existing_g1_proprio = {fn for fn in os.listdir(g1_proprio_dir) if fn.endswith(".npy")}
+    existing_proprio = {fn for fn in os.listdir(proprio_dir) if fn.endswith(".npy")}
 
-    # An episode is pending if any of {sonic, g1_action, g1_proprio} is missing.
-    # ``need_sonic=False`` lets workers skip the ONNX session for episodes where
-    # only the lightweight g1_action/proprio dumps are missing — those can be
+    # An episode is pending if either of {sonic, proprio} is missing.
+    # ``need_sonic=False`` lets workers skip the ONNX session for episodes
+    # where only the lightweight proprio dump is missing — that can be
     # produced from parquet alone, no GPU needed.
     pending: list[tuple[int, str, bool]] = []
     for idx, path in all_episodes:
         fn = f"episode_{idx:06d}.npy"
         need_sonic = fn not in existing_sonic
-        need_g1 = (fn not in existing_g1_action) or (fn not in existing_g1_proprio)
-        if need_sonic or need_g1:
+        need_proprio = fn not in existing_proprio
+        if need_sonic or need_proprio:
             pending.append((idx, path, need_sonic))
     skipped = len(all_episodes) - len(pending)
     print(
@@ -343,7 +325,7 @@ def main() -> None:
             target=worker_main,
             args=(
                 gpu, work_q, result_q, encoder_path, out_dir,
-                g1_action_dir, g1_proprio_dir, hand_thresholds,
+                proprio_dir, hand_thresholds,
                 source_fps, target_fps,
             ),
             daemon=False,

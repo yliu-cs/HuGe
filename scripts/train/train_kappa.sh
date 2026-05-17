@@ -1,159 +1,169 @@
 #!/usr/bin/env bash
-# Kappa full training pipeline.
-#
-# Runs the four stages sequentially and threads each stage's output run
-# directory into the next stage's --train.pretrained-weights, so the chain
-# pretrain(egodex) -> pretrain(he_wbt) -> posttrain -> finetune
-# starts each stage from the previous stage's last saved checkpoint without
-# any hand-edited paths.
+# Kappa training launcher.
 #
 # Usage:
-#   ./scripts/train/run_kappa_pipeline.sh                                  # full chain
-#   ./scripts/train/run_kappa_pipeline.sh --num_gpus 8                     # forward to all stages
-#   ./scripts/train/run_kappa_pipeline.sh --from posttrain \
-#       --pretrained-weights .runs/kappa/<existing-stage1-2-run>           # resume mid-pipeline
+#   ./scripts/train/train_kappa.sh <config_name> [flags...]
 #
-# Anything not consumed by this script is forwarded verbatim to every
-# sub-stage (e.g. --num_gpus, --no_deepspeed, --master_port, --data.* /
-# --train.* / --model.* config overrides). Per-stage overrides aren't
-# supported here; if you need them, run the stage scripts directly.
+# Where <config_name> is any module under src/config/train/ (without ".py"),
+# e.g.:
 #
-# Discovery details:
-#   - The trainer writes runs to .runs/<train_cfg.name>/<run_name>/ where
-#     train_cfg.name="kappa" for every stage in this project.
-#   - Before each stage we drop a marker file; after the stage we pick the
-#     most recently modified directory under .runs/kappa/ that's newer than
-#     the marker. The trainer's load_pretrained_weights() resolves a run
-#     directory to its latest checkpoints/ckpt_*/, so we hand it the run
-#     directory instead of a specific checkpoint.
-#   - Don't run other Kappa training jobs in parallel during the pipeline,
-#     or the discovery may pick the wrong run.
+#   ./scripts/train/train_kappa.sh pretrain_egodex_kappa_config
+#   ./scripts/train/train_kappa.sh posttrain_he_wbt_kappa_config --num_gpus 4
+#   ./scripts/train/train_kappa.sh finetune_prop_ep_kappa_config \
+#       --train.pretrained-weights .runs/kappa/<posttrain-run>
+#
+# Distributed flags (all optional — autodetected for single-node):
+#   --num_gpus N               # default: nvidia-smi count, 1 if unavailable
+#   --num_nodes N              # default: $PET_NNODES or 1
+#   --node_rank N              # default: $PET_NODE_RANK or 0
+#   --master_addr HOST         # default: $MASTER_ADDR or localhost
+#   --master_port PORT         # default: $MASTER_PORT or 29500
+#   --zero_stage N             # default: 2
+#   --ds_config PATH           # explicit DeepSpeed JSON
+#   --hostfile PATH            # multi-node via deepspeed launcher
+#   --no_deepspeed             # force plain DDP (default on 1 GPU single-node)
+#   --deepspeed                # force DeepSpeed (override single-GPU auto-off)
+#
+# Anything else is forwarded verbatim to scripts/train.py — typically
+# `--train.* / --data.* / --model.*` config overrides.
+#
+# Multi-node submission: cluster sets PET_NNODES / PET_NODE_RANK / MASTER_ADDR
+# / MASTER_PORT per node. Each node runs this script with no extra flags; the
+# IB/NCCL tuning block below auto-applies whenever NUM_NODES > 1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-RUNS_DIR=".runs/kappa"
+PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+DEEPSPEED="${PROJECT_ROOT}/.venv/bin/deepspeed"
+TORCHRUN="${PROJECT_ROOT}/.venv/bin/torchrun"
+TRAIN_SCRIPT="${PROJECT_ROOT}/scripts/train.py"
 
-START_STAGE="egodex"
-SEED_WEIGHTS=""
-FORWARDED=()
+if [[ $# -lt 1 || "$1" == -* ]]; then
+    echo "Error: missing <config_name> as first positional argument" >&2
+    echo "Usage: $0 <config_name> [flags...]" >&2
+    exit 1
+fi
+CONFIG_NAME="$1"; shift
+
+NUM_GPUS=""
+NUM_NODES="${PET_NNODES:-1}"
+NODE_RANK="${PET_NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-localhost}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+ZERO_STAGE=2
+DS_CONFIG=""
+HOSTFILE=""
+NO_DEEPSPEED=""
+EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --from)
-            START_STAGE="$2"; shift 2 ;;
-        --pretrained-weights|--train.pretrained-weights)
-            SEED_WEIGHTS="$2"; shift 2 ;;
-        --train.pretrained-weights=*)
-            SEED_WEIGHTS="${1#*=}"; shift ;;
-        --pretrained-weights=*)
-            SEED_WEIGHTS="${1#*=}"; shift ;;
-        *)
-            FORWARDED+=("$1"); shift ;;
+        --num_gpus)     NUM_GPUS="$2"; shift 2 ;;
+        --num_nodes)    NUM_NODES="$2"; shift 2 ;;
+        --node_rank)    NODE_RANK="$2"; shift 2 ;;
+        --master_addr)  MASTER_ADDR="$2"; shift 2 ;;
+        --master_port)  MASTER_PORT="$2"; shift 2 ;;
+        --zero_stage)   ZERO_STAGE="$2"; shift 2 ;;
+        --ds_config)    DS_CONFIG="$2"; shift 2 ;;
+        --hostfile)     HOSTFILE="$2"; shift 2 ;;
+        --no_deepspeed) NO_DEEPSPEED=true; shift ;;
+        --deepspeed)    NO_DEEPSPEED=false; shift ;;
+        *)              EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
-STAGES=(egodex he_wbt posttrain finetune)
-START_IDX=-1
-for i in "${!STAGES[@]}"; do
-    if [ "${STAGES[$i]}" = "$START_STAGE" ]; then
-        START_IDX=$i
-        break
+# Autodetect GPU count on single-node when not specified.
+if [ -z "$NUM_GPUS" ] && [ "$NUM_NODES" -eq 1 ] && [ -z "$HOSTFILE" ]; then
+    if command -v nvidia-smi &>/dev/null; then
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
     fi
-done
-if [ "$START_IDX" -lt 0 ]; then
-    echo "Error: --from must be one of: ${STAGES[*]} (got '$START_STAGE')" >&2
-    exit 1
+    NUM_GPUS="${NUM_GPUS:-1}"
+    echo "==> Auto-detected ${NUM_GPUS} GPU(s)"
+fi
+NUM_GPUS="${NUM_GPUS:-1}"
+
+# Single GPU: auto-disable DeepSpeed (overrideable via --deepspeed).
+if [ -z "$NO_DEEPSPEED" ]; then
+    if [ "$NUM_GPUS" -eq 1 ] && [ "$NUM_NODES" -eq 1 ] && [ -z "$HOSTFILE" ]; then
+        NO_DEEPSPEED=true
+        echo "==> Single GPU detected, auto-disabling DeepSpeed (use --deepspeed to override)"
+    else
+        NO_DEEPSPEED=false
+    fi
 fi
 
-if [ "$START_IDX" -gt 0 ] && [ -z "$SEED_WEIGHTS" ]; then
-    echo "Error: --from $START_STAGE requires --pretrained-weights to seed the resumed stage" >&2
-    exit 1
+echo "==> Config: ${CONFIG_NAME}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_DEBUG="${NCCL_DEBUG:-ERROR}"
+
+# Multi-node IB / NCCL tuning. Each var uses `:-` so a caller can override
+# via the environment. Skipped on single-node since the IB path is unused
+# inside one box.
+if [ "$NUM_NODES" -gt 1 ] || [ -n "$HOSTFILE" ]; then
+    export NCCL_IB_QPS_PER_CONNECTION="${NCCL_IB_QPS_PER_CONNECTION:-8}"
+    export NCCL_GDR_LEVEL="${NCCL_GDR_LEVEL:-4}"
+    export NCCL_IB_PCI_RELAXED_ORDERING="${NCCL_IB_PCI_RELAXED_ORDERING:-1}"
+    export NCCL_IB_TC="${NCCL_IB_TC:-186}"
+    export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+    export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+    export NCCL_IB_TIMEOUT="${NCCL_IB_TIMEOUT:-22}"
+    export NCCL_IB_RETRY_CNT="${NCCL_IB_RETRY_CNT:-7}"
+    export NCCL_IB_HCA="${NCCL_IB_HCA:-^=mlx5_3,mlx5_4,mlx5_5,mlx5_bond_0}"
+    # Memory locking is required for IB/RDMA registered buffers; without it
+    # NCCL silently falls back to TCP and throughput collapses.
+    ulimit -l unlimited || true
+    echo "==> Multi-node NCCL/IB tuning applied (bond0, mlx5)"
 fi
 
-mkdir -p "$RUNS_DIR"
+if [ "$NO_DEEPSPEED" = true ]; then
+    echo "==> Launching with torchrun (DDP, no DeepSpeed)"
+    exec "$PYTHON" -m torch.distributed.run \
+        --nproc_per_node="$NUM_GPUS" \
+        --nnodes="$NUM_NODES" \
+        --node_rank="$NODE_RANK" \
+        --master_addr="$MASTER_ADDR" \
+        --master_port="$MASTER_PORT" \
+        "$TRAIN_SCRIPT" "$CONFIG_NAME" \
+        --train.no-use-deepspeed \
+        "${EXTRA_ARGS[@]}"
+fi
 
-discover_latest_run() {
-    local marker="$1"
-    find "$RUNS_DIR" -mindepth 1 -maxdepth 1 -type d -newer "$marker" \
-        -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | head -1 | awk '{print $2}'
-}
+TRAIN_ARGS=(
+    "$CONFIG_NAME"
+    --train.use-deepspeed
+    --train.zero-stage "$ZERO_STAGE"
+)
+[ -n "$DS_CONFIG" ] && TRAIN_ARGS+=(--train.deepspeed-config "$DS_CONFIG")
+TRAIN_ARGS+=("${EXTRA_ARGS[@]}")
 
-# Each stage runs as a subprocess so its `exec` of torchrun/deepspeed
-# returns the rc to us. We disable -e around the call to capture rc cleanly.
-run_stage() {
-    local label="$1"; shift
-    local marker
-    marker=$(mktemp -t "kappa_pipeline_${label}.XXXXXX.mark")
-    # Many filesystems have 1-second mtime granularity; sleep so the marker
-    # mtime is strictly older than any directory the stage creates.
-    sleep 1
+# Multi-node without hostfile = PET_*-style cluster (each node runs this
+# script independently). The `deepspeed` launcher requires SSH from a single
+# master, so use torchrun and let DeepSpeed initialize inside the script.
+if [ "$NUM_NODES" -gt 1 ] && [ -z "$HOSTFILE" ]; then
+    echo "==> Launching with torchrun + DeepSpeed engine (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs, node_rank=${NODE_RANK})"
+    exec "$TORCHRUN" \
+        --nproc_per_node="$NUM_GPUS" \
+        --nnodes="$NUM_NODES" \
+        --node_rank="$NODE_RANK" \
+        --master_addr="$MASTER_ADDR" \
+        --master_port="$MASTER_PORT" \
+        "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
+fi
 
-    echo "============================================================"
-    echo "==> [pipeline] starting stage: $label"
-    echo "==> [pipeline] cmd: $*"
-    echo "============================================================"
+DS_ARGS=(--num_gpus="$NUM_GPUS" --master_port="$MASTER_PORT")
+if [ -n "$HOSTFILE" ]; then
+    NUM_NODES=$(grep -cve '^\s*$' "$HOSTFILE")
+    DS_ARGS+=(--hostfile="$HOSTFILE" --num_nodes="$NUM_NODES")
+    echo "==> Launching with DeepSpeed via hostfile (ZeRO-${ZERO_STAGE}, ${NUM_NODES} nodes x ${NUM_GPUS} GPUs)"
+else
+    echo "==> Launching with DeepSpeed (ZeRO-${ZERO_STAGE}, single node x ${NUM_GPUS} GPUs)"
+fi
 
-    set +e
-    "$@"
-    local rc=$?
-    set -e
-
-    if [ "$rc" -ne 0 ]; then
-        rm -f "$marker"
-        echo "==> [pipeline] stage $label FAILED (rc=$rc) — aborting" >&2
-        exit "$rc"
-    fi
-
-    LATEST_RUN=$(discover_latest_run "$marker")
-    rm -f "$marker"
-
-    if [ -z "$LATEST_RUN" ]; then
-        echo "==> [pipeline] stage $label finished but no new run dir under $RUNS_DIR" >&2
-        echo "==> [pipeline]   (did the stage save a checkpoint? did another job race us?)" >&2
-        exit 1
-    fi
-    if [ ! -d "$LATEST_RUN/checkpoints" ]; then
-        echo "==> [pipeline] stage $label run $LATEST_RUN has no checkpoints/ subdir" >&2
-        echo "==> [pipeline]   (likely max_training_steps/checkpointing_steps mismatch)" >&2
-        exit 1
-    fi
-
-    echo "==> [pipeline] stage $label produced run: $LATEST_RUN"
-}
-
-CURRENT_WEIGHTS="$SEED_WEIGHTS"
-
-for ((i = START_IDX; i < ${#STAGES[@]}; i++)); do
-    stage="${STAGES[$i]}"
-    extra=()
-    if [ -n "$CURRENT_WEIGHTS" ]; then
-        extra+=(--train.pretrained-weights "$CURRENT_WEIGHTS")
-    fi
-    case "$stage" in
-        egodex|he_wbt)
-            run_stage "$stage" \
-                "$SCRIPT_DIR/pretrain_kappa.sh" --stage "$stage" \
-                "${extra[@]}" "${FORWARDED[@]}"
-            ;;
-        posttrain)
-            run_stage "$stage" \
-                "$SCRIPT_DIR/posttrain_kappa.sh" \
-                "${extra[@]}" "${FORWARDED[@]}"
-            ;;
-        finetune)
-            run_stage "$stage" \
-                "$SCRIPT_DIR/finetune_kappa.sh" \
-                "${extra[@]}" "${FORWARDED[@]}"
-            ;;
-    esac
-    CURRENT_WEIGHTS="$LATEST_RUN"
-done
-
-echo "============================================================"
-echo "==> [pipeline] all stages completed"
-echo "==> [pipeline] final run: $CURRENT_WEIGHTS"
-echo "============================================================"
+exec "$DEEPSPEED" "${DS_ARGS[@]}" "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"

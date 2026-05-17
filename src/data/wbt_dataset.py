@@ -60,10 +60,8 @@ class WBTDataset(TokenizedVideoDataset):
         action_chunk_size: int = 50,
         cache_root: str | None = None,
         subsets: "str | list[str]" = "all",
-        emit_g1_actions: bool = False,
         emit_proprio: bool = False,
-        g1_action_stats: dict | None = None,
-        g1_proprio_stats: dict | None = None,
+        proprio_stats: dict | None = None,
         normalize_mode: str = "bounds",
     ) -> None:
         super().__init__(action_chunk_size=action_chunk_size)
@@ -82,23 +80,16 @@ class WBTDataset(TokenizedVideoDataset):
                 f"Missing token dir {self.tokens_root}. Re-run the preprocess script."
             )
 
-        self._emit_g1_actions = emit_g1_actions
         self._emit_proprio = emit_proprio
-        self.g1_action_root = os.path.join(self.cache_root, "g1_actions")
-        self.g1_proprio_root = os.path.join(self.cache_root, "g1_proprio")
-        if emit_g1_actions and not os.path.isdir(self.g1_action_root):
+        # ``g1_proprio/`` references the G1 *robot's* joint state cache; the
+        # directory name is preserved across the G1-expert removal.
+        self.proprio_root = os.path.join(self.cache_root, "g1_proprio")
+        if emit_proprio and not os.path.isdir(self.proprio_root):
             raise FileNotFoundError(
-                f"Missing {self.g1_action_root}; re-run calc_wbt_sonic_tokens.py."
+                f"Missing {self.proprio_root}; re-run calc_wbt_sonic_tokens.py."
             )
-        if emit_proprio and not os.path.isdir(self.g1_proprio_root):
-            raise FileNotFoundError(
-                f"Missing {self.g1_proprio_root}; re-run calc_wbt_sonic_tokens.py."
-            )
-        self._g1_action_bounds = _load_normalize_bounds(
-            g1_action_stats, "action", self.g1_action_dim, normalize_mode,
-        )
         self._proprio_bounds = _load_normalize_bounds(
-            g1_proprio_stats, "proprio", self.proprio_dim, normalize_mode,
+            proprio_stats, "proprio", self.proprio_dim, normalize_mode,
         )
 
         meta = pl.read_parquet(meta_path)
@@ -205,20 +196,11 @@ class WBTDataset(TokenizedVideoDataset):
             os.path.join(self.tokens_root, sub, f"episode_{ep_idx:06d}.npy")
         )
 
-    def _g1_actions(self, ep: int) -> np.ndarray | None:
-        if not self._emit_g1_actions:
-            return None
-        sub = self._subset_names[int(self._ep_subset_id[ep])]
-        ep_idx = int(self._ep_episode_idx[ep])
-        return get_token_mmap(
-            os.path.join(self.g1_action_root, sub, f"episode_{ep_idx:06d}.npy")
-        )
-
     def _proprio(self, ep: int) -> np.ndarray | None:
         if not self._emit_proprio:
             return None
         sub = self._subset_names[int(self._ep_subset_id[ep])]
         ep_idx = int(self._ep_episode_idx[ep])
         return get_token_mmap(
-            os.path.join(self.g1_proprio_root, sub, f"episode_{ep_idx:06d}.npy")
+            os.path.join(self.proprio_root, sub, f"episode_{ep_idx:06d}.npy")
         )

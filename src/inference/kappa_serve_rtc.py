@@ -1,4 +1,4 @@
-"""WebSocket server that runs a Kappa post-train RTC control loop.
+"""WebSocket server that runs a Kappa RTC control loop emitting SONIC tokens.
 
 Adapted from ``Psi0/src/psi/deploy/psi_serve_rtc-trainingtimertc.py``. A
 single Kappa MoT model is loaded once on a chosen device. Clients connect
@@ -11,16 +11,17 @@ via WebSocket and send periodic observation packets:
     }
 
 The server runs an internal control loop at ``ctrl_hz`` (default 30 Hz) and
-streams the most-recent denormalized G1 action as JSON:
+streams the most-recent SONIC token vector as JSON:
 
-    {"version": <int>, "action": [31 floats]}
+    {"version": <int>, "sonic": [66 floats]}
+
+Downstream clients run the SONIC decoder ONNX to recover joint targets.
 
 Run via:
 
     .venv/bin/python -m src.inference.kappa_serve_rtc \\
         --weights .runs/kappa/<post-train>/checkpoints/ckpt_<step>/model.safetensors \\
-        --backbone resource/model/Qwen3-VL-2B-Instruct \\
-        --action-stats resource/dataset/G1_WBT-cache/meta/g1_action_stats.json
+        --backbone resource/model/Qwen3-VL-2B-Instruct
 """
 from __future__ import annotations
 
@@ -40,8 +41,8 @@ from PIL import Image
 
 
 def _load_model(args, device: torch.device):
-    """Build a fresh ``KappaModelWrapper``, convert to MoT with G1 + proprio,
-    and load post-train weights via ``safetensors``.
+    """Build a fresh ``KappaModelWrapper``, convert to MoT with proprio + RTC,
+    and load Post-Train / Fine-Tune weights via ``safetensors``.
     """
     from src.config.model_kappa import KappaModelConfig
     from src.models.kappa_model import KappaModelWrapper
@@ -49,10 +50,8 @@ def _load_model(args, device: torch.device):
 
     cfg = KappaModelConfig(
         model_name_or_path=args.backbone,
-        use_g1_expert=True,
         use_proprio=args.use_proprio,
         use_rtc=True,
-        rtc_on_sonic=args.rtc_on_sonic,
     )
     wrapper = KappaModelWrapper(
         model_name_or_path=cfg.model_name_or_path,
@@ -64,13 +63,9 @@ def _load_model(args, device: torch.device):
     wrapper.convert_to_mot(
         sonic_dim=cfg.sonic_dim,
         action_loss_weight=cfg.action_loss_weight,
-        use_g1_expert=True,
-        g1_dim=cfg.g1_dim,
-        g1_loss_weight=cfg.g1_loss_weight,
         use_proprio=args.use_proprio,
         proprio_dim=cfg.proprio_dim,
         use_rtc=True,
-        rtc_on_sonic=args.rtc_on_sonic,
     )
     state_dict = load_file(args.weights)
     result = wrapper.model.load_state_dict(state_dict, strict=False)
@@ -180,7 +175,7 @@ class Server:
                     continue
                 version = self._action_version
                 action = self._latest_action.tolist()
-            await ws.send_text(json.dumps({"version": version, "action": action}))
+            await ws.send_text(json.dumps({"version": version, "sonic": action}))
             last_version = version
 
     # ------------------------------------------------------------------
@@ -244,7 +239,6 @@ def _build_controller(args, wrapper, cfg, device):
     scheduler = FlowMatchEulerDiscreteScheduler(
         num_train_timesteps=getattr(cfg, "num_train_timesteps", 1000),
     )
-    g1_action_stats = _load_json(args.action_stats)
 
     def factory():
         return RealTimeChunkController(
@@ -252,7 +246,6 @@ def _build_controller(args, wrapper, cfg, device):
             processor=wrapper.processor,
             scheduler=scheduler,
             cfg=cfg,
-            g1_action_stats=g1_action_stats,
             ctrl_hz=args.ctrl_hz,
             s_min=args.s_min,
         )
@@ -262,15 +255,10 @@ def _build_controller(args, wrapper, cfg, device):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--weights", required=True, help="Post-train safetensors checkpoint.")
+    parser.add_argument("--weights", required=True, help="Post-Train / Fine-Tune safetensors checkpoint.")
     parser.add_argument("--backbone", default="resource/model/Qwen3-VL-2B-Instruct")
-    parser.add_argument(
-        "--action-stats", default="resource/dataset/G1_WBT-cache/meta/g1_action_stats.json",
-    )
     parser.add_argument("--use-proprio", action="store_true", default=True)
     parser.add_argument("--no-proprio", dest="use_proprio", action="store_false")
-    parser.add_argument("--rtc-on-sonic", action="store_true", default=True)
-    parser.add_argument("--no-rtc-on-sonic", dest="rtc_on_sonic", action="store_false")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="0.0.0.0")

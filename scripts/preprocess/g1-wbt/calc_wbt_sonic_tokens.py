@@ -50,7 +50,6 @@ from _subsets import (  # noqa: E402
 # upsampling), and so the dataset-side path manipulation hack is gone.
 from src.data.preprocess import (  # noqa: E402
     atomic_save_npy,
-    build_g1_action_23,
     resample_linear as _resample_linear,
     resample_quat_wxyz as _resample_quat_wxyz,
 )
@@ -72,8 +71,8 @@ def _encode_one(
     dataset's documented hand_state range, and (optionally) run the SONIC encoder.
 
     Returns ``(tokens_or_None, jp, op, oq, hand_bits, n_tgt)``. Caller uses
-    ``jp``, ``op``, ``oq``, ``hand_bits`` to dump the 23-D G1 actions and 64-D
-    proprio without needing to redo resampling/binarization.
+    ``jp``, ``oq``, ``hand_bits`` to dump the 64-D proprio without needing to
+    redo resampling/binarization.
     """
     import numpy as np
 
@@ -99,30 +98,21 @@ def _encode_one(
     return tokens, jp, op, oq, hand_bits, n_tgt
 
 
-def _dump_g1_action_and_proprio(
+def _dump_proprio(
     jp: "np.ndarray",
-    op: "np.ndarray",
     oq: "np.ndarray",
     hand_bits: "np.ndarray",
     target_fps: float,
-    g1_action_path: str,
-    g1_proprio_path: str,
+    proprio_path: str,
 ) -> None:
-    """Dump 23-D G1 actions (arms + hand_bits + loco_cmd) and 64-D proprio
+    """Dump the 64-D robot proprio vector
     (full-body jp + hand_bits + jv + odom_quat_xyzw).
-
-    See ``src.data.preprocess.build_g1_action_23`` for the 23-D layout. Legs+
-    waist are dropped from the action target (WBC drives them) but remain in
-    the 64-D proprio, so the model still sees full body state as observation.
     """
     import numpy as np
     from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw
 
     jp32 = jp.astype(np.float32, copy=False)
     bits = hand_bits.astype(np.float32, copy=False)
-
-    g1_action = build_g1_action_23(jp32, bits, op, oq, fps=target_fps)
-    atomic_save_npy(g1_action, g1_action_path)
 
     n = jp32.shape[0]
     jv = np.zeros_like(jp32)
@@ -132,7 +122,7 @@ def _dump_g1_action_and_proprio(
     proprio = np.concatenate(
         [jp32, bits, jv, quat_xyzw], axis=-1
     ).astype(np.float32)
-    atomic_save_npy(proprio, g1_proprio_path)
+    atomic_save_npy(proprio, proprio_path)
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +135,7 @@ def worker_main(
     result_q: "mp.Queue",
     encoder_path: str,
     out_root: str,
-    g1_action_root: str,
-    g1_proprio_root: str,
+    proprio_root: str,
     data_root: str,
     source_fps: float,
     target_fps: float,
@@ -185,16 +174,12 @@ def worker_main(
                 final = os.path.join(out_dir, f"episode_{episode_index:06d}.npy")
                 atomic_save_npy(tokens, final)
 
-            g1_action_dir = os.path.join(g1_action_root, subset_name)
-            g1_proprio_dir = os.path.join(g1_proprio_root, subset_name)
-            os.makedirs(g1_action_dir, exist_ok=True)
-            os.makedirs(g1_proprio_dir, exist_ok=True)
-            g1_action_path = os.path.join(g1_action_dir, f"episode_{episode_index:06d}.npy")
-            g1_proprio_path = os.path.join(g1_proprio_dir, f"episode_{episode_index:06d}.npy")
-            if not (os.path.exists(g1_action_path) and os.path.exists(g1_proprio_path)):
-                _dump_g1_action_and_proprio(
-                    jp, op, oq, hand_bits, target_fps,
-                    g1_action_path, g1_proprio_path,
+            proprio_dir = os.path.join(proprio_root, subset_name)
+            os.makedirs(proprio_dir, exist_ok=True)
+            proprio_path = os.path.join(proprio_dir, f"episode_{episode_index:06d}.npy")
+            if not os.path.exists(proprio_path):
+                _dump_proprio(
+                    jp, oq, hand_bits, target_fps, proprio_path,
                 )
             result_q.put(("ok", subset_name, episode_index, int(n_tgt)))
         except Exception:
@@ -295,26 +280,26 @@ def main() -> None:
 
     encoder_path = os.path.join(args.sonic_model_dir, "model_encoder.onnx")
     out_root = os.path.join(cache_root, "sonic_tokens")
-    g1_action_root = os.path.join(cache_root, "g1_actions")
-    g1_proprio_root = os.path.join(cache_root, "g1_proprio")
+    # ``g1_proprio/`` references the G1 *robot's* joint state cache; the
+    # directory name is preserved across the G1-expert removal.
+    proprio_root = os.path.join(cache_root, "g1_proprio")
     os.makedirs(out_root, exist_ok=True)
-    os.makedirs(g1_action_root, exist_ok=True)
-    os.makedirs(g1_proprio_root, exist_ok=True)
+    os.makedirs(proprio_root, exist_ok=True)
 
-    # Build pending list. An episode is pending when *any* of {sonic, g1_action,
-    # g1_proprio} is missing; ``need_sonic`` is False when only the lightweight
-    # parquet-derived dumps are missing — the worker can skip the ONNX session.
+    # Build pending list. An episode is pending when either of {sonic, proprio}
+    # is missing; ``need_sonic`` is False when only the lightweight
+    # parquet-derived proprio dump is missing — the worker can skip the ONNX
+    # session.
     pending: list[tuple] = []
     skipped = 0
     for row in meta_df.iter_rows(named=True):
         sub = row["subset"]
         ep_fn = f"episode_{row['episode_index']:06d}.npy"
         sonic_path = os.path.join(out_root, sub, ep_fn)
-        g1a_path = os.path.join(g1_action_root, sub, ep_fn)
-        g1p_path = os.path.join(g1_proprio_root, sub, ep_fn)
+        proprio_path = os.path.join(proprio_root, sub, ep_fn)
         need_sonic = not os.path.exists(sonic_path)
-        need_g1 = not (os.path.exists(g1a_path) and os.path.exists(g1p_path))
-        if not (need_sonic or need_g1):
+        need_proprio = not os.path.exists(proprio_path)
+        if not (need_sonic or need_proprio):
             skipped += 1
             continue
         pending.append((
@@ -352,7 +337,7 @@ def main() -> None:
             target=worker_main,
             args=(
                 gpu, work_q, result_q, encoder_path, out_root,
-                g1_action_root, g1_proprio_root, args.data_root,
+                proprio_root, args.data_root,
                 args.source_fps, args.target_fps,
             ),
             daemon=False,

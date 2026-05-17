@@ -351,7 +351,7 @@ class G1MujocoEnv:
 
         # WBC head state. Off by default; switched on via ``enable_wbc_mode``,
         # which retunes sim_dt to the WBC training resolution (0.005 s) and
-        # exposes ``step_with_wbc``. Other heads (g1_expert, sonic, gt_*) are
+        # exposes ``step_with_wbc``. Other heads (sonic, gt_wbc) are
         # untouched.
         self._wbc = None  # set by enable_wbc_mode
         self._wbc_decimation = 4  # WBC fires every N sim substeps (20 ms at 5 ms)

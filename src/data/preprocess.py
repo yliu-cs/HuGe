@@ -9,10 +9,10 @@ Common pieces used by both ``scripts/preprocess/humanoid-everyday/`` and
 * :func:`atomic_save_npy` — write ``.npy`` via ``<final>.tmp.<pid>`` then
   rename, so interrupted runs never leave a half-written file that the
   resume logic would skip.
-* :func:`build_loco_cmd` / :func:`pelvis_roll_pitch` — derive the 7-D WBC
-  command channel (navigate_cmd[3] + height[1] + rpy[3]) from pelvis
-  pos/quat at the SONIC timeline. Mirrors ``episode_source._build_loco_cmd``
-  so offline cache and sim_validate's GT-derivation produce identical values.
+* :func:`build_loco_cmd` / :func:`pelvis_roll_pitch` — derive locomotion
+  command components from pelvis pos/quat at the SONIC timeline. Mirrors
+  ``episode_source._build_loco_cmd`` so offline cache and sim_validate's
+  GT-derivation produce identical values.
 """
 from __future__ import annotations
 
@@ -158,32 +158,3 @@ def build_loco_cmd(
     return cmd.astype(np.float32)
 
 
-def build_g1_action_23(
-    jp: np.ndarray,            # (T, 29) float
-    hand_bits: np.ndarray,     # (T, 2)  float
-    pos_xyz: np.ndarray,       # (T, 3)  float
-    quat_wxyz: np.ndarray,     # (T, 4)  float
-    fps: float,
-) -> np.ndarray:
-    """Assemble the 23-D G1 action target.
-
-    Layout:
-        [0:14]   arms (jp[15:29])
-        [14:16]  hand_bits
-        [16:19]  navigate_cmd(vx_b, vy_b, ωz)
-        [19:20]  base_height (absolute pelvis z, m)
-        [20:23]  rpy_cmd(roll, pitch, yaw=0)
-
-    Legs+waist (jp[0:15]) are intentionally dropped — WBC drives those joints
-    at deployment; keeping them in the action target only adds gradient noise
-    on shared expert parameters (auto-memory: ``project_kappa_leg_pred_uncorrelated``).
-    The full body pose still reaches the model via the 64-D proprio.
-    """
-    arms = np.asarray(jp[:, 15:29], dtype=np.float32)
-    bits = np.asarray(hand_bits, dtype=np.float32)
-    nav = build_loco_cmd(pos_xyz, quat_wxyz, fps=fps)
-    height = np.asarray(pos_xyz[:, 2:3], dtype=np.float32)
-    rp = pelvis_roll_pitch(quat_wxyz)
-    yaw_cmd = np.zeros((rp.shape[0], 1), dtype=np.float32)
-    rpy = np.concatenate([rp, yaw_cmd], axis=-1)
-    return np.concatenate([arms, bits, nav, height, rpy], axis=-1).astype(np.float32)

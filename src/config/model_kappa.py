@@ -35,28 +35,19 @@ class KappaModelConfig(ModelConfig):
 
     num_inference_steps: int = 4
 
-    # Post-train extras (3rd MoT expert + RTC + proprio). Defaults preserve
-    # the pretrain stage 1-2 layout exactly so existing configs keep working.
-    use_g1_expert: bool = False
-    # 23-D = arms(14) + hand_bits(2) + loco_cmd(7). Legs+waist are not
-    # predicted (WBC handles them at deployment); see
-    # ``src.data.preprocess.build_g1_action_23`` for the channel layout.
-    g1_dim: int = 23
-    g1_loss_weight: float = 0.3
+    # Optional 64-D robot proprio prefix (kept after G1 expert removal so the
+    # SONIC head can still condition on the current joint state).
     use_proprio: bool = False
     proprio_dim: int = 64
-    use_rtc: bool = False
-    rtc_on_sonic: bool = True
-    g1_max_delay: int = 10
-    sonic_max_delay: int = 8
     proprio_noise_std: float = 0.02
-    # Proprio now lives in the latent prefix (visible to BOTH SONIC and G1
-    # via attention), so a non-zero default drop avoids the experts collapsing
-    # onto proprio and ignoring the visual conditioning.
+    # Non-zero default drop avoids the SONIC head collapsing onto proprio and
+    # ignoring the visual conditioning when proprio is enabled.
     proprio_drop_prob: float = 0.1
-    g1_action_stats_path: str | None = None
-    g1_proprio_stats_path: str | None = None
+    proprio_stats_path: str | None = None
 
-    # Post-train freeze toggles.
-    freeze_for_post_train: bool = False
-    init_g1_from_sonic: bool = False
+    # Real-Time Chunking on the SONIC chunk (per-token timestep + prefix
+    # substitution + intra-segment causal mask). Off by default — enabled
+    # starting at Post-Train so the head learns the RTC mechanism on the full
+    # HE+WBT mix before Fine-Tune inherits it.
+    use_rtc: bool = False
+    sonic_max_delay: int = 8

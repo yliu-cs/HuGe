@@ -11,7 +11,7 @@ from src.config.data_wbt import WBTDataConfig
 
 
 class HEWBTMixDataConfig(DataConfig):
-    """Stage 1-2 mix: Humanoid-Everyday G1 + G1-WBT.
+    """HE-G1 + G1-WBT mix.
 
     Both child datasets emit identical ``{image, text, sonic_tokens [50,66],
     sonic_mask [50]}`` dicts and share the same transform pipeline, so a single
@@ -34,10 +34,8 @@ class HEWBTMixDataConfig(DataConfig):
             split=split,
             cache_root=self.he.cache_root,
             robot_type=self.he.robot_type,
-            emit_g1_actions=self.he.emit_g1_actions,
             emit_proprio=self.he.emit_proprio,
-            g1_action_stats=self.he._load_stats(self.he.g1_action_stats_path),
-            g1_proprio_stats=self.he._load_stats(self.he.g1_proprio_stats_path),
+            proprio_stats=self.he._load_stats(self.he.proprio_stats_path),
             normalize_mode=self.he.normalize_mode,
         )
         raw_wbt = WBTDataset(
@@ -45,10 +43,8 @@ class HEWBTMixDataConfig(DataConfig):
             action_chunk_size=self.wbt.action_chunk_size,
             cache_root=self.wbt.cache_root,
             subsets=self.wbt.subsets,
-            emit_g1_actions=self.wbt.emit_g1_actions,
             emit_proprio=self.wbt.emit_proprio,
-            g1_action_stats=self.wbt._load_stats(self.wbt.g1_action_stats_path),
-            g1_proprio_stats=self.wbt._load_stats(self.wbt.g1_proprio_stats_path),
+            proprio_stats=self.wbt._load_stats(self.wbt.proprio_stats_path),
             normalize_mode=self.wbt.normalize_mode,
         )
         mix = ConcatMixDataset([raw_he, raw_wbt])

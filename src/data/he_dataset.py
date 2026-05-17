@@ -25,10 +25,8 @@ class HEDataset(TokenizedVideoDataset):
         split: str = "train",
         cache_root: str | None = None,
         robot_type: str = "g1",
-        emit_g1_actions: bool = False,
         emit_proprio: bool = False,
-        g1_action_stats: dict | None = None,
-        g1_proprio_stats: dict | None = None,
+        proprio_stats: dict | None = None,
         normalize_mode: str = "bounds",
         episode_indices: list[int] | None = None,
     ):
@@ -50,23 +48,16 @@ class HEDataset(TokenizedVideoDataset):
                 "Run `python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py` first."
             )
 
-        self._emit_g1_actions = emit_g1_actions
         self._emit_proprio = emit_proprio
-        self.g1_action_dir = os.path.join(self.cache_root, "g1_actions")
-        self.g1_proprio_dir = os.path.join(self.cache_root, "g1_proprio")
-        if emit_g1_actions and not os.path.isdir(self.g1_action_dir):
+        # ``g1_proprio/`` references the G1 *robot's* joint state (not the
+        # removed G1 expert), so the cache directory keeps its name.
+        self.proprio_dir = os.path.join(self.cache_root, "g1_proprio")
+        if emit_proprio and not os.path.isdir(self.proprio_dir):
             raise FileNotFoundError(
-                f"Missing {self.g1_action_dir}; re-run calc_sonic_tokens.py to dump g1_actions/."
+                f"Missing {self.proprio_dir}; re-run calc_sonic_tokens.py to dump g1_proprio/."
             )
-        if emit_proprio and not os.path.isdir(self.g1_proprio_dir):
-            raise FileNotFoundError(
-                f"Missing {self.g1_proprio_dir}; re-run calc_sonic_tokens.py to dump g1_proprio/."
-            )
-        self._g1_action_bounds = _load_normalize_bounds(
-            g1_action_stats, "action", self.g1_action_dim, normalize_mode,
-        )
         self._proprio_bounds = _load_normalize_bounds(
-            g1_proprio_stats, "proprio", self.proprio_dim, normalize_mode,
+            proprio_stats, "proprio", self.proprio_dim, normalize_mode,
         )
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
@@ -226,18 +217,10 @@ class HEDataset(TokenizedVideoDataset):
             os.path.join(self.sonic_tokens_dir, f"episode_{ep_idx:06d}.npy")
         )
 
-    def _g1_actions(self, ep: int) -> np.ndarray | None:
-        if not self._emit_g1_actions:
-            return None
-        ep_idx = int(self._ep_episode_idx[ep])
-        return get_token_mmap(
-            os.path.join(self.g1_action_dir, f"episode_{ep_idx:06d}.npy")
-        )
-
     def _proprio(self, ep: int) -> np.ndarray | None:
         if not self._emit_proprio:
             return None
         ep_idx = int(self._ep_episode_idx[ep])
         return get_token_mmap(
-            os.path.join(self.g1_proprio_dir, f"episode_{ep_idx:06d}.npy")
+            os.path.join(self.proprio_dir, f"episode_{ep_idx:06d}.npy")
         )

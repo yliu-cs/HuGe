@@ -52,20 +52,11 @@ class HEEpisodeSource:
         self,
         data_root: str | Path = "resource/dataset/humanoid-everyday",
         proprio_cache_root: str | Path = "resource/dataset/humanoid-everyday-cache/g1_proprio",
-        g1_action_cache_root: str | Path | None = None,
         robot_type: str = "g1",
         seed: int = 0,
     ):
         self.data_root = Path(data_root)
         self.proprio_cache_root = Path(proprio_cache_root)
-        # Default the g1_actions cache to the sibling of g1_proprio. Both are
-        # written together by calc_sonic_tokens.py so they always live in the
-        # same parent directory.
-        self.g1_action_cache_root = (
-            Path(g1_action_cache_root)
-            if g1_action_cache_root is not None
-            else self.proprio_cache_root.parent / "g1_actions"
-        )
         # Lazy per-episode pelvis pose cache. Built on first ``pelvis_pose_at``
         # call by reading the parquet's ``observation.odometry.{position,quat}``
         # at 30 Hz and upsampling to the 50 Hz token timeline. Not part of
@@ -108,7 +99,6 @@ class HEEpisodeSource:
         self._task_by_index: dict[int, dict] = {int(t["task_index"]): t for t in tasks}
         self._rng = random.Random(seed)
         self._proprio_mmap: dict[int, np.ndarray] = {}
-        self._g1_action_mmap: dict[int, np.ndarray] = {}
 
     def sample(self, n: int, seed: Optional[int] = None) -> list[HEEpisode]:
         rng = random.Random(seed) if seed is not None else self._rng
@@ -148,32 +138,6 @@ class HEEpisodeSource:
         idx = max(0, min(idx, arr.shape[0] - 1))
         return np.asarray(arr[idx], dtype=np.float32)  # copy out of mmap
 
-    def g1_action_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
-        """Return the cached 23-D training-time G1 action at the frame closest
-        to ``t_seconds`` (50 Hz timeline).
-
-        Layout matches what the Kappa G1 head was trained to predict:
-        ``[arms(14), hand_bits(2), loco_cmd(3), base_height(1), rpy_cmd(3)]``.
-        Used by sim-validation plots to overlay the dataset's ground-truth
-        action against the model's commanded action so fit quality is visible
-        at a glance.
-        """
-        ep = int(episode_index)
-        arr = self._g1_action_mmap.get(ep)
-        if arr is None:
-            path = self.g1_action_cache_root / f"episode_{ep:06d}.npy"
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"Missing cached g1_action for episode {ep}: {path}. "
-                    f"Re-run scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py "
-                    f"or pass --g1-action-cache-root to point at an existing cache."
-                )
-            arr = np.load(str(path), mmap_mode="r")
-            self._g1_action_mmap[ep] = arr
-        idx = int(round(t_seconds * HE_PROPRIO_FPS))
-        idx = max(0, min(idx, arr.shape[0] - 1))
-        return np.asarray(arr[idx], dtype=np.float32)
-
     def pelvis_pose_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
         """Return the dataset's pelvis pose at sim time ``t_seconds``.
 
@@ -181,7 +145,7 @@ class HEEpisodeSource:
         Loaded on demand from the source parquet's
         ``observation.odometry.{position,quat}`` and upsampled from the native
         30 Hz parquet rate to the 50 Hz token timeline so it lines up with
-        ``g1_action_at`` / ``proprio_at`` indexing.
+        ``proprio_at`` indexing.
 
         Used by the GT-replay head in the sim validator to make the floating
         base actually translate / rotate the way the recorded episode did,
@@ -299,7 +263,7 @@ class HEEpisodeSource:
         quat_wxyz = np.asarray(df["observation.odometry.quat"].to_list(), dtype=np.float32)
         n_src = pos.shape[0]
         # Match the resampling pass calc_sonic_tokens.py applies to jp/proprio
-        # so the pelvis pose lands on the same indices as ``g1_action_at(t)``.
+        # so the pelvis pose lands on the same 50 Hz indices as ``proprio_at``.
         n_tgt = max(1, int(round(n_src * HE_PROPRIO_FPS / HE_VIDEO_FPS)))
         if n_tgt != n_src:
             pos = resample_linear(pos.astype(np.float64), n_src, n_tgt).astype(np.float32)

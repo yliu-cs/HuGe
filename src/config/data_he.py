@@ -17,12 +17,10 @@ class HEDataConfig(DataConfig):
     # embodiment, so default to G1. Pass "all" to disable the filter.
     robot_type: str = "g1"
 
-    # Post-train extras. Default off so existing pretrain configs are byte-
-    # identical to before this change.
-    emit_g1_actions: bool = False
+    # Optional 64-D robot proprio prefix. Default off so the EgoDex pretrain
+    # config stays byte-identical.
     emit_proprio: bool = False
-    g1_action_stats_path: str | None = None
-    g1_proprio_stats_path: str | None = None
+    proprio_stats_path: str | None = None
     normalize_mode: str = "bounds"
 
     # Restrict the dataset to a fixed list of HE episode indices. ``None``
@@ -46,10 +44,8 @@ class HEDataConfig(DataConfig):
             split=split,
             cache_root=self.cache_root,
             robot_type=self.robot_type,
-            emit_g1_actions=self.emit_g1_actions,
             emit_proprio=self.emit_proprio,
-            g1_action_stats=self._load_stats(self.g1_action_stats_path),
-            g1_proprio_stats=self._load_stats(self.g1_proprio_stats_path),
+            proprio_stats=self._load_stats(self.proprio_stats_path),
             normalize_mode=self.normalize_mode,
             episode_indices=self.episode_indices,
         )

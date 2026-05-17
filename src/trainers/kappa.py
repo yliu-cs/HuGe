@@ -23,23 +23,19 @@ class KappaCollator:
     Labels are not produced because the MoT path supervises via
     ``velocity_target`` only; the CE fallback in the model is unused at train.
 
-    Post-train mode (``use_g1_expert=True``) additionally:
-
-    * stacks ``g1_actions`` / ``g1_mask`` / ``proprio`` from each instance,
-    * draws an independent G1 (and optionally SONIC) RTC delay,
-    * builds prefix-aware noisy actions and velocity targets for both streams,
-    * adds Gaussian jitter to the proprio (skipping hand-bit + quat dims).
+    When ``use_rtc`` is on, the collator draws a SONIC RTC delay, builds a
+    prefix-aware noisy SONIC chunk, and suppresses the loss on the substituted
+    prefix positions. When ``use_proprio`` is on, the collator stacks proprio
+    from each instance and adds Gaussian jitter (skipping hand-bit + quat
+    dims).
     """
 
     def __init__(
         self,
         processor,
         model_max_length: int = 8192,
-        use_g1_expert: bool = False,
         use_proprio: bool = False,
         use_rtc: bool = False,
-        rtc_on_sonic: bool = True,
-        g1_max_delay: int = 10,
         sonic_max_delay: int = 8,
         proprio_noise_std: float = 0.02,
         proprio_drop_prob: float = 0.1,
@@ -47,11 +43,8 @@ class KappaCollator:
     ):
         self.processor = processor
         self.model_max_length = model_max_length
-        self.use_g1_expert = use_g1_expert
-        self.use_proprio = use_proprio and use_g1_expert
+        self.use_proprio = use_proprio
         self.use_rtc = use_rtc
-        self.rtc_on_sonic = rtc_on_sonic and use_rtc
-        self.g1_max_delay = g1_max_delay
         self.sonic_max_delay = sonic_max_delay
         self.proprio_noise_std = proprio_noise_std
         self.proprio_drop_prob = proprio_drop_prob
@@ -121,7 +114,7 @@ class KappaCollator:
             t = self._logit_normal_t(B)
             noise_s = torch.randn_like(sonic_tokens)
 
-            if self.rtc_on_sonic:
+            if self.use_rtc:
                 # SONIC RTC: prefix region gets t=0 (clean a) and is masked
                 # out of the loss. ``timesteps`` is per-sample (single t emb
                 # token still); the prefix substitution happens in the
@@ -152,37 +145,6 @@ class KappaCollator:
             result["timesteps"] = t
             result["velocity_target"] = velocity_target
             result["sonic_mask"] = sonic_mask
-
-        if self.use_g1_expert and "g1_actions" in instances[0]:
-            g1_actions = torch.stack([inst["g1_actions"] for inst in instances])
-            g1_mask = torch.stack([inst["g1_mask"] for inst in instances])
-            B, T_g, D_g = g1_actions.shape
-
-            # Reuse the SONIC ``t`` so both losses sample the same global
-            # noise level — keeps the two streams' training in sync as the
-            # design doc describes.
-            t = result.get("timesteps", self._logit_normal_t(B))
-            delay_g = torch.randint(0, max(1, self.g1_max_delay), (B,))
-            arange_g = torch.arange(T_g)
-            prefix_mask_g = arange_g[None, :] < delay_g[:, None]  # (B, T_g)
-
-            noise_g = torch.randn_like(g1_actions)
-            t_per_pos_g = torch.where(
-                prefix_mask_g, torch.zeros_like(t)[:, None].expand(-1, T_g),
-                t[:, None].expand(-1, T_g),
-            )
-            t_for_noise = t_per_pos_g[..., None]
-            noisy_g1_tokens = t_for_noise * noise_g + (1 - t_for_noise) * g1_actions
-            g1_velocity_target = noise_g - g1_actions
-
-            postfix_mask_g = (~prefix_mask_g).to(g1_mask.dtype)
-            g1_mask = g1_mask * postfix_mask_g
-
-            result["noisy_g1_tokens"] = noisy_g1_tokens
-            # Per-pos timestep for the G1 head; the model handles 2-D shapes.
-            result["g1_timesteps"] = t_per_pos_g
-            result["g1_velocity_target"] = g1_velocity_target
-            result["g1_mask"] = g1_mask
 
         if self.use_proprio and "proprio" in instances[0]:
             proprio = torch.stack([inst["proprio"] for inst in instances])  # (B, D_p)
@@ -238,13 +200,9 @@ class KappaTrainer(Trainer):
             model_wrapper.convert_to_mot(
                 sonic_dim=model_cfg.sonic_dim,
                 action_loss_weight=model_cfg.action_loss_weight,
-                use_g1_expert=getattr(model_cfg, "use_g1_expert", False),
-                g1_dim=getattr(model_cfg, "g1_dim", 31),
-                g1_loss_weight=getattr(model_cfg, "g1_loss_weight", 0.3),
                 use_proprio=getattr(model_cfg, "use_proprio", False),
                 proprio_dim=getattr(model_cfg, "proprio_dim", 64),
                 use_rtc=getattr(model_cfg, "use_rtc", False),
-                rtc_on_sonic=getattr(model_cfg, "rtc_on_sonic", True),
             )
 
         self.model_wrapper = model_wrapper
@@ -254,24 +212,6 @@ class KappaTrainer(Trainer):
 
         if model_cfg.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
-
-    def load_pretrained_weights(self) -> Optional[str]:
-        """Hook the post-train init/freeze sequence onto pretrained loading.
-
-        Order: parent loads SONIC stage 1-2 weights with ``strict=False`` so
-        the new G1 / proprio副本 stay at their random init. We then copy
-        SONIC into G1 (``init_g1_from_sonic``) before freezing — this happens
-        only when both flags are on, so the legacy pretrain path is unchanged.
-        """
-        path = super().load_pretrained_weights()
-        model_cfg = self.cfg.model
-        if path is None:
-            return None
-        if getattr(model_cfg, "init_g1_from_sonic", False):
-            self.model_wrapper.init_g1_from_sonic_expert()
-        if getattr(model_cfg, "freeze_for_post_train", False):
-            self.model_wrapper.freeze_for_post_train()
-        return path
 
     def create_datasets(self) -> tuple[Dataset, Optional[Dataset]]:
         data_cfg = self.cfg.data
@@ -296,11 +236,8 @@ class KappaTrainer(Trainer):
         collator = KappaCollator(
             processor=self.vlm_processor,
             model_max_length=model_cfg.model_max_length,
-            use_g1_expert=getattr(model_cfg, "use_g1_expert", False),
             use_proprio=getattr(model_cfg, "use_proprio", False),
             use_rtc=getattr(model_cfg, "use_rtc", False),
-            rtc_on_sonic=getattr(model_cfg, "rtc_on_sonic", True),
-            g1_max_delay=getattr(model_cfg, "g1_max_delay", 10),
             sonic_max_delay=getattr(model_cfg, "sonic_max_delay", 8),
             proprio_noise_std=getattr(model_cfg, "proprio_noise_std", 0.02),
             proprio_drop_prob=getattr(model_cfg, "proprio_drop_prob", 0.1),
@@ -437,20 +374,12 @@ class KappaTrainer(Trainer):
             "loss": loss.item(),
             "lr": self.lr,
         }
-        # Surface per-expert losses for the post-train run.
         if hasattr(output, "sonic_loss") and output.sonic_loss is not None:
             log_metrics["sonic_loss"] = output.sonic_loss.item()
-        if hasattr(output, "g1_loss") and output.g1_loss is not None:
-            log_metrics["g1_loss"] = output.g1_loss.item()
         return self.accelerator.sync_gradients, log_metrics
 
     def create_optimizer(self):
-        """Create optimizer with parameter groups for vision, projector, and LLM.
-
-        Post-train adds a separate ``g1`` group so the design-doc's "give the
-        new expert its own lr knob" stays available — by default it shares
-        the LLM lr; configs can override via ``model_cfg.g1_lr``.
-        """
+        """Create optimizer with parameter groups for projector and LLM."""
         from torch.optim import AdamW
 
         model_cfg = self.cfg.model
@@ -460,17 +389,12 @@ class KappaTrainer(Trainer):
 
         projector_params = []
         llm_params = []
-        g1_params = []
         other_params = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            # ``proprio_embedder`` is a latent-prefix Linear, no longer part of
-            # the G1 expert — let it follow the default LR rather than g1_lr.
-            if "_g1" in name:
-                g1_params.append(param)
-            elif "mlp1" in name or "projector" in name or "merger" in name:
+            if "mlp1" in name or "projector" in name or "merger" in name:
                 projector_params.append(param)
             elif "lm_head" in name or "embed_tokens" in name or "layers" in name or "norm" in name:
                 llm_params.append(param)
@@ -478,14 +402,11 @@ class KappaTrainer(Trainer):
                 other_params.append(param)
 
         optimizer_kwargs = dict(train_cfg.optimizer_kwargs)
-        g1_lr = getattr(model_cfg, "g1_lr", train_cfg.learning_rate)
 
         if len(projector_params) > 0:
             param_groups.append({"params": projector_params, "lr": model_cfg.mm_projector_lr, "weight_decay": model_cfg.weight_decay})
         if len(llm_params) > 0:
             param_groups.append({"params": llm_params, "lr": train_cfg.learning_rate, "weight_decay": model_cfg.weight_decay})
-        if len(g1_params) > 0:
-            param_groups.append({"params": g1_params, "lr": g1_lr, "weight_decay": model_cfg.weight_decay})
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": train_cfg.learning_rate, "weight_decay": model_cfg.weight_decay})
 

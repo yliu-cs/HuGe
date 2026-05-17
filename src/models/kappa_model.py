@@ -92,18 +92,13 @@ class KappaModelWrapper(nn.Module):
         self,
         sonic_dim: int = 66,
         action_loss_weight: float = 1.0,
-        use_g1_expert: bool = False,
-        g1_dim: int = 31,
-        g1_loss_weight: float = 0.3,
         use_proprio: bool = False,
         proprio_dim: int = 64,
         use_rtc: bool = False,
-        rtc_on_sonic: bool = True,
     ):
         from src.models.mot_kappa import MoTKappaModel
         overwatch.info(
-            f"Converting to MoT (g1={use_g1_expert}, proprio={use_proprio}, "
-            f"rtc={use_rtc}, rtc_on_sonic={rtc_on_sonic})..."
+            f"Converting to MoT (proprio={use_proprio}, rtc={use_rtc})..."
         )
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
@@ -111,93 +106,11 @@ class KappaModelWrapper(nn.Module):
             self.model,
             sonic_dim=sonic_dim,
             action_loss_weight=action_loss_weight,
-            use_g1_expert=use_g1_expert,
-            g1_dim=g1_dim,
-            g1_loss_weight=g1_loss_weight,
             use_proprio=use_proprio,
             proprio_dim=proprio_dim,
             use_rtc=use_rtc,
-            rtc_on_sonic=rtc_on_sonic,
         ).to(dtype=dtype, device=device)
         overwatch.info("MoT conversion complete")
-
-    def init_g1_from_sonic_expert(self) -> int:
-        """Copy SONIC expert weights into the G1 expert副本.
-
-        For every layer the per-expert ``*_action`` parameters (q/k/v/o, q/k
-        norms, MLP, layernorms) are copied to the matching ``*_g1``副本; the
-        same applies to the top-level ``norm_action`` -> ``norm_action_g1`` and
-        the timestep embedder. ``action_embedder_g1`` (sonic_dim → hidden) and
-        ``velocity_head_g1`` (hidden → g1_dim) have different I/O dims and
-        keep their random / zero init. Returns the number of tensors copied.
-        """
-        from src.models.mot_kappa import MoTKappaModel
-        if not isinstance(self.model, MoTKappaModel):
-            raise RuntimeError("init_g1_from_sonic_expert requires convert_to_mot first")
-        if not self.model.use_g1_expert:
-            raise RuntimeError("Model has no G1 expert; convert with use_g1_expert=True")
-
-        copied = 0
-        for layer in self.model.base_model.model.language_model.layers:
-            attn = layer.self_attn
-            for src, dst in [
-                (attn.q_proj_action, attn.q_proj_g1),
-                (attn.k_proj_action, attn.k_proj_g1),
-                (attn.v_proj_action, attn.v_proj_g1),
-                (attn.o_proj_action, attn.o_proj_g1),
-                (attn.q_norm_action, attn.q_norm_g1),
-                (attn.k_norm_action, attn.k_norm_g1),
-            ]:
-                dst.load_state_dict(src.state_dict())
-                copied += 1
-            layer.mlp_g1.load_state_dict(layer.mlp_action.state_dict())
-            layer.input_layernorm_g1.load_state_dict(layer.input_layernorm_action.state_dict())
-            layer.post_attention_layernorm_g1.load_state_dict(
-                layer.post_attention_layernorm_action.state_dict(),
-            )
-            copied += 3
-        # Top-level companions: timestep + final norm. Embedder/head have
-        # different shapes so keep their original init.
-        self.model.t_embedder_g1.load_state_dict(self.model.t_embedder.state_dict())
-        self.model.norm_action_g1.load_state_dict(self.model.norm_action.state_dict())
-        copied += 2
-        overwatch.info(f"Initialized G1 expert from SONIC expert ({copied} tensors).")
-        return copied
-
-    def freeze_for_post_train(self) -> tuple[int, int]:
-        """Freeze everything except the SONIC + G1 experts (and proprio inputs).
-
-        Returns ``(n_trainable, n_total)``. The freezable list mirrors the
-        post-train design: visual tower, text embeddings, latent decoder
-        path, and the LM head are frozen; only the per-layer ``*_action`` /
-        ``*_g1`` projections + MLPs + layernorms and the top-level action /
-        G1 modules remain trainable.
-        """
-        from src.models.mot_kappa import MoTKappaModel
-        if not isinstance(self.model, MoTKappaModel):
-            raise RuntimeError("freeze_for_post_train requires convert_to_mot first")
-
-        trainable_substrings = (
-            "_action",          # per-layer SONIC副本 and final norm/head
-            "_g1",              # per-layer G1副本 and top-level
-            "action_embedder",  # sonic embedder (top-level)
-            "t_embedder",       # both t_embedder + t_embedder_g1
-            "velocity_head",    # both velocity_head + velocity_head_g1
-            "norm_action",      # final norms (both experts)
-            "proprio_embedder", # latent-prefix proprio Linear (no _g1 suffix)
-        )
-        n_total = 0
-        n_trainable = 0
-        for name, param in self.model.named_parameters():
-            n_total += 1
-            keep = any(sub in name for sub in trainable_substrings)
-            param.requires_grad = bool(keep)
-            if keep:
-                n_trainable += 1
-        overwatch.info(
-            f"Post-train freeze: {n_trainable}/{n_total} tensors trainable."
-        )
-        return n_trainable, n_total
 
     def _apply_lora(self, lora_config):
         """Apply LoRA to the model."""

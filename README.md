@@ -28,31 +28,28 @@ mkdir -p sonic
 ## 🚀 Training
 
 ```
-# Stage 1-1: Pre-Train on EgoDex
+# Stage 1: Pre-Train on EgoDex
 uv run python scripts/preprocess/egodex/build_index.py
-tmux new -s pretrain_egodex -d "script -q -c './scripts/train/pretrain_kappa.sh --stage egodex' pretrain_egodex.log"
+tmux new -s pretrain_egodex -d "script -q -c './scripts/train/train_kappa.sh pretrain_egodex_kappa_config' pretrain_egodex.log"
 
-# Stage 1-2: Pre-Train on Humanoid-Everyday G1 + G1-WBT
+# Stage 2: Post-Train on Humanoid-Everyday G1 + G1-WBT (SONIC tokens + RTC)
 uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
-tmux new -s calc_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
+tmux new -s calc_he_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
 tmux new -s calc_wbt_sonic -d "uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py"
-tmux new -s pretrain_he_wbt -d "script -q -c './scripts/train/pretrain_kappa.sh --stage he_wbt' pretrain_he_wbt.log"
+tmux new -s posttrain_he_wbt -d "script -q -c './scripts/train/train_kappa.sh posttrain_he_wbt_kappa_config' posttrain_he_wbt.log"
 
-# Stage 2: Post-Train on Humanoid-Everyday G1 + G1-WBT
-tmux new -s posttrain_he_wbt -d "script -q -c './scripts/train/posttrain_kappa.sh' posttrain_he_wbt.log"
+# Stage 3: Fine-Tune on Proprietary Data (SONIC tokens)
+tmux new -s calc_prop_sonic -d "uv run python scripts/preprocess/proprietary/calc_sonic_tokens.py"
+tmux new -s finetune_prop -d "script -q -c './scripts/train/train_kappa.sh finetune_prop_ep_kappa_config' finetune_prop.log"
 
-# Stage 3: Fine-Tune on Proprietary Data
-tmux new -s finetune_prop -d "script -q -c './scripts/train/finetune_kappa.sh' finetune_prop.log"
-
-# tmux new -s train_kappa -d "script -q -c './scripts/train/train_kappa.sh' train_kappa.log"
-
-tmux new -s train_kappa -d "script -q -c './scripts/train/train_kappa.sh --from posttrain --pretrained-weights .runs/kappa/exp.kappa.b1024.gpus8.2605100801' train_kappa_resume.log"
+# Or run the full chain (pretrain -> posttrain -> finetune) end-to-end:
+tmux new -s run_kappa -d "script -q -c './scripts/train/run_kappa.sh' run_kappa.log"
 ```
 
 ## 🎯 Evaluation
 
 ```
-uv run python scripts/eval/sim_validate.py --heads gt_wbc g1_expert_wbc --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
+uv run python scripts/eval/sim_validate.py --heads gt_wbc sonic --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
 ```
 
 ## ❤️ Acknowledgment
