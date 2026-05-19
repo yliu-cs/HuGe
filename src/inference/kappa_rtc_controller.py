@@ -51,10 +51,12 @@ class RealTimeChunkController:
         processor,
         scheduler,
         cfg,
-        ctrl_hz: float = 30.0,
+        ctrl_hz: float = 50.0,
         s_min: int = 15,
         delay_buffer_size: int = 6,
         d_init: int = 6,
+        proprio_min: Optional[np.ndarray] = None,
+        proprio_max: Optional[np.ndarray] = None,
     ):
         self.model = model
         self.processor = processor
@@ -69,6 +71,22 @@ class RealTimeChunkController:
         self.ctrl_period = 1.0 / float(ctrl_hz)
         self.s_min = int(s_min)
         self.Q: deque[int] = deque([int(d_init)] * delay_buffer_size, maxlen=delay_buffer_size)
+
+        # Training normalized proprio to [-1, 1] via q01/q99 bounds; mirror that
+        # here so the deployed model sees the same distribution. When stats are
+        # not supplied, raw values pass through (only safe if the upstream
+        # already normalized).
+        if proprio_min is not None and proprio_max is not None:
+            self.proprio_min = np.asarray(proprio_min, dtype=np.float32)
+            self.proprio_max = np.asarray(proprio_max, dtype=np.float32)
+            if self.proprio_min.shape != (self.PROPRIO_DIM,) or self.proprio_max.shape != (self.PROPRIO_DIM,):
+                raise ValueError(
+                    f"proprio bounds shape mismatch: expected ({self.PROPRIO_DIM},), "
+                    f"got min={self.proprio_min.shape} max={self.proprio_max.shape}"
+                )
+        else:
+            self.proprio_min = None
+            self.proprio_max = None
 
         # Shared state.
         self._lock = threading.Lock()
@@ -315,4 +333,8 @@ class RealTimeChunkController:
             raise ValueError(
                 f"Expected proprio shape ({self.PROPRIO_DIM},), got {arr.shape}"
             )
+        if self.proprio_min is not None:
+            rng = self.proprio_max - self.proprio_min
+            arr = (arr - self.proprio_min) / rng * 2.0 - 1.0
+            np.clip(arr, -1.0, 1.0, out=arr)
         return torch.from_numpy(arr).to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1)

@@ -7,20 +7,35 @@ via WebSocket and send periodic observation packets:
     {
         "image":   <base64 PNG bytes>,
         "text":    "perform the task",
-        "proprio": <list of 64 floats>,
+        "proprio": <list of 64 floats — RAW, server normalizes>,
     }
 
-The server runs an internal control loop at ``ctrl_hz`` (default 30 Hz) and
-streams the most-recent SONIC token vector as JSON:
+Proprio layout matches the training cache (``calc_sonic_tokens.py``):
+
+    proprio[ 0:29] = jp        (rad, MuJoCo joint order)
+    proprio[29:31] = hand_bits (binary 0/1; zeroed for fake-hand datasets)
+    proprio[31:60] = jv        (rad/s, finite-diff of jp at 50 Hz)
+    proprio[60:64] = quat_xyzw (pelvis orientation)
+
+The server normalizes proprio internally using the cached ``q01``/``q99``
+bounds (``--proprio-stats``) — clients send raw values.
+
+The control loop runs at ``ctrl_hz`` (default 50 Hz, matching the deploy
+SONIC decoder's ``control_dt_ = 0.02 s``) and streams the most-recent SONIC
+token vector as JSON:
 
     {"version": <int>, "sonic": [66 floats]}
 
-Downstream clients run the SONIC decoder ONNX to recover joint targets.
+The downstream client runs the SONIC ONNX decoder
+(``resource/model/sonic/model_decoder.onnx``) with the live robot state
+history to recover the 29-D IsaacLab action, then reorders to MuJoCo joint
+order and feeds the PD controller. The 2 trailing hand bits go to a
+separate gripper controller.
 
 Run via:
 
     .venv/bin/python -m src.inference.kappa_serve_rtc \\
-        --weights .runs/kappa/<post-train>/checkpoints/ckpt_<step>/model.safetensors \\
+        --weights .runs/kappa/<finetune>/checkpoints/ckpt_<step>/model.safetensors \\
         --backbone resource/model/Qwen3-VL-2B-Instruct
 """
 from __future__ import annotations
@@ -84,6 +99,27 @@ def _load_json(path: Optional[str]) -> Optional[dict]:
         return json.load(f)
 
 
+def _load_proprio_bounds(
+    stats_path: str, mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read q01/q99 (or min/max) for the 64-D proprio. Mirrors
+    :meth:`src.eval.kappa_policy.KappaPolicy._load_stats`.
+    """
+    with open(stats_path) as f:
+        pstats = json.load(f).get("proprio", {})
+    if mode == "bounds":
+        lo_key, hi_key = "min", "max"
+    elif mode == "bounds_q99":
+        lo_key, hi_key = "q01", "q99"
+    else:
+        raise ValueError(f"unknown normalize_mode {mode!r}")
+    lo = np.asarray(pstats[lo_key], dtype=np.float32)
+    hi = np.asarray(pstats[hi_key], dtype=np.float32)
+    ill = np.abs(hi - lo) < 1e-4 * (np.abs(hi) + np.abs(lo) + 1e-8)
+    hi = np.where(ill, lo + 1.0, hi)
+    return lo, hi
+
+
 def _decode_image(payload: dict[str, Any]) -> Image.Image:
     raw = payload["image"]
     if isinstance(raw, str):
@@ -104,7 +140,7 @@ class Server:
     def __init__(
         self,
         controller_factory,
-        ctrl_hz: float = 30.0,
+        ctrl_hz: float = 50.0,
     ):
         self.controller_factory = controller_factory
         self.ctrl_period = 1.0 / float(ctrl_hz)
@@ -240,6 +276,17 @@ def _build_controller(args, wrapper, cfg, device):
         num_train_timesteps=getattr(cfg, "num_train_timesteps", 1000),
     )
 
+    if args.use_proprio:
+        proprio_min, proprio_max = _load_proprio_bounds(
+            args.proprio_stats, args.normalize_mode,
+        )
+        print(
+            f"[serve] loaded proprio bounds ({args.normalize_mode}) from "
+            f"{args.proprio_stats}"
+        )
+    else:
+        proprio_min, proprio_max = None, None
+
     def factory():
         return RealTimeChunkController(
             model=wrapper.model,
@@ -248,6 +295,8 @@ def _build_controller(args, wrapper, cfg, device):
             cfg=cfg,
             ctrl_hz=args.ctrl_hz,
             s_min=args.s_min,
+            proprio_min=proprio_min,
+            proprio_max=proprio_max,
         )
 
     return factory
@@ -259,10 +308,29 @@ def main() -> None:
     parser.add_argument("--backbone", default="resource/model/Qwen3-VL-2B-Instruct")
     parser.add_argument("--use-proprio", action="store_true", default=True)
     parser.add_argument("--no-proprio", dest="use_proprio", action="store_false")
+    parser.add_argument(
+        "--proprio-stats",
+        default="resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json",
+        help="Path to the q01/q99 stats JSON used at training time. Required "
+             "when --use-proprio (default) is on; the server uses it to map "
+             "raw client proprio into the [-1, 1] band the model was trained on.",
+    )
+    parser.add_argument(
+        "--normalize-mode",
+        default="bounds_q99",
+        choices=["bounds_q99", "bounds"],
+        help="Must match the training-time data.normalize_mode. bounds_q99 "
+             "reads q01/q99 (Kappa default); bounds reads min/max.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--ctrl-hz", type=float, default=30.0)
+    parser.add_argument(
+        "--ctrl-hz", type=float, default=50.0,
+        help="Control-loop rate. Defaults to 50 Hz to match the deploy SONIC "
+             "decoder's training control_dt=0.02s and the 50 Hz token timeline "
+             "the model was trained on.",
+    )
     parser.add_argument("--s-min", type=int, default=15)
     args = parser.parse_args()
 

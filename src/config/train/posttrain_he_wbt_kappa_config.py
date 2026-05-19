@@ -73,7 +73,7 @@ class PostTrainHEWBTLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        num_train_epochs=1,
+        num_train_epochs=3,
         train_batch_size=128,
         gradient_accumulation_steps=1,
         num_workers=8,
@@ -83,7 +83,7 @@ class PostTrainHEWBTLaunchConfig(LaunchConfig):
         # and one-batch-per-episode access turns it into next-frame decodes.
         block_shuffle_size=64,
         frame_cache_size=2,
-        checkpointing_steps=3000,
+        checkpointing_steps=10000,
         max_checkpoints_to_keep=5,
         validation_steps=0,
         mixed_precision="bf16",

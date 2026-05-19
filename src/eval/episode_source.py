@@ -36,10 +36,11 @@ class HEEpisode:
     video_path: Path
     instruction: str
     n_frames: int
+    video_fps: float = HE_VIDEO_FPS
 
     @property
     def duration_s(self) -> float:
-        return self.n_frames / HE_VIDEO_FPS
+        return self.n_frames / self.video_fps
 
 
 class HEEpisodeSource:
@@ -52,11 +53,21 @@ class HEEpisodeSource:
         self,
         data_root: str | Path = "resource/dataset/humanoid-everyday",
         proprio_cache_root: str | Path = "resource/dataset/humanoid-everyday-cache/g1_proprio",
+        sonic_tokens_root: str | Path | None = None,
         robot_type: str = "g1",
         seed: int = 0,
     ):
         self.data_root = Path(data_root)
         self.proprio_cache_root = Path(proprio_cache_root)
+        # SONIC token cache lives next to ``g1_proprio`` by default
+        # (``<cache-root>/sonic_tokens/episode_NNNNNN.npy`` per
+        # ``calc_sonic_tokens.py``). Lazily mmap'd on first read.
+        self.sonic_tokens_root = (
+            Path(sonic_tokens_root)
+            if sonic_tokens_root is not None
+            else self.proprio_cache_root.parent / "sonic_tokens"
+        )
+        self._sonic_mmap: dict[int, np.ndarray] = {}
         # Lazy per-episode pelvis pose cache. Built on first ``pelvis_pose_at``
         # call by reading the parquet's ``observation.odometry.{position,quat}``
         # at 30 Hz and upsampling to the 50 Hz token timeline. Not part of
@@ -137,6 +148,31 @@ class HEEpisodeSource:
         idx = int(round(t_seconds * HE_PROPRIO_FPS))
         idx = max(0, min(idx, arr.shape[0] - 1))
         return np.asarray(arr[idx], dtype=np.float32)  # copy out of mmap
+
+    def sonic_token_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
+        """Return the cached 66-D SONIC token at the frame closest to
+        ``t_seconds`` (50 Hz timeline). Layout matches
+        ``sonic_tokens/episode_NNNNNN.npy``: ``[latent(64) | hand_bits(2)]``.
+
+        Used by the GT-SONIC eval head to drive the SonicDecoder with
+        training-time tokens (model-free upper bound on what the same
+        decoder + sim infrastructure can achieve).
+        """
+        ep = int(episode_index)
+        arr = self._sonic_mmap.get(ep)
+        if arr is None:
+            path = self.sonic_tokens_root / f"episode_{ep:06d}.npy"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Missing cached SONIC tokens for episode {ep}: {path}. "
+                    f"Re-run scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py "
+                    f"or pass --sonic-tokens-root."
+                )
+            arr = np.load(str(path), mmap_mode="r")
+            self._sonic_mmap[ep] = arr
+        idx = int(round(t_seconds * HE_PROPRIO_FPS))
+        idx = max(0, min(idx, arr.shape[0] - 1))
+        return np.asarray(arr[idx], dtype=np.float32)
 
     def pelvis_pose_at(self, episode_index: int, t_seconds: float) -> np.ndarray:
         """Return the dataset's pelvis pose at sim time ``t_seconds``.

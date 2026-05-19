@@ -47,22 +47,80 @@ JOINT_NAMES_29: tuple[str, ...] = (
 )
 
 
-# PD gains taken from gear_sonic's MuJoCo G1 sim config (g1_29dof_sonic_model12).
-DEFAULT_KP = np.array([
-    150, 150, 150, 200, 40, 40,
-    150, 150, 150, 200, 40, 40,
-    250, 250, 250,
-    100, 100, 40, 40, 20, 20, 20,
-    100, 100, 40, 40, 20, 20, 20,
-], dtype=np.float64)
+# PD gains + armature aligned to the SONIC RL training-time IsaacLab config
+# (``humanoid everyday/GR00T-WholeBodyControl/gear_sonic/envs/manager_env/
+# robots/g1.py``  →  ``G1_CYLINDER_MODEL_12_DEX_CFG``). The base formula is the
+# BeyondMimic / Unitree motor design point::
+#
+#     stiffness = armature * (10 * 2π)²        # natural freq 10 Hz
+#     damping   = 4 * armature * (10 * 2π)     # damping ratio 2 (overdamped)
+#
+# Critically, ``feet`` (ankle pitch/roll) and ``waist`` (waist roll/pitch) use
+# a 2× multiplier on stiffness/damping/armature in the training config — the
+# 10 Hz natural frequency is preserved, but the actuator becomes 2× stiffer at
+# its training point. The single-multiplier ``policy_parameters.hpp`` values
+# from the deploy reference give *the same per-joint action_scale* (because
+# the deploy halves both ``stiffness`` and ``effort_limit`` and ``0.25·E/S``
+# cancels), but they apply *half the PD torque* on the joint for the same
+# position error. The decoder was trained against the 2× stiff feet/waist —
+# leaving those at 1× makes the foot/COP under-respond, which is the dominant
+# residual contributor to base/yaw drift in our sim.
+#
+# Similarly, per-motor armature is intentionally non-uniform in training to
+# keep all joints at the same 10 Hz natural frequency. Our previous uniform
+# ``armature = 0.01`` injection collapsed that — hip_pitch/knee became 16 Hz
+# (too fast) while ankles and wrists fell to 6 Hz (too slow). Now we apply
+# motor-specific armature (with the 2× factor on feet/waist) so every joint
+# matches the training-time ω_n = 10 Hz.
+_NATURAL_FREQ = 10.0 * 2.0 * np.pi
+_DAMPING_RATIO = 2.0
+_ARMATURE = {
+    "5020": 0.003609725,
+    "7520_14": 0.010177520,
+    "7520_22": 0.025101925,
+    "4010": 0.00425,
+}
+_STIFFNESS = {k: a * _NATURAL_FREQ * _NATURAL_FREQ for k, a in _ARMATURE.items()}
+_DAMPING = {k: 2.0 * _DAMPING_RATIO * a * _NATURAL_FREQ for k, a in _ARMATURE.items()}
 
-DEFAULT_KD = np.array([
-    2, 2, 2, 4, 2, 2,
-    2, 2, 2, 4, 2, 2,
-    5, 5, 5,
-    5, 5, 2, 2, 2, 2, 2,
-    5, 5, 2, 2, 2, 2, 2,
-], dtype=np.float64)
+# Motor type per MuJoCo joint (same ordering as ``JOINT_NAMES_29``):
+# legs ×2 = [hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll]
+# waist = [yaw, roll, pitch]
+# arms ×2 = [shoulder_p, shoulder_r, shoulder_y, elbow, wrist_r, wrist_p, wrist_y]
+_MOTOR_BY_JOINT = (
+    "7520_22", "7520_22", "7520_14", "7520_22", "5020", "5020",
+    "7520_22", "7520_22", "7520_14", "7520_22", "5020", "5020",
+    "7520_14", "5020", "5020",
+    "5020", "5020", "5020", "5020", "5020", "4010", "4010",
+    "5020", "5020", "5020", "5020", "5020", "4010", "4010",
+)
+# Joints whose ``ImplicitActuatorCfg`` group in training applies a 2× factor:
+# the ``feet`` group (ankle pitch+roll) and the ``waist`` group (waist roll +
+# pitch, NOT waist_yaw which is its own 7520_14 group at 1×).
+_FEET_WAIST_DOUBLE_INDICES: tuple[int, ...] = (4, 5, 10, 11, 13, 14)
+
+
+def _per_joint_multiplier() -> np.ndarray:
+    mult = np.ones(29, dtype=np.float64)
+    for i in _FEET_WAIST_DOUBLE_INDICES:
+        mult[i] = 2.0
+    return mult
+
+
+_PD_MULTIPLIER = _per_joint_multiplier()
+DEFAULT_KP = np.array(
+    [_STIFFNESS[m] for m in _MOTOR_BY_JOINT], dtype=np.float64,
+) * _PD_MULTIPLIER
+DEFAULT_KD = np.array(
+    [_DAMPING[m] for m in _MOTOR_BY_JOINT], dtype=np.float64,
+) * _PD_MULTIPLIER
+
+# Per-joint armature (used by ``_inject_joint_dynamics``). Indexed by joint
+# name; the ×2 group keeps ω_n at 10 Hz despite the doubled stiffness.
+_ARMATURE_BY_JOINT_NAME: dict[str, float] = {
+    name: _ARMATURE[motor] * (2.0 if i in _FEET_WAIST_DOUBLE_INDICES else 1.0)
+    for i, (name, motor) in enumerate(zip(JOINT_NAMES_29, _MOTOR_BY_JOINT))
+}
 
 
 # G1 default standing pose, in the same 29-D MuJoCo joint order as above.
@@ -137,27 +195,33 @@ def _look_at_quat_wxyz(cam_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.array([w, x, y, z], dtype=np.float64)
 
 
-# Joint dynamics taken verbatim from the per-class defaults in the older
-# ``g1_29dof_old.xml`` (the one ``gear_sonic`` actually trains and validates
-# SONIC against). Wrists used ``frictionloss=0.1`` instead of 0.2 there.
-_DEFAULT_ARMATURE = 0.01
+# Per-class joint damping + frictionloss from the older ``g1_29dof_old.xml``
+# defaults. Damping here is the MJCF *static* joint damping (always-on, applied
+# automatically by MuJoCo every substep, independent of the actuator PD). We
+# keep it at the same constant 0.05 that both the deploy XML and the BeyondMimic
+# URDF use; the joint-specific actuator damping comes from ``DEFAULT_KD`` and
+# is applied separately in ``_apply_pd_torque``.
 _DEFAULT_DAMPING = 0.05
 _DEFAULT_FRICTIONLOSS = 0.2
 _WRIST_FRICTIONLOSS = 0.1
+# Fallback armature for any hinge joint not in ``_ARMATURE_BY_JOINT_NAME``
+# (e.g. hand fingers in the with-hand model). Matches the legacy uniform
+# value the file shipped with for unmapped joints.
+_FALLBACK_ARMATURE = 0.01
 
 
 def _inject_joint_dynamics(spec: mujoco.MjSpec) -> None:
-    """Apply armature/damping/frictionloss to every hinge joint in ``spec``.
+    """Apply per-joint armature, MJCF damping, and frictionloss.
 
-    Skips the free root joint (no scalar dof). Values mirror the
-    ``<default class="leg_motor"/arm_motor/...>`` block of
-    ``g1_29dof_old.xml`` so the joint dynamics match the model SONIC was
-    trained on.
+    Armature is keyed per joint to match the IsaacLab training-time motor
+    config (``_ARMATURE_BY_JOINT_NAME``). Skips the free root joint.
+    Unmapped hinge joints fall back to ``_FALLBACK_ARMATURE = 0.01`` so
+    auxiliary models (with-hand etc.) still compile.
     """
     for joint in spec.joints:
         if joint.type != mujoco.mjtJoint.mjJNT_HINGE:
             continue
-        joint.armature = _DEFAULT_ARMATURE
+        joint.armature = _ARMATURE_BY_JOINT_NAME.get(joint.name, _FALLBACK_ARMATURE)
         # ``damping`` is exposed as a 3-vector for SDF compatibility; hinge
         # only consumes element 0.
         joint.damping[0] = _DEFAULT_DAMPING
