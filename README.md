@@ -5,7 +5,8 @@ claude --resume 31ae9900-a7da-415e-8a42-71657ececc36
 ## 🏠 Installation
 
 ```
-git clone https://github.com/yliu-cs/Kappa.git
+git clone --recurse-submodules https://github.com/yliu-cs/Kappa.git
+# (or, after a plain clone: `git submodule update --init --recursive`)
 cd Kappa
 uv sync
 uv pip install flash_attn==2.7.4.post1 --no-build-isolation
@@ -96,9 +97,50 @@ uv run python scripts/eval/sim_validate.py \
 
 `version` monotonically increases each control tick (1/50 s). The 66-D vector is `[sonic_latent(64) | hand_bits(2)]`.
 
+### One-command launch (tmux orchestrator)
+
+The four-terminal stack (Kappa server, WBC C++ deploy, bridge, keyboard) is bundled into a single tmux session by `scripts/deploy/run_kappa_deploy.sh`. The bridge (`scripts/deploy/run_kappa_inference.py`) plays the role of GR00T's `run_vla_inference.py`: it reads camera + state ZMQ, drives the Kappa WebSocket at 50 Hz, expands the server's 2 hand-bits into 7-DoF left/right hand joints via `G1GripperInverseKinematicsSolver`, and publishes Protocol-v4 `pose` messages on the action ZMQ socket consumed by `gear_sonic_deploy`.
+
+```bash
+KAPPA_CKPT=.runs/kappa/<finetune-run>/checkpoints/ckpt_<step>/model.safetensors \
+./scripts/deploy/run_kappa_deploy.sh
+tmux attach -t kappa_deploy
+```
+
+tmux windows (`Ctrl-b n` / `Ctrl-b p` to cycle, `Ctrl-b d` to detach):
+
+1. `serve`  — `src.inference.kappa_serve_rtc` on port 8765
+2. `wbc`    — `GR00T-WholeBodyControl/gear_sonic_deploy/deploy.sh --input-type zmq_manager real`
+3. `bridge` — Kappa ↔ WBC bridge; auto-reconnects to the server with exponential backoff
+4. `kbd`    — interactive keyboard publisher (ZMQ PUB on 5580)
+
+Keyboard window controls:
+
+| Key | Effect |
+| --- | ------ |
+| `p` | pause / resume bridge inference loop |
+| `k` | start / stop C++ control loop (PLANNER mode) |
+| `i` | send initial pose; switch to POSE mode; reset frame counter |
+| `[` / `]` | toggle initial-pose left / right hand closed |
+| `t` | enter a new language prompt (line entry; publishes `prompt:<text>`) |
+| `c` / `s` / `f` | start / stop-success / stop-failure recording (data exporter) |
+| `q` | quit the keyboard publisher only |
+
+Stop everything: `tmux kill-session -t kappa_deploy`. Per-window logs land in `.runs/deploy/<timestamp>/{serve,wbc,bridge,kbd}.log`.
+
+Env vars accepted by the orchestrator (defaults shown in the script):
+
+- **Required**: `KAPPA_CKPT`
+- **Model**: `KAPPA_BACKBONE`, `KAPPA_PROPRIO_STATS`, `KAPPA_DEVICE`, `WS_PORT`, `KAPPA_HOST`, `CTRL_HZ`
+- **WBC**: `WBC_MODE` (`real` or `sim`), `WBC_INPUT_TYPE`
+- **ZMQ wiring**: `CAMERA_HOST`/`CAMERA_PORT`, `STATE_HOST`/`STATE_PORT`, `ACTION_HOST`/`ACTION_PORT`, `KEYBOARD_HOST`/`KEYBOARD_PORT`
+- **Bridge**: `WS_CLIENT_HOST`, `BRIDGE_PROMPT`
+
+Smoke testing without hardware: set `WBC_MODE=sim` to swap the C++ deploy into MuJoCo loopback mode (same Protocol-v4 wire format, no robot). For pure server validation, run the bridge by hand with `--dry-run` to print packed action diagnostics instead of publishing ZMQ.
+
 ## ❤️ Acknowledgment
 
-We sincerely thank [Psi0](https://github.com/physical-superintelligence-lab/Psi0), and [LaST​$_0$​](https://github.com/ZhuoyangLiu2005/last0) for their excellent code implementations.
+We sincerely thank [Psi0](https://github.com/physical-superintelligence-lab/Psi0), [LaST​0​](https://github.com/ZhuoyangLiu2005/last0), [GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl), and [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) for their excellent code implementations.
 
 ## 📜 Citation
 

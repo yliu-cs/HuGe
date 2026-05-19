@@ -22,6 +22,14 @@ dependencies = [
     "decord>=0.6.0",
     "gpustat>=1.1.1",
     "mediapy>=1.2.6",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=13.0",
+    "pyzmq>=26.0",
+    "msgpack>=1.0",
+    "msgpack-numpy>=0.4.8",
+    "opencv-python>=4.10.0",
+    "gear_sonic",
 ]
 
 [build-system]
@@ -30,3 +38,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.uv.sources]
+gear_sonic = { path = "GR00T-WholeBodyControl/gear_sonic", editable = true }
+
+[tool.uv]
+override-dependencies = [
+    "numpy>=1.26,<3",
+    "scipy>=1.14",
+]
