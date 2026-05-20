@@ -41,7 +41,7 @@ import onnxruntime as ort
 # Joint mapping arrays
 # ---------------------------------------------------------------------------
 # Both copied verbatim from
-# humanoid everyday/.../gear_sonic_deploy/.../include/policy_parameters.hpp.
+# GR00T-WholeBodyControl/gear_sonic_deploy/.../include/policy_parameters.hpp.
 # The naming convention mirrors the C++ side:
 #   ``isaaclab_to_mujoco[i]`` — given a MuJoCo index ``i``, returns the
 #       corresponding IsaacLab index (i.e., values are IsaacLab indices,

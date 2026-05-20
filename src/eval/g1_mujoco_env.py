@@ -48,7 +48,7 @@ JOINT_NAMES_29: tuple[str, ...] = (
 
 
 # PD gains + armature aligned to the SONIC RL training-time IsaacLab config
-# (``humanoid everyday/GR00T-WholeBodyControl/gear_sonic/envs/manager_env/
+# (``GR00T-WholeBodyControl/gear_sonic/envs/manager_env/
 # robots/g1.py``  →  ``G1_CYLINDER_MODEL_12_DEX_CFG``). The base formula is the
 # BeyondMimic / Unitree motor design point::
 #
@@ -134,15 +134,14 @@ DEFAULT_QPOS = np.array([
 ], dtype=np.float64)
 
 
-# Path to the G1 MJCF shipped with the GR00T-WholeBodyControl repo bundled
-# under ``humanoid everyday/``. We embed-include it from a generated scene
-# that adds a ground, light, and ego camera.
+# Path to the G1 MJCF shipped with the top-level GR00T-WholeBodyControl
+# submodule. We embed-include it from a generated scene that adds a ground,
+# light, and ego camera.
 def _default_g1_xml_path() -> Path:
     here = Path(__file__).resolve()
     repo = here.parent.parent.parent
     return (
         repo
-        / "humanoid everyday"
         / "GR00T-WholeBodyControl"
         / "gear_sonic_deploy"
         / "g1"

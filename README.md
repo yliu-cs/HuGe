@@ -1,12 +1,10 @@
 # $\kappa_{0}$: A Foundation Vision-Language-Action Model for General Humanoid Robot Loco-Manipulation Control
 
-claude --resume 31ae9900-a7da-415e-8a42-71657ececc36
-
 ## 🏠 Installation
 
 ```
+git lfs install
 git clone --recurse-submodules https://github.com/yliu-cs/Kappa.git
-# (or, after a plain clone: `git submodule update --init --recursive`)
 cd Kappa
 uv sync
 uv pip install flash_attn==2.7.4.post1 --no-build-isolation
@@ -63,7 +61,7 @@ uv run python scripts/eval/sim_validate.py \
 ### Start the server
 
 ```
-.venv/bin/python -m src.inference.kappa_serve_rtc \
+uv run python -m src.inference.kappa_serve_rtc \
   --weights .runs/kappa/<finetune-run>/checkpoints/ckpt_<step>/model.safetensors \
   --backbone resource/model/Qwen3-VL-2B-Instruct \
   --proprio-stats resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json \

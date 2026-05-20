@@ -890,14 +890,14 @@ def main() -> None:
                          "position tracking — no WBC.")
     ap.add_argument(
         "--wbc-balance-onnx",
-        default=str(ROOT / "humanoid everyday/GR00T-WholeBodyControl/decoupled_wbc/"
+        default=str(ROOT / "GR00T-WholeBodyControl/decoupled_wbc/"
                     "sim2mujoco/resources/robots/g1/policy/"
                     "GR00T-WholeBodyControl-Balance.onnx"),
         help="Path to the GR00T WBC Balance ONNX (used when ||loco_cmd|| <= 0.05).",
     )
     ap.add_argument(
         "--wbc-walk-onnx",
-        default=str(ROOT / "humanoid everyday/GR00T-WholeBodyControl/decoupled_wbc/"
+        default=str(ROOT / "GR00T-WholeBodyControl/decoupled_wbc/"
                     "sim2mujoco/resources/robots/g1/policy/"
                     "GR00T-WholeBodyControl-Walk.onnx"),
         help="Path to the GR00T WBC Walk ONNX (used when ||loco_cmd|| > 0.05).",
