@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# One-command launcher for the Kappa real-robot deploy stack.
+# Manual launcher helper for the Kappa real-robot deploy stack.
 #
-# Spins up four tmux windows in a session named `kappa_deploy`:
+# This script no longer spawns tmux panes or auto-presses keys. It runs the
+# pre-flight checks + port reclaim, then prints four commands. The operator
+# opens four terminals and runs one command in each:
 #   1. serve  — Kappa WebSocket inference server (src.inference.kappa_serve_rtc)
 #   2. wbc    — WBC C++ deploy (gear_sonic_deploy/deploy.sh --input-type zmq_manager real)
 #   3. bridge — Kappa <-> WBC bridge (scripts/deploy/run_kappa_inference.py)
 #   4. kbd    — Keyboard publisher (scripts/deploy/keyboard_pub.py)
 #
-# Each window is wrapped with `script -q -c "..." <log>` so the pane output is
-# mirrored to .runs/deploy/<timestamp>/<window>.log for later inspection.
+# All confirmations are manual:
+#   y in wbc pane    — confirm "Proceed with deployment? [Y/n]:"
+#   k in kbd pane    — start C++ control loop in PLANNER mode (MOTORS ENGAGE)
+#   i in kbd pane    — publish LATENT_INITIAL_MOTION_TOKEN + switch to POSE mode
+#   p in kbd pane    — unpause the bridge tick loop
 #
 # Required:
 #   KAPPA_CKPT — absolute or repo-relative path to the Fine-Tune model.safetensors
@@ -19,7 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:?must set KAPPA_CKPT to Fine-Tune model.safetensors path}"
+: "${KAPPA_CKPT:=.runs/kappa/exp.kappa.b1024.gpus8.2605181229/checkpoints/ckpt_5000/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
 : "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
 : "${KAPPA_HOST:=0.0.0.0}"
@@ -31,7 +36,10 @@ cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 : "${WBC_INPUT_TYPE:=zmq_manager}"
 
 : "${WS_CLIENT_HOST:=localhost}"    # how the bridge reaches the server
-: "${CAMERA_HOST:=localhost}"
+# Real-robot deploy: camera frames are always published by the G1 itself,
+# never localhost. Default to the standard Unitree G1 IP; override if your
+# robot lives elsewhere on the LAN.
+: "${CAMERA_HOST:=192.168.123.164}"
 : "${CAMERA_PORT:=5555}"
 : "${STATE_HOST:=localhost}"
 : "${STATE_PORT:=5557}"
@@ -39,20 +47,9 @@ cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 : "${ACTION_PORT:=5556}"
 : "${KEYBOARD_HOST:=localhost}"
 : "${KEYBOARD_PORT:=5580}"
-: "${BRIDGE_PROMPT:=perform the task}"
+: "${BRIDGE_PROMPT:=Walk to the table and push the scotch tape to the blue tape}"
 
-: "${SESSION:=kappa_deploy}"
-
-# ---------- session guard ----------
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    cat >&2 <<EOF
-[deploy] tmux session '$SESSION' already exists.
-         attach:  tmux attach -t $SESSION
-         restart: tmux kill-session -t $SESSION && $0
-EOF
-    exit 1
-fi
-
+# ---------- pre-flight ----------
 if [[ ! -x .venv/bin/python ]]; then
     echo "[deploy] .venv/bin/python not found. Run \`uv sync\` first." >&2
     exit 1
@@ -61,14 +58,69 @@ if [[ ! -x GR00T-WholeBodyControl/gear_sonic_deploy/deploy.sh ]]; then
     echo "[deploy] WBC deploy.sh not found / not executable." >&2
     exit 1
 fi
+if [[ ! -f "$KAPPA_CKPT" ]]; then
+    echo "[deploy] KAPPA_CKPT not found: $KAPPA_CKPT" >&2
+    exit 1
+fi
 
-LOGDIR=.runs/deploy/$(date +%Y%m%d_%H%M%S)
-mkdir -p "$LOGDIR"
-echo "[deploy] logs -> $LOGDIR"
+# ---------- reclaim ports and orphan processes from prior runs ----------
+# Port-bound holders (serve/bridge/kbd) from a prior run can survive across
+# launches and the next start dies on EADDRINUSE. Mirrors the cleanup step
+# in scripts/eval/run_kappa_sim_test.sh, minus the sim-only entries.
+#
+# We deliberately do NOT touch the WBC C++ deploy binary here: on real
+# hardware it may still be holding motor PD state, and an unattended pkill
+# is more dangerous than letting the next launch fail loudly. If a stale
+# C++ deploy is running, the operator should kill it explicitly.
+#
+# Skip the whole step with SKIP_PORT_RECLAIM=1 (e.g. if you intentionally
+# started something on these ports outside this script and want it alive).
+if [[ "${SKIP_PORT_RECLAIM:-0}" != "1" ]]; then
+    PORTS_TO_RECLAIM=("$WS_PORT" "$ACTION_PORT" "$STATE_PORT" "$KEYBOARD_PORT")
+    need_kill=0
+    for port in "${PORTS_TO_RECLAIM[@]}"; do
+        pids=$(fuser "$port/tcp" 2>/dev/null | tr -s ' ' || true)
+        if [[ -n "$pids" ]]; then
+            echo "[deploy] reclaiming port $port (pids:$pids)" >&2
+            fuser -k -TERM "$port/tcp" >/dev/null 2>&1 || true
+            need_kill=1
+        fi
+    done
+    if (( need_kill )); then
+        sleep 1
+        for port in "${PORTS_TO_RECLAIM[@]}"; do
+            fuser -k -KILL "$port/tcp" >/dev/null 2>&1 || true
+        done
+    fi
+
+    # Detached python children — match by full cmdline. Patterns are tight
+    # enough that collisions with unrelated jobs are unlikely.
+    ORPHAN_PATTERNS=(
+        "kappa_serve_rtc\.py"
+        "run_kappa_inference\.py"
+        "keyboard_pub\.py --port $KEYBOARD_PORT"
+    )
+    need_kill=0
+    for pat in "${ORPHAN_PATTERNS[@]}"; do
+        pids=$(pgrep -f "$pat" 2>/dev/null | tr '\n' ' ' || true)
+        if [[ -n "$pids" ]]; then
+            echo "[deploy] reclaiming orphans /$pat/ (pids:${pids% })" >&2
+            pkill -TERM -f "$pat" 2>/dev/null || true
+            need_kill=1
+        fi
+    done
+    if (( need_kill )); then
+        sleep 1
+        for pat in "${ORPHAN_PATTERNS[@]}"; do
+            pkill -KILL -f "$pat" 2>/dev/null || true
+        done
+    fi
+fi
 
 PY=.venv/bin/python
+REPO=$(pwd)
 
-SERVE_CMD="$PY -m src.inference.kappa_serve_rtc \
+SERVE_CMD="cd $REPO && $PY src/inference/kappa_serve_rtc.py \
   --weights '$KAPPA_CKPT' \
   --backbone '$KAPPA_BACKBONE' \
   --proprio-stats '$KAPPA_PROPRIO_STATS' \
@@ -77,9 +129,10 @@ SERVE_CMD="$PY -m src.inference.kappa_serve_rtc \
   --ctrl-hz $CTRL_HZ \
   --host $KAPPA_HOST --port $WS_PORT"
 
-WBC_CMD="cd GR00T-WholeBodyControl/gear_sonic_deploy && ./deploy.sh --input-type $WBC_INPUT_TYPE $WBC_MODE"
+WBC_CMD="cd $REPO/GR00T-WholeBodyControl/gear_sonic_deploy && \
+  ./deploy.sh --input-type $WBC_INPUT_TYPE $WBC_MODE"
 
-BRIDGE_CMD="$PY scripts/deploy/run_kappa_inference.py \
+BRIDGE_CMD="cd $REPO && $PY scripts/deploy/run_kappa_inference.py \
   --ws-host $WS_CLIENT_HOST --ws-port $WS_PORT \
   --camera-host $CAMERA_HOST --camera-port $CAMERA_PORT \
   --state-zmq-host $STATE_HOST --state-zmq-port $STATE_PORT \
@@ -88,28 +141,34 @@ BRIDGE_CMD="$PY scripts/deploy/run_kappa_inference.py \
   --prompt '$BRIDGE_PROMPT' \
   --tick-hz $CTRL_HZ"
 
-KBD_CMD="$PY scripts/deploy/keyboard_pub.py --port $KEYBOARD_PORT"
-
-# ---------- spawn ----------
-# Server first; it takes longest to come up (model load + cuDNN warmup).
-tmux new-session -d -s "$SESSION" -n serve \
-    "script -q -c \"$SERVE_CMD\" $LOGDIR/serve.log"
-
-# Brief pause so the next windows don't race the server's port bind log.
-sleep 0.3
-
-tmux new-window -t "$SESSION" -n wbc \
-    "script -q -c \"$WBC_CMD\" $LOGDIR/wbc.log"
-tmux new-window -t "$SESSION" -n bridge \
-    "script -q -c \"$BRIDGE_CMD\" $LOGDIR/bridge.log"
-tmux new-window -t "$SESSION" -n kbd \
-    "script -q -c \"$KBD_CMD\" $LOGDIR/kbd.log"
+KBD_CMD="cd $REPO && $PY scripts/deploy/keyboard_pub.py --port $KEYBOARD_PORT"
 
 cat <<EOF
-[deploy] session '$SESSION' launched.
-         attach:        tmux attach -t $SESSION
-         next window:   Ctrl-b n     prev: Ctrl-b p
-         detach:        Ctrl-b d
-         stop all:      tmux kill-session -t $SESSION
-         logs:          $LOGDIR/{serve,wbc,bridge,kbd}.log
+[deploy] pre-flight passed and ports reclaimed.
+[deploy] Open FOUR terminals and run one command in each, in this order:
+
+# ---- Terminal 1: serve (Kappa WebSocket inference server) ----
+# Wait until it prints "Listening on $KAPPA_HOST:$WS_PORT" before starting the bridge.
+$SERVE_CMD
+
+# ---- Terminal 2: wbc (C++ deploy) ----
+# Manually answer 'y' at the "Proceed with deployment? [Y/n]:" prompt.
+# Wait for "Init Done", then allow ~5s for the torso-IMU (rt/secondary_imu)
+# DDS handshake before pressing 'k' in Terminal 4.
+$WBC_CMD
+
+# ---- Terminal 3: bridge (Kappa <-> WBC bridge) ----
+# Start AFTER Terminal 1 is listening on $WS_PORT.
+$BRIDGE_CMD
+
+# ---- Terminal 4: kbd (keyboard publisher) ----
+# Drive the pipeline manually by typing single keys (no Enter needed):
+#   k = start C++ control loop in PLANNER mode (MOTORS ENGAGE on real hw)
+#   i = publish LATENT_INITIAL_MOTION_TOKEN + switch C++ loop to POSE mode
+#   p = unpause the bridge tick loop
+$KBD_CMD
+
+SAFETY (real hardware): pressing 'k' engages G1's leg motors. Position the
+robot safely, hold the e-stop, and only press 'k' AFTER WBC has printed
+"Init Done" and ~5s have elapsed for the torso-IMU DDS handshake.
 EOF

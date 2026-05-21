@@ -30,6 +30,7 @@ dependencies = [
     "msgpack-numpy>=0.4.8",
     "opencv-python>=4.10.0",
     "gear_sonic",
+    "flash-attn",
 ]
 
 [build-system]
@@ -41,6 +42,15 @@ packages = ["src"]
 
 [tool.uv.sources]
 gear_sonic = { path = "GR00T-WholeBodyControl/gear_sonic", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv]
 override-dependencies = [

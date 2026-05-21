@@ -436,7 +436,13 @@ async def run(cfg: Cfg) -> None:
                     _green(f"[bridge] connected to {url}")
                     backoff = 0.5
                     await tick_loop(cfg, ws, state_sub, cam_sub, zmq_socket, state, handle_kb)
-            except (websockets.ConnectionClosed, OSError, ConnectionRefusedError) as e:
+            except (websockets.WebSocketException, OSError, ConnectionRefusedError) as e:
+                # WebSocketException covers ConnectionClosed *and* handshake
+                # failures like InvalidMessage (raised when the server's TCP
+                # port is open but ASGI lifespan hasn't finished — common
+                # while kappa_serve_rtc.py is still loading the Qwen3-VL
+                # backbone). Without this, the bridge dies on its first
+                # connect attempt during serve warm-up.
                 print(f"[bridge] WS dropped: {e!r}; reconnecting in {backoff:.1f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)

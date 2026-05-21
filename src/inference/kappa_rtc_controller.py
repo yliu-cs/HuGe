@@ -66,7 +66,7 @@ class RealTimeChunkController:
         self.SONIC_DIM = int(getattr(cfg, "sonic_dim", 66))
         self.PROPRIO_DIM = int(getattr(cfg, "proprio_dim", 64))
         self.use_proprio = bool(getattr(cfg, "use_proprio", False))
-        self.num_inference_steps = int(getattr(cfg, "num_inference_steps", 8))
+        self.num_inference_steps = int(getattr(cfg, "num_inference_steps", 4))
 
         self.ctrl_period = 1.0 / float(ctrl_hz)
         self.s_min = int(s_min)

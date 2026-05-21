@@ -34,7 +34,7 @@ separate gripper controller.
 
 Run via:
 
-    .venv/bin/python -m src.inference.kappa_serve_rtc \\
+    .venv/bin/python src/inference/kappa_serve_rtc.py \\
         --weights .runs/kappa/<finetune>/checkpoints/ckpt_<step>/model.safetensors \\
         --backbone resource/model/Qwen3-VL-2B-Instruct
 """
@@ -52,7 +52,21 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+from fastapi import FastAPI, WebSocket
 from PIL import Image
+from torchvision.transforms import v2
+
+
+# Mirror src/data/transform.py:DefaultImageAugment (Resize short=224 ->
+# CenterCrop(224, 320)). Training applied this in PIL space before the
+# Qwen3-VL processor, so the model only ever saw 224x320 frames. Deploy
+# cameras publish 480x640 raw — feeding that straight to Qwen yields a
+# different image_grid_thw than training and collapses SONIC velocity to
+# near-zero, so the robot stops moving. Apply the same transform here.
+_TRAIN_IMG_TRANSFORM = v2.Compose([
+    v2.Resize(224, interpolation=v2.InterpolationMode.BICUBIC),
+    v2.CenterCrop((224, 320)),
+])
 
 
 def _load_model(args, device: torch.device):
@@ -128,7 +142,8 @@ def _decode_image(payload: dict[str, Any]) -> Image.Image:
         data = bytes(raw)
     else:
         raise ValueError("image must be base64 str or bytes")
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    return _TRAIN_IMG_TRANSFORM(img)
 
 
 class Server:
@@ -145,6 +160,7 @@ class Server:
         self.controller_factory = controller_factory
         self.ctrl_period = 1.0 / float(ctrl_hz)
         self.controller = None
+        self._controller_starting: bool = False
 
         self._latest_obs: dict[str, Any] | None = None
         self._latest_action: np.ndarray | None = None
@@ -161,8 +177,6 @@ class Server:
     # ------------------------------------------------------------------
 
     def fastapi_app(self):
-        from fastapi import FastAPI, WebSocket
-
         app = FastAPI()
 
         @app.websocket("/predict")
@@ -195,8 +209,14 @@ class Server:
             obs = self._parse_obs(payload)
             with self._obs_lock:
                 self._latest_obs = obs
-            if self.controller is None:
-                self._start_control_loop(obs)
+            if self.controller is None and not self._controller_starting:
+                # Warm-up runs 3 full forward passes (cuDNN autotune + ORT
+                # init); on a fresh CUDA context this takes 20-60s and would
+                # block the event loop here, freezing WS ping/pong and
+                # causing the client to drop with 1006 ABNORMAL_CLOSURE.
+                # Off-load to a worker thread so the loop stays responsive.
+                self._controller_starting = True
+                asyncio.create_task(self._warm_start_async(obs))
 
     async def _send_loop(self, ws):
         last_version = -1
@@ -226,6 +246,18 @@ class Server:
         self.controller.warm_start(first_obs)
         self._ctrl_thread = threading.Thread(target=self._ctrl_loop, daemon=True)
         self._ctrl_thread.start()
+        print("[serve] controller ready")
+
+    async def _warm_start_async(self, obs: dict[str, Any]) -> None:
+        """Run the blocking ``_start_control_loop`` in a worker thread so the
+        event loop can keep handling WS ping/pong while warm-up is running.
+        """
+        try:
+            await asyncio.to_thread(self._start_control_loop, obs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[serve] controller warm-up failed: {e!r}")
+            # Reset flag so the next obs can re-trigger warm-up.
+            self._controller_starting = False
 
     def _ctrl_loop(self) -> None:
         next_tick = time.perf_counter()
@@ -331,7 +363,15 @@ def main() -> None:
              "decoder's training control_dt=0.02s and the 50 Hz token timeline "
              "the model was trained on.",
     )
-    parser.add_argument("--s-min", type=int, default=15)
+    parser.add_argument(
+        "--s-min", type=int, default=8,
+        help="Re-query the policy every this many control steps. Default 8 "
+             "= KappaModelConfig.sonic_max_delay so the RTC prefix-substitution "
+             "delay stays inside the training distribution (trainer samples "
+             "delay in [0, sonic_max_delay)). At ctrl_hz=50 this is 6.25Hz "
+             "inference; raise only if you also retrain with a larger "
+             "sonic_max_delay.",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")

@@ -2,55 +2,57 @@
 
 ## 🏠 Installation
 
-```
+```bash
 git lfs install
 git clone --recurse-submodules https://github.com/yliu-cs/Kappa.git
 cd Kappa
 uv sync
-uv pip install flash_attn==2.7.4.post1 --no-build-isolation
+```
 
-mkdir -p resource/dataset
+Download datasets to `resource/dataset/`:
+
+```bash
 wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
 ./hfd.sh USC-PSI-Lab/humanoid-everyday --dataset
-# Download EgoDex from [ml-egodex](https://github.com/apple/ml-egodex) to "resource/dataset/EgoDex"
-# Download G1-WBT from [unifolm-wbt](https://huggingface.co/collections/unitreerobotics/unifolm-wbt-dataset) to "resource/dataset/G1_WBT"
-mkdir -p resource/model
-cd resource/model
-wget https://hf-mirror.com/hfd/hfd.sh && chmod a+x hfd.sh
+# EgoDex: https://github.com/apple/ml-egodex  →  resource/dataset/EgoDex
+# G1-WBT: https://huggingface.co/collections/unitreerobotics/unifolm-wbt-dataset  →  resource/dataset/G1_WBT
+```
+
+Download models to `resource/model/`:
+
+```bash
 ./hfd.sh Qwen/Qwen3-VL-2B-Instruct
-mkdir -p sonic
-./hfd.sh nvidia/GEAR-SONIC --local-dir ./sonic --include model_encoder.onnx
-./hfd.sh nvidia/GEAR-SONIC --local-dir ./sonic --include model_decoder.onnx
-./hfd.sh nvidia/GEAR-SONIC --local-dir ./sonic --include observation_config.yaml
+./hfd.sh nvidia/GEAR-SONIC --local-dir ./sonic \
+  --include model_encoder.onnx model_decoder.onnx observation_config.yaml
 ```
 
 ## 🚀 Training
 
-```
+```bash
 # Stage 1: Pre-Train on EgoDex
 uv run python scripts/preprocess/egodex/build_index.py
-tmux new -s pretrain_egodex -d "script -q -c './scripts/train/train_kappa.sh pretrain_egodex_kappa_config' pretrain_egodex.log"
+./scripts/train/train_kappa.sh pretrain_egodex_kappa_config
 
 # Stage 2: Post-Train on Humanoid-Everyday G1 + G1-WBT (SONIC tokens + RTC)
 uv run python scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py
-tmux new -s calc_he_sonic -d "uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py"
-tmux new -s calc_wbt_sonic -d "uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py"
-tmux new -s posttrain_he_wbt -d "script -q -c './scripts/train/train_kappa.sh posttrain_he_wbt_kappa_config' posttrain_he_wbt.log"
+uv run python scripts/preprocess/humanoid-everyday/calc_sonic_tokens.py
+uv run python scripts/preprocess/g1-wbt/calc_wbt_sonic_tokens.py
+./scripts/train/train_kappa.sh posttrain_he_wbt_kappa_config
 
 # Stage 3: Fine-Tune on Proprietary Data (SONIC tokens)
-tmux new -s calc_prop_sonic -d "uv run python scripts/preprocess/proprietary/calc_sonic_tokens.py"
-tmux new -s finetune_prop -d "script -q -c './scripts/train/train_kappa.sh finetune_prop_ep_kappa_config' finetune_prop.log"
+uv run python scripts/preprocess/proprietary/calc_sonic_tokens.py
+./scripts/train/train_kappa.sh finetune_prop_ep_kappa_config
 
-# Or run the full chain (pretrain -> posttrain -> finetune) end-to-end:
-tmux new -s run_kappa -d "script -q -c './scripts/train/run_kappa.sh' run_kappa.log"
+# Or run all three stages end-to-end:
+./scripts/train/run_kappa.sh
 ```
 
 ## 🎯 Evaluation
 
-```
+```bash
 uv run python scripts/eval/sim_validate.py \
   --dataset proprietary \
-  --checkpoint .runs/kappa/exp.kappa.b1024.gpus8.2605181229/checkpoints/ckpt_5000/model.safetensors \
+  --checkpoint .runs/kappa/<exp>/checkpoints/ckpt_5000/model.safetensors \
   --heads sonic gt_sonic \
   --episode-indices 0 \
   --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
@@ -58,87 +60,52 @@ uv run python scripts/eval/sim_validate.py \
 
 ## 🤖 Deployment
 
-### Start the server
-
-```
-uv run python -m src.inference.kappa_serve_rtc \
-  --weights .runs/kappa/<finetune-run>/checkpoints/ckpt_<step>/model.safetensors \
-  --backbone resource/model/Qwen3-VL-2B-Instruct \
-  --proprio-stats resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json \
-  --normalize-mode bounds_q99 \
-  --ctrl-hz 50 \
-  --host 0.0.0.0 --port 8765
-```
-
-### Client → server payload (WebSocket text frame, JSON)
-
-```jsonc
-{
-  "image":   "<base64-encoded PNG of the latest ego-view frame>",
-  "text":    "perform the task",
-  "proprio": [/* 64 RAW floats, see layout below */]
-}
-```
-
-| Index    | Field      | Units    | Notes                                                                 |
-| -------- | ---------- | -------- | --------------------------------------------------------------------- |
-| `[0:29]` | `jp`       | rad      | Joint positions in **MuJoCo joint order** (see `MUJOCO_TO_ISAACLAB`). |
-| `[29:31]`| `hand_bits`| binary   | 0/1 per gripper (left, right). Use `0,0` for fake-hand datasets.      |
-| `[31:60]`| `jv`       | rad/s    | Finite-difference of `jp` at 50 Hz: `(jp[t] - jp[t-1]) * 50`.         |
-| `[60:64]`| `quat_xyzw`| unit q   | Pelvis orientation, **xyzw** order.                                   |
-
-### Server → client message (JSON)
-
-```jsonc
-{ "version": 1234, "sonic": [/* 66 floats */] }
-```
-
-`version` monotonically increases each control tick (1/50 s). The 66-D vector is `[sonic_latent(64) | hand_bits(2)]`.
-
-### One-command launch (tmux orchestrator)
-
-The four-terminal stack (Kappa server, WBC C++ deploy, bridge, keyboard) is bundled into a single tmux session by `scripts/deploy/run_kappa_deploy.sh`. The bridge (`scripts/deploy/run_kappa_inference.py`) plays the role of GR00T's `run_vla_inference.py`: it reads camera + state ZMQ, drives the Kappa WebSocket at 50 Hz, expands the server's 2 hand-bits into 7-DoF left/right hand joints via `G1GripperInverseKinematicsSolver`, and publishes Protocol-v4 `pose` messages on the action ZMQ socket consumed by `gear_sonic_deploy`.
+One-time setup:
 
 ```bash
-KAPPA_CKPT=.runs/kappa/<finetune-run>/checkpoints/ckpt_<step>/model.safetensors \
-./scripts/deploy/run_kappa_deploy.sh
-tmux attach -t kappa_deploy
+cd GR00T-WholeBodyControl
+bash install_scripts/install_mujoco_sim.sh
+bash install_scripts/install_data_collection.sh
+cd ..
 ```
 
-tmux windows (`Ctrl-b n` / `Ctrl-b p` to cycle, `Ctrl-b d` to detach):
+On the G1, launch the camera service:
 
-1. `serve`  — `src.inference.kappa_serve_rtc` on port 8765
-2. `wbc`    — `GR00T-WholeBodyControl/gear_sonic_deploy/deploy.sh --input-type zmq_manager real`
-3. `bridge` — Kappa ↔ WBC bridge; auto-reconnects to the server with exponential backoff
-4. `kbd`    — interactive keyboard publisher (ZMQ PUB on 5580)
+```bash
+sudo systemctl restart composed_camera_server.service
+```
 
-Keyboard window controls:
+### Sim evaluation (real camera → MuJoCo)
 
-| Key | Effect |
-| --- | ------ |
-| `p` | pause / resume bridge inference loop |
-| `k` | start / stop C++ control loop (PLANNER mode) |
-| `i` | send initial pose; switch to POSE mode; reset frame counter |
-| `[` / `]` | toggle initial-pose left / right hand closed |
-| `t` | enter a new language prompt (line entry; publishes `prompt:<text>`) |
-| `c` / `s` / `f` | start / stop-success / stop-failure recording (data exporter) |
-| `q` | quit the keyboard publisher only |
+Kappa consumes real G1 camera frames; action chunks are executed in MuJoCo and the rendered ego-view is republished over ZMQ.
 
-Stop everything: `tmux kill-session -t kappa_deploy`. Per-window logs land in `.runs/deploy/<timestamp>/{serve,wbc,bridge,kbd}.log`.
+```bash
+./scripts/eval/run_kappa_sim_test.sh
+tmux attach -t kappa_sim_test
+```
 
-Env vars accepted by the orchestrator (defaults shown in the script):
+Five tiled panes (`serve`, `sim`, `wbc`, `bridge`, `kbd`); `kbd` is focused. Logs land in `.runs/sim_test/<timestamp>/`. Set `CAMERA_HOST=localhost` to use MuJoCo's rendered camera for offline smoke tests.
 
-- **Required**: `KAPPA_CKPT`
-- **Model**: `KAPPA_BACKBONE`, `KAPPA_PROPRIO_STATS`, `KAPPA_DEVICE`, `WS_PORT`, `KAPPA_HOST`, `CTRL_HZ`
-- **WBC**: `WBC_MODE` (`real` or `sim`), `WBC_INPUT_TYPE`
-- **ZMQ wiring**: `CAMERA_HOST`/`CAMERA_PORT`, `STATE_HOST`/`STATE_PORT`, `ACTION_HOST`/`ACTION_PORT`, `KEYBOARD_HOST`/`KEYBOARD_PORT`
-- **Bridge**: `WS_CLIENT_HOST`, `BRIDGE_PROMPT`
+### Real-world evaluation
 
-Smoke testing without hardware: set `WBC_MODE=sim` to swap the C++ deploy into MuJoCo loopback mode (same Protocol-v4 wire format, no robot). For pure server validation, run the bridge by hand with `--dry-run` to print packed action diagnostics instead of publishing ZMQ.
+The helper runs pre-flight checks, reclaims stale ports, then prints four commands to paste into four terminals:
+
+```bash
+./scripts/deploy/run_kappa_deploy.sh
+```
+
+Start order:
+
+1. **serve** — wait for `Listening on $KAPPA_HOST:$WS_PORT`.
+2. **wbc** — answer `y`; wait for `Init Done` plus ~5s for the torso-IMU DDS handshake.
+3. **bridge** — start only after `serve` is listening.
+4. **kbd** — press `k` (engage motors, PLANNER mode), `i` (initial motion token, POSE mode), `p` (unpause bridge).
+
+**Safety**: position the robot and hold the e-stop before pressing `k`.
 
 ## ❤️ Acknowledgment
 
-We sincerely thank [Psi0](https://github.com/physical-superintelligence-lab/Psi0), [LaST​0​](https://github.com/ZhuoyangLiu2005/last0), [GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl), and [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) for their excellent code implementations.
+We thank [Psi0](https://github.com/physical-superintelligence-lab/Psi0), [LaST​0​](https://github.com/ZhuoyangLiu2005/last0), [GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl), and [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) for their excellent code.
 
 ## 📜 Citation
 

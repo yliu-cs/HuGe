@@ -860,13 +860,18 @@ def main() -> None:
     # at 200 Hz). The legacy PD-only family used 0.002 s; we no longer support
     # PD-only heads, so 0.005 is the only relevant setting.
     ap.add_argument("--sim-dt", type=float, default=0.005)
-    ap.add_argument("--s-min", type=int, default=20,
+    ap.add_argument("--s-min", type=int, default=8,
                     help="Re-query the policy every this many control steps. "
-                         "13 ≈ 3.8Hz inference at ctrl_hz=50.")
+                         "Default 8 = KappaModelConfig.sonic_max_delay so the "
+                         "RTC prefix-substitution delay stays inside the "
+                         "training distribution (trainer samples delay in "
+                         "[0, sonic_max_delay)). At ctrl_hz=50 this is 6.25Hz "
+                         "inference; raise only if you also retrain with a "
+                         "larger sonic_max_delay.")
     ap.add_argument("--delay-init", type=int, default=4,
                     help="Initial RTC prefix delay (overwritten by per-step "
                          "consumed count after the first chunk).")
-    ap.add_argument("--num-inference-steps", type=int, default=8)
+    ap.add_argument("--num-inference-steps", type=int, default=4)
     ap.add_argument("--no-rtc", dest="use_rtc", action="store_false", default=True,
                     help="Disable RTC prefix substitution (run vanilla "
                          "chunk-by-chunk inference).")
