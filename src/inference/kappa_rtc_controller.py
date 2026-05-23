@@ -52,7 +52,7 @@ class RealTimeChunkController:
         scheduler,
         cfg,
         ctrl_hz: float = 50.0,
-        s_min: int = 15,
+        s_min: int = 8,
         delay_buffer_size: int = 6,
         d_init: int = 6,
         proprio_min: Optional[np.ndarray] = None,

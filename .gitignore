@@ -11,6 +11,8 @@ outputs
 .venv
 .runs
 .claude
+.codex
+.agents
 .sii
 .baks
 

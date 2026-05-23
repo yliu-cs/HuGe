@@ -47,16 +47,30 @@ uv run python scripts/preprocess/proprietary/calc_sonic_tokens.py
 ./scripts/train/run_kappa.sh
 ```
 
-## 🎯 Evaluation
+## 🎯 Offline Closed-Loop Sim
+
+`sim_validate.py` is the offline closed-loop simulation entry point. It keeps
+the deployment Kappa server, WebSocket bridge, WBC deploy binary, and GR00T
+MuJoCo sim loop in the path. The model input is published from the proprietary
+offline cache: dataset `ego_view` frames on the camera ZMQ port and cached
+64-D proprio converted to the bridge's `g1_debug` state format. Kappa actions
+are then executed through the real bridge/WBC/sim loop, so this tests whether
+the deployed chain can drive the MuJoCo G1 stably from offline inputs.
 
 ```bash
-uv run python scripts/eval/sim_validate.py \
+.venv/bin/python scripts/eval/sim_validate.py \
   --dataset proprietary \
-  --checkpoint .runs/kappa/<exp>/checkpoints/ckpt_5000/model.safetensors \
-  --heads sonic gt_sonic \
-  --episode-indices 0 \
-  --out-dir .runs/eval/$(date +%Y%m%d_%H%M%S)
+  --episode-index 0 \
+  --checkpoint .runs/kappa/exp.kappa.b1024.gpus8.2605181229/checkpoints/ckpt_5000/model.safetensors \
+  --backbone resource/model/Qwen3-VL-2B-Instruct \
+  --proprio-stats resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json \
+  --device cuda:0 \
+  --ctrl-hz 50 \
+  --session kappa_sim_test
 ```
+
+Attach with `tmux attach -t kappa_sim_test`. Logs land in
+`.runs/sim_test/<timestamp>/`.
 
 ## 🤖 Deployment
 
@@ -75,16 +89,18 @@ On the G1, launch the camera service:
 sudo systemctl restart composed_camera_server.service
 ```
 
-### Sim evaluation (real camera → MuJoCo)
+### Sim evaluation
 
-Kappa consumes real G1 camera frames; action chunks are executed in MuJoCo and the rendered ego-view is republished over ZMQ.
+By default this is the offline-cache closed-loop sim described above.
 
 ```bash
-./scripts/eval/run_kappa_sim_test.sh
+.venv/bin/python scripts/eval/sim_validate.py
 tmux attach -t kappa_sim_test
 ```
 
-Five tiled panes (`serve`, `sim`, `wbc`, `bridge`, `kbd`); `kbd` is focused. Logs land in `.runs/sim_test/<timestamp>/`. Set `CAMERA_HOST=localhost` to use MuJoCo's rendered camera for offline smoke tests.
+Tiled panes are `serve`, `sim`, `wbc`, `cache`, `bridge`, and `kbd`; `kbd` is
+focused. Set `OFFLINE_CACHE_INPUT=0` only when you intentionally want the
+bridge to read camera/state from external publishers.
 
 ### Real-world evaluation
 
