@@ -36,7 +36,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:=.runs/kappa/170R+85E/real/checkpoints/ckpt_1300/model.safetensors}"
+: "${KAPPA_CKPT:=.runs/kappa/170R+85E_real.kappa.b1024.gpus8.2605241244/ckpt_1300/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
 : "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
 : "${KAPPA_HOST:=0.0.0.0}"
@@ -301,14 +301,21 @@ SERVE_CMD="cd $REPO && $PY src/inference/kappa_serve_rtc.py \
 # The on-screen MuJoCo viewer is ALWAYS enabled (the user wants the live
 # window). The offscreen EGL renderer + image publisher is enabled only
 # when the bridge actually needs MuJoCo-rendered frames as model input,
-# i.e. OFFLINE_CACHE_INPUT=0. We deliberately do NOT enable it for the
-# video recording: on NVIDIA, GLX (viewer) and EGL (offscreen) coexisting
-# in the same process fails eglMakeCurrent. Video recording is handled by
+# i.e. OFFLINE_CACHE_INPUT=0 AND CAMERA_HOST=localhost (full-sim mode).
+# If CAMERA_HOST points elsewhere (e.g. a real robot NUC providing
+# ego_view over the network), publishing sim frames is pointless and
+# actively harmful — the current G1 scene has no `head_camera` MJCF
+# node, so offscreen rendering aborts the sim on startup.
+# We also deliberately do NOT enable it for video recording: on NVIDIA,
+# GLX (viewer) and EGL (offscreen) coexisting in the same process fails
+# eglMakeCurrent. Video recording is handled by
 # scripts/eval/x11_window_recorder.py grabbing the on-screen window.
 SIM_PUBLISH=0
-if [[ "$OFFLINE_CACHE_INPUT" != "1" ]]; then
+if [[ "$OFFLINE_CACHE_INPUT" != "1" && "$CAMERA_HOST" == "localhost" ]]; then
   SIM_PUBLISH=1
-  echo "[sim-test] WARNING: OFFLINE_CACHE_INPUT=0 -> bridge needs EGL sim frames; the on-screen viewer will fail on NVIDIA because GLX+EGL cannot share a process. Set OFFLINE_CACHE_INPUT=1 to record from the viewer instead." >&2
+  echo "[sim-test] WARNING: OFFLINE_CACHE_INPUT=0 + CAMERA_HOST=localhost -> bridge needs EGL sim frames; the on-screen viewer will fail on NVIDIA because GLX+EGL cannot share a process. Set OFFLINE_CACHE_INPUT=1 to record from the viewer instead." >&2
+elif [[ "$OFFLINE_CACHE_INPUT" != "1" ]]; then
+  echo "[sim-test] CAMERA_HOST=$CAMERA_HOST (non-local) -> sim image publishing disabled; bridge will subscribe to the remote camera." >&2
 fi
 SIM_EGL_ENV=""
 if (( SIM_PUBLISH )) && [[ -n "$SIM_EGL_VENDOR" ]]; then
@@ -495,7 +502,7 @@ OFFLINE_STATE_PORT="$OFFLINE_STATE_PORT"
 
     deadline=\$(( \$(date +%s) + 180 ))
     while true; do
-        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$WBC_PANE" -p -S - 2>/dev/null \
+        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$WBC_PANE" -p -J -S - 2>/dev/null \
             | grep -q "Init Done"; then
             break
         fi
@@ -514,7 +521,7 @@ OFFLINE_STATE_PORT="$OFFLINE_STATE_PORT"
 
     deadline=\$(( \$(date +%s) + 180 ))
     while true; do
-        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$BRIDGE_PANE" -p -S - 2>/dev/null \
+        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$BRIDGE_PANE" -p -J -S - 2>/dev/null \
             | grep -q "\[bridge\] connected to"; then
             break
         fi
@@ -538,7 +545,7 @@ OFFLINE_STATE_PORT="$OFFLINE_STATE_PORT"
 
     deadline=\$(( \$(date +%s) + 15 ))
     while true; do
-        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$BRIDGE_PANE" -p -S - 2>/dev/null \
+        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$BRIDGE_PANE" -p -J -S - 2>/dev/null \
             | grep -q "Resumed policy loop"; then
             break
         fi
@@ -571,7 +578,7 @@ OFFLINE_STATE_PORT="$OFFLINE_STATE_PORT"
 
     deadline=\$(( \$(date +%s) + EPISODE_TIMEOUT_S ))
     while true; do
-        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$CACHE_PANE" -p -S - 2>/dev/null \
+        if tmux capture-pane -t "\$SESSION:\$WINDOW.\$CACHE_PANE" -p -J -S - 2>/dev/null \
             | grep -q "episode finished"; then
             echo "[auto] cache reports episode finished; tearing down"
             break

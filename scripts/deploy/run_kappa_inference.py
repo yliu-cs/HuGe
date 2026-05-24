@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
+import imageio.v2 as imageio
 import numpy as np
 import tyro
 import websockets
@@ -88,6 +91,11 @@ class Cfg:
 
     # Debug: print actions instead of publishing ZMQ
     dry_run: bool = False
+
+    # Per-tick dump of (image, proprio, predicted sonic) under this dir,
+    # mirroring the training-dataset layout so the run can be diffed against
+    # offline data via ``PropEpisodeSource``. Empty = disabled, zero overhead.
+    log_dir: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +160,104 @@ def hand_bits_to_joints(bits: np.ndarray, threshold: float) -> tuple[np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Hand-state -> 1-bit detector (mirror of training-side observation.hand_binary_state)
+# ---------------------------------------------------------------------------
+#
+# Dex3 ``_get_middle_close_q_desired()`` puts q[1] at ±0.7 (closed) and 0
+# (open), with the right hand mirroring the left's sign convention. abs()
+# collapses the L/R polarity into a single 0..0.7 magnitude, and 0.35 is the
+# midpoint — wide hysteresis-free detector that matches the training-side
+# binary state without needing the IK solver at runtime.
+_HAND_CLOSED_Q1_THRESHOLD = 0.35
+
+# Once-per-process diagnostic flags so we don't spam every tick.
+_HAND_SOURCE_LOGGED: set[str] = set()
+
+
+def _q7_to_hand_bit(q7) -> float | None:
+    """Threshold a Dex3 7-DoF joint vector into a binary closed bit, or
+    return ``None`` if the array is missing / wrong-shape so the caller can
+    fall back to the next preferred source."""
+    if q7 is None:
+        return None
+    arr = np.asarray(q7, dtype=np.float32)
+    if arr.shape != (7,):
+        return None
+    return float(abs(arr[1]) > _HAND_CLOSED_Q1_THRESHOLD)
+
+
+def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
+    """Resolve ``[left_closed, right_closed]`` (float32, 0/1) from the
+    g1_debug ZMQ message.
+
+    Preference order (each tier is taken only if BOTH L+R fields are
+    populated and well-shaped):
+
+      1. ``left_hand_q_measured`` / ``right_hand_q_measured``  — real Dex3
+         encoder readback, matches training ``observation.hand_binary_state``
+         semantics. Always present on real-robot C++ deploys built with the
+         ``output_data_map_`` visualisation block.
+      2. ``left_hand_q`` / ``right_hand_q``                    — commanded
+         Dex3 setpoints from the C++ state logger. Tracks (1) within one
+         tick on real hardware; what the sim-mode C++ deploy publishes.
+      3. ``last_left_hand_action`` / ``last_right_hand_action`` — last
+         action the C++ deploy executed. Same polarity as (1)/(2).
+      4. Direct ``hand_bits`` field — used by the offline-cache publisher
+         in ``scripts/eval/sim_validate.py`` to forward the cache's already-
+         binary bits when it doesn't synthesise the 7-DoF q vector.
+
+    Any successful tier below "measured" prints a one-shot info line so a
+    real-deploy operator notices a stale C++ build or a degenerate cache.
+    """
+    measured_l, measured_r = state_msg.get("left_hand_q_measured"), state_msg.get("right_hand_q_measured")
+    lb, rb = _q7_to_hand_bit(measured_l), _q7_to_hand_bit(measured_r)
+    if lb is not None and rb is not None:
+        return np.array([lb, rb], dtype=np.float32)
+
+    cmd_l, cmd_r = state_msg.get("left_hand_q"), state_msg.get("right_hand_q")
+    lb, rb = _q7_to_hand_bit(cmd_l), _q7_to_hand_bit(cmd_r)
+    if lb is not None and rb is not None:
+        if "commanded" not in _HAND_SOURCE_LOGGED:
+            _HAND_SOURCE_LOGGED.add("commanded")
+            print(
+                "[bridge] hand-state: *_q_measured missing in g1_debug; "
+                "thresholding commanded *_q instead. Fine in sim, "
+                "may indicate a stale C++ build on real hardware."
+            )
+        return np.array([lb, rb], dtype=np.float32)
+
+    last_l, last_r = state_msg.get("last_left_hand_action"), state_msg.get("last_right_hand_action")
+    lb, rb = _q7_to_hand_bit(last_l), _q7_to_hand_bit(last_r)
+    if lb is not None and rb is not None:
+        if "last_action" not in _HAND_SOURCE_LOGGED:
+            _HAND_SOURCE_LOGGED.add("last_action")
+            print(
+                "[bridge] hand-state: only last_*_hand_action available; "
+                "using it as a proxy for current hand position."
+            )
+        return np.array([lb, rb], dtype=np.float32)
+
+    direct = state_msg.get("hand_bits")
+    if direct is not None:
+        arr = np.asarray(direct, dtype=np.float32)
+        if arr.shape == (2,):
+            if "direct" not in _HAND_SOURCE_LOGGED:
+                _HAND_SOURCE_LOGGED.add("direct")
+                print("[bridge] hand-state: using direct 'hand_bits' field from state_msg.")
+            return arr
+
+    if "zeros" not in _HAND_SOURCE_LOGGED:
+        _HAND_SOURCE_LOGGED.add("zeros")
+        print(
+            "[bridge] WARNING: no usable hand state in g1_debug; "
+            "writing proprio[29:31]=0. Policy will see 'hands always open' "
+            "in proprio — output bits can still be correct but the "
+            "feedback loop is broken."
+        )
+    return np.zeros(2, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Proprio assembly (64-D RAW; server normalizes via q01/q99)
 # ---------------------------------------------------------------------------
 
@@ -165,7 +271,11 @@ def assemble_proprio(
 
     Layout (see README.md and src/inference/kappa_serve_rtc.py):
         [ 0:29]  jp        — MuJoCo joint order, default_angles offset baked in by C++
-        [29:31]  hand_bits — 0,0 for fake-hand training data (placeholder)
+        [29:31]  hand_bits — binary closed/open per hand, derived from the
+                             best hand-state field available in state_msg
+                             (see ``_hand_bits_from_state`` for the fallback
+                             chain). Must match the training-side
+                             ``observation.hand_binary_state`` semantics.
         [31:60]  jv        — finite-diff of jp at tick_hz Hz
         [60:64]  quat_xyzw — pelvis orientation (C++ publishes wxyz; reorder)
     """
@@ -183,7 +293,7 @@ def assemble_proprio(
 
     out = np.empty(64, dtype=np.float32)
     out[0:29] = jp
-    out[29:31] = 0.0
+    out[29:31] = _hand_bits_from_state(state_msg)
     out[31:60] = jv
     out[60:64] = quat_xyzw
     return out, jp
@@ -341,15 +451,188 @@ class SharedSlot:
         self.version: int = -1
 
 
+# ---------------------------------------------------------------------------
+# Per-tick logger for training-dataset-format dumps
+# ---------------------------------------------------------------------------
+
+
+class BridgeLogger:
+    """Per-tick logger that mirrors the training-dataset layout.
+
+    Output under ``log_dir`` (loadable by ``PropEpisodeSource``):
+      ``videos/chunk-000/observation.images.ego_view/episode_NNNNNN.mp4``
+      ``g1_proprio/episode_NNNNNN.npy``         (T, 64) float32
+      ``sonic_tokens/episode_NNNNNN.npy``       (T, 66) float32, NaN for invalid rows
+      ``meta/tasks.jsonl``                      dedup-append-by-prompt
+      ``meta/episodes.jsonl``                   one line per closed episode
+
+    Plus a deploy-only sidecar:
+      ``bridge_log/episode_NNNNNN.npz``         t_obs_send, version, valid_action
+
+    One episode per bridge process invocation. Episode index = next free
+    slot under ``g1_proprio/``, so repeated bridge runs into the same
+    ``log_dir`` append episodes.
+
+    Trade-offs / edge cases:
+      * Numpy buffers live in memory until ``close()``. A SIGKILL between
+        ``log_obs`` ticks loses every row of this episode; the mp4 (streamed
+        via ffmpeg subprocess) survives but lacks moov — recover with
+        ``ffmpeg -i bad.mp4 -c copy fixed.mp4``. Per-row disk flush at 50 Hz
+        was rejected (~1 ms/tick is too costly on the bridge loop).
+      * WS reconnect mid-episode: ``SharedSlot`` is rebuilt per session, so
+        ``slot.action is None`` again until the new server's first reply
+        arrives. Those rows are NaN-filled with ``valid_action=False``.
+      * Pause ('p') freezes ``obs_publisher`` before the logger call, so no
+        rows are written during pause — logged length == deployed ticks.
+      * Mid-episode prompt changes via ``prompt:NEW`` keyboard hotkey are
+        NOT reflected in ``episodes.jsonl`` — that file records only the
+        prompt set at logger construction. Restart between prompts if you
+        need per-episode prompt labels.
+    """
+
+    def __init__(self, log_dir: str, prompt: str, fps: float) -> None:
+        self._closed = False
+        if not log_dir:
+            self.enabled = False
+            return
+        self.enabled = True
+        self._prompt = prompt
+        root = Path(log_dir)
+        self._video_dir = root / "videos" / "chunk-000" / "observation.images.ego_view"
+        self._proprio_dir = root / "g1_proprio"
+        self._sonic_dir = root / "sonic_tokens"
+        self._sidecar_dir = root / "bridge_log"
+        self._meta_dir = root / "meta"
+        for d in (
+            self._video_dir,
+            self._proprio_dir,
+            self._sonic_dir,
+            self._sidecar_dir,
+            self._meta_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Next free episode index = max(existing g1_proprio/episode_*.npy) + 1.
+        existing = sorted(self._proprio_dir.glob("episode_*.npy"))
+        if existing:
+            last_idx = max(int(p.stem.split("_")[-1]) for p in existing)
+            self._ep = last_idx + 1
+        else:
+            self._ep = 0
+        self._stem = f"episode_{self._ep:06d}"
+
+        tasks_path = self._meta_dir / "tasks.jsonl"
+        task_lines: list[dict] = []
+        if tasks_path.exists():
+            for raw in tasks_path.read_text().splitlines():
+                raw = raw.strip()
+                if raw:
+                    try:
+                        task_lines.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        pass
+        if not any(t.get("task") == prompt for t in task_lines):
+            new_idx = max((t.get("task_index", -1) for t in task_lines), default=-1) + 1
+            with tasks_path.open("a") as f:
+                f.write(json.dumps({"task_index": new_idx, "task": prompt}) + "\n")
+
+        self._mp4_path = self._video_dir / f"{self._stem}.mp4"
+        # macro_block_size=1 keeps non-16-multiple frame dims (480x640) intact.
+        self._writer = imageio.get_writer(
+            str(self._mp4_path),
+            fps=float(fps),
+            codec="libx264",
+            quality=8,
+            macro_block_size=1,
+        )
+        self._proprio: list[np.ndarray] = []
+        self._sonic: list[np.ndarray] = []
+        self._t_obs: list[float] = []
+        self._version: list[int] = []
+        self._valid: list[bool] = []
+
+        print(f"[bridge-log] writing {self._stem} to {root}")
+
+    def log_obs(
+        self,
+        img: np.ndarray,
+        proprio: np.ndarray,
+        slot: SharedSlot,
+        t_wall: float,
+    ) -> None:
+        """Append one row. Caller wraps this in ``asyncio.to_thread`` so the
+        mp4 ffmpeg write doesn't stall the obs loop."""
+        if not self.enabled or self._closed:
+            return
+        self._writer.append_data(img)
+        self._proprio.append(proprio.astype(np.float32, copy=True))
+        if slot.action is None:
+            self._sonic.append(np.full(66, np.nan, dtype=np.float32))
+            self._version.append(-1)
+            self._valid.append(False)
+        else:
+            self._sonic.append(slot.action.astype(np.float32, copy=True))
+            self._version.append(int(slot.version))
+            self._valid.append(True)
+        self._t_obs.append(float(t_wall))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self.enabled:
+            return
+
+        # Close the writer first to finalize the moov atom.
+        try:
+            self._writer.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[bridge-log] writer.close() failed: {e!r}")
+
+        T = len(self._proprio)
+        if T == 0:
+            try:
+                self._mp4_path.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"[bridge-log] empty {self._stem}; nothing saved")
+            return
+
+        proprio = np.stack(self._proprio, axis=0).astype(np.float32, copy=False)
+        sonic = np.stack(self._sonic, axis=0).astype(np.float32, copy=False)
+        np.save(self._proprio_dir / f"{self._stem}.npy", proprio)
+        np.save(self._sonic_dir / f"{self._stem}.npy", sonic)
+        np.savez(
+            self._sidecar_dir / f"{self._stem}.npz",
+            t_obs_send=np.array(self._t_obs, dtype=np.float64),
+            version=np.array(self._version, dtype=np.int64),
+            valid_action=np.array(self._valid, dtype=bool),
+        )
+
+        episodes_path = self._meta_dir / "episodes.jsonl"
+        entry = {"episode_index": self._ep, "tasks": [self._prompt], "length": int(T)}
+        with episodes_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        print(f"[bridge-log] closed {self._stem}: T={T}, mp4={self._mp4_path.name}")
+
+
 async def obs_publisher(
     cfg: Cfg,
     ws,
     state_sub: ZMQStateSubscriber,
     cam_sub: ComposedCameraClientSensor,
     state: LoopState,
+    slot: SharedSlot,
+    logger: BridgeLogger,
 ) -> None:
     """Pace obs at ``tick_hz`` and push to the server WS without waiting for
-    a reply. Replies are drained by ``action_consumer``."""
+    a reply. Replies are drained by ``action_consumer``. After the send, if
+    a logger is enabled, snapshot (img, proprio, latest slot.action) for the
+    training-format dump — done via ``asyncio.to_thread`` so the mp4 frame
+    write can't stall this loop."""
     period = 1.0 / float(cfg.tick_hz)
     next_t = time.perf_counter()
     while True:
@@ -386,6 +669,9 @@ async def obs_publisher(
             len(header_bytes).to_bytes(4, "big") + header_bytes + img.tobytes()
         )
         await ws.send(payload)
+
+        if logger.enabled:
+            await asyncio.to_thread(logger.log_obs, img, proprio, slot, time.time())
 
         next_t += period
         sleep_for = next_t - time.perf_counter()
@@ -484,13 +770,14 @@ async def run_session(
     zmq_socket: zmq.Socket,
     state: LoopState,
     handle_kb,
+    logger: BridgeLogger,
 ) -> None:
     """Run the three concurrent tasks for the lifetime of one WS connection.
     Returns (and propagates) when any task raises — the outer reconnect loop
     handles WS exceptions."""
     slot = SharedSlot()
     tasks = [
-        asyncio.create_task(obs_publisher(cfg, ws, state_sub, cam_sub, state)),
+        asyncio.create_task(obs_publisher(cfg, ws, state_sub, cam_sub, state, slot, logger)),
         asyncio.create_task(action_consumer(ws, slot)),
         asyncio.create_task(wbc_publisher(cfg, zmq_socket, state, slot, handle_kb)),
     ]
@@ -526,6 +813,10 @@ async def run(cfg: Cfg) -> None:
     state = LoopState(prompt=cfg.prompt)
     handle_kb = make_keyboard_handler(kb, zmq_socket, state)
 
+    logger = BridgeLogger(cfg.log_dir, cfg.prompt, cfg.tick_hz)
+    if not logger.enabled:
+        print("[bridge-log] disabled (no --log-dir set)")
+
     url = f"ws://{cfg.ws_host}:{cfg.ws_port}{cfg.ws_path}"
     backoff = 0.5
     try:
@@ -539,7 +830,7 @@ async def run(cfg: Cfg) -> None:
                 ) as ws:
                     _green(f"[bridge] connected to {url}")
                     backoff = 0.5
-                    await run_session(cfg, ws, state_sub, cam_sub, zmq_socket, state, handle_kb)
+                    await run_session(cfg, ws, state_sub, cam_sub, zmq_socket, state, handle_kb, logger)
             except (websockets.WebSocketException, OSError, ConnectionRefusedError) as e:
                 # WebSocketException covers ConnectionClosed *and* handshake
                 # failures like InvalidMessage (raised when the server's TCP
@@ -553,6 +844,10 @@ async def run(cfg: Cfg) -> None:
     except KeyboardInterrupt:
         print("[bridge] interrupted by user")
     finally:
+        try:
+            logger.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[bridge-log] close failed: {e!r}")
         zmq_socket.close()
         ctx.term()
         state_sub.close()

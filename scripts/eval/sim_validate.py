@@ -58,9 +58,15 @@ def _publish_state(socket: zmq.Socket, proprio_64: np.ndarray, frame: int) -> No
     p = np.asarray(proprio_64, dtype=np.float32)
     quat_xyzw = p[60:64]
     quat_wxyz = quat_xyzw[[3, 0, 1, 2]].astype(np.float32)
+    # Forward the cache's binary hand bits as a direct `hand_bits` field so
+    # the bridge's _hand_bits_from_state sees the same training-side signal
+    # it would derive from `*_q_measured` in a real-deploy g1_debug. Without
+    # this the bridge falls back to zeros in offline-cache mode and the
+    # policy's proprio[29:31] diverges from training distribution.
     msg = {
         "body_q": p[0:29].astype(np.float32),
         "base_quat": quat_wxyz,
+        "hand_bits": p[29:31].astype(np.float32),
         "frame_index": int(frame),
         "timestamp": time.time(),
     }

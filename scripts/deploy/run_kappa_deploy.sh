@@ -24,7 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:=.runs/kappa/exp.kappa.b1024.gpus8.2605181229/checkpoints/ckpt_5000/model.safetensors}"
+: "${KAPPA_CKPT:=.runs/kappa/170R+85E_real.kappa.b1024.gpus8.2605241244/ckpt_1300/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
 : "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
 : "${KAPPA_HOST:=0.0.0.0}"
@@ -47,7 +47,13 @@ cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 : "${ACTION_PORT:=5556}"
 : "${KEYBOARD_HOST:=localhost}"
 : "${KEYBOARD_PORT:=5580}"
-: "${BRIDGE_PROMPT:=Walk to the table and push the scotch tape to the blue tape}"
+: "${BRIDGE_PROMPT:=Grab the cola, turn left, throw into the trash bin}"
+
+# Per-tick log of (image, proprio, predicted sonic) under this dir, in the
+# training-dataset layout. Default: timestamped subdir under .runs/deploy/
+# so every real-hardware run is captured automatically. Unset (LOG_DIR=)
+# to disable.
+: "${LOG_DIR:=.runs/deploy/$(date +%Y%m%d_%H%M%S)}"
 
 # ---------- pre-flight ----------
 if [[ ! -x .venv/bin/python ]]; then
@@ -130,7 +136,7 @@ SERVE_CMD="cd $REPO && $PY src/inference/kappa_serve_rtc.py \
   --host $KAPPA_HOST --port $WS_PORT"
 
 WBC_CMD="cd $REPO/GR00T-WholeBodyControl/gear_sonic_deploy && \
-  ./deploy.sh --input-type $WBC_INPUT_TYPE $WBC_MODE"
+  ./deploy.sh --input-type $WBC_INPUT_TYPE --hand-type inspire $WBC_MODE"
 
 BRIDGE_CMD="cd $REPO && $PY scripts/deploy/run_kappa_inference.py \
   --ws-host $WS_CLIENT_HOST --ws-port $WS_PORT \
@@ -139,7 +145,7 @@ BRIDGE_CMD="cd $REPO && $PY scripts/deploy/run_kappa_inference.py \
   --action-zmq-host $ACTION_HOST --action-zmq-port $ACTION_PORT \
   --keyboard-zmq-host $KEYBOARD_HOST --keyboard-zmq-port $KEYBOARD_PORT \
   --prompt '$BRIDGE_PROMPT' \
-  --tick-hz $CTRL_HZ"
+  --tick-hz $CTRL_HZ${LOG_DIR:+ --log-dir '$LOG_DIR'}"
 
 KBD_CMD="cd $REPO && $PY scripts/deploy/keyboard_pub.py --port $KEYBOARD_PORT"
 
