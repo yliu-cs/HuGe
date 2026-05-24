@@ -247,7 +247,12 @@ def main() -> int:
         "-preset", args.preset,
         "-crf", str(args.crf),
         "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+        # NOTE: do NOT use ``+faststart``. It triggers a full-file rewrite at
+        # exit to relocate the moov atom to the front (~90s for a 30MB file
+        # at 50fps), which holds the tmux session and bridge alive long past
+        # the actual task. The default trailer-at-end layout plays fine in
+        # mpv/VLC/ffplay; only HTTP progressive streaming benefits from
+        # faststart, which is not the use case here.
         "-y",
         args.output,
     ]

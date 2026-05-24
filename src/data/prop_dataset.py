@@ -31,7 +31,8 @@ class PropDataset(TokenizedVideoDataset):
     ``videos/chunk-<NNN>/observation.images.ego_view/episode_<NNNNNN>.mp4``.
 
     SONIC tokens come from ``scripts/preprocess/proprietary/calc_sonic_tokens.py``
-    which materializes the ``action.motion_token`` column + zero hand_bits.
+    which materializes the ``action.motion_token`` column concatenated with the
+    parquet's ``action.hand_binary`` column (real 0/1 open/close labels).
     """
 
     def __init__(

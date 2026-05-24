@@ -36,7 +36,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:=.runs/kappa/exp.kappa.b1024.gpus8.2605181229/checkpoints/ckpt_5000/model.safetensors}"
+: "${KAPPA_CKPT:=.runs/kappa/170R+85E/real/checkpoints/ckpt_1300/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
 : "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
 : "${KAPPA_HOST:=0.0.0.0}"
@@ -83,9 +83,9 @@ fi
 # while preserving the deploy bridge/WBC/sim action path.
 : "${OFFLINE_CACHE_INPUT:=1}"
 : "${OFFLINE_DATASET:=proprietary}"
-: "${OFFLINE_DATA_ROOT:=resource/dataset/proprietary}"
+: "${OFFLINE_DATA_ROOT:=resource/dataset/proprietary/real/2026-05-23}"
 : "${OFFLINE_PROPRIO_CACHE_ROOT:=}"
-: "${OFFLINE_EPISODE_INDEX:=0}"
+: "${OFFLINE_EPISODE_INDEX:=123}"
 : "${OFFLINE_SEED:=0}"
 : "${OFFLINE_CAMERA_PORT:=6555}"
 : "${OFFLINE_STATE_PORT:=6557}"
@@ -110,7 +110,7 @@ fi
 : "${WBC_STATE_PORT:=5557}"
 : "${KEYBOARD_HOST:=localhost}"
 : "${KEYBOARD_PORT:=5580}"
-: "${BRIDGE_PROMPT:=Walk to the table and push the scotch tape to the blue tape}"
+: "${BRIDGE_PROMPT:=Grab the cola, turn left, throw into the trash bin}"
 
 : "${SESSION:=kappa_sim_test}"
 
@@ -118,8 +118,14 @@ fi
 # Disable by exporting AUTO_EXIT_ON_EPISODE_END=0 to keep the tmux session
 # alive for post-run inspection. EPISODE_TIMEOUT_S is the max wall-clock the
 # auto-driver waits for the end-of-episode signal before giving up.
+# POST_EPISODE_WAIT_S is a grace window AFTER the cache publisher exits: the
+# bridge stops emitting new actions, but MuJoCo's PD controller is still
+# driving the joints toward the last commanded targets, so the actual robot
+# pose lags the cache's final frame by ~1-5s. Recorder and tmux teardown are
+# delayed by this much so the saved mp4 captures the trailing settle motion.
 : "${AUTO_EXIT_ON_EPISODE_END:=1}"
 : "${EPISODE_TIMEOUT_S:=600}"
+: "${POST_EPISODE_WAIT_S:=5}"
 
 # Sim video recording. When RECORD_VIDEO=1 the MuJoCo on-screen viewer
 # window is captured to $LOGDIR/sim.mp4 via ffmpeg x11grab. We DON'T use the
@@ -466,6 +472,7 @@ EB_FILE_BAK="$EB_FILE_BAK"
 NEEDS_RESTORE="$NEEDS_RESTORE"
 AUTO_EXIT_ON_EPISODE_END="$AUTO_EXIT_ON_EPISODE_END"
 EPISODE_TIMEOUT_S="$EPISODE_TIMEOUT_S"
+POST_EPISODE_WAIT_S="$POST_EPISODE_WAIT_S"
 RECORD_VIDEO="$RECORD_VIDEO"
 VIDEO_PATH="$VIDEO_PATH"
 KEYBOARD_PORT="$KEYBOARD_PORT"
@@ -580,6 +587,32 @@ OFFLINE_STATE_PORT="$OFFLINE_STATE_PORT"
         sleep 0.5
     done
 
+    # Pause the bridge as soon as the episode ends so it stops emitting
+    # actions sourced from stale (or no longer published) camera frames.
+    # 'p' toggles run/pause in the bridge keyboard handler; the initial
+    # k -> i -> p sequence above leaves the bridge running, so this second
+    # 'p' flips it back to paused. With Plan A's 50Hz producer/consumer
+    # bridge, every second of "stale grace" would otherwise pump ~50 weird
+    # actions into WBC.
+    tmux send-keys -t "\$SESSION:\$WINDOW.\$KBD_PANE" 'p' Enter 2>/dev/null \
+        && echo "[auto] paused bridge (sent 'p' to kbd pane)" \
+        || echo "[auto] could not send pause to kbd pane"
+
+    # Grace window: cache publisher has exited, but the last 1-5s of motion
+    # is still being executed by MuJoCo PD + WBC. Keep the recorder running
+    # and the bridge/WBC/sim panes alive so the saved mp4 + logs capture the
+    # settle motion. Skip by exporting POST_EPISODE_WAIT_S=0.
+    if (( POST_EPISODE_WAIT_S > 0 )); then
+        echo "[auto] sleeping \${POST_EPISODE_WAIT_S}s post-episode for PD/sim to settle"
+        for _ in \$(seq 1 \$POST_EPISODE_WAIT_S); do
+            if ! tmux has-session -t "\$SESSION" 2>/dev/null; then
+                echo "[auto] tmux session '\$SESSION' gone during post-episode wait; skipping rest"
+                break
+            fi
+            sleep 1
+        done
+    fi
+
     # Finalize the recorder FIRST. x11_window_recorder.py traps SIGTERM and
     # forwards SIGINT to ffmpeg, which writes the mp4 trailer (moov atom)
     # before exiting. If we kill the tmux session first, the recorder dies
@@ -654,7 +687,10 @@ cat <<EOF
            offline cache starts only after WBC Init Done + k/i/p
            auto-driver: yaml elastic-band restored + k/i/p sent on 'Init Done',
                         and on 'episode finished' the whole session + MuJoCo
-                        viewer/children are torn down (AUTO_EXIT_ON_EPISODE_END=$AUTO_EXIT_ON_EPISODE_END,
+                        viewer/children are torn down after a
+                        POST_EPISODE_WAIT_S=${POST_EPISODE_WAIT_S}s grace window so
+                        MuJoCo PD can settle on the final pose
+                        (AUTO_EXIT_ON_EPISODE_END=$AUTO_EXIT_ON_EPISODE_END,
                         timeout=${EPISODE_TIMEOUT_S}s; see $LOGDIR/auto.log)
            attach:        tmux attach -t $SESSION
            switch pane:   Ctrl-b o   (cycle)   Ctrl-b <arrow>   (directional)

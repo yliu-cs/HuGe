@@ -200,13 +200,26 @@ class Server:
 
     async def _recv_loop(self, ws):
         while True:
-            text = await ws.receive_text()
+            # Handle both text (legacy JSON-with-base64-PNG) and binary
+            # (length-prefixed JSON header + raw image bytes) frames. The
+            # binary path skips the bridge-side PNG encode + server-side
+            # decode round-trip, saving ~10ms/tick on 480x640 frames.
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
             try:
-                payload = json.loads(text)
+                data = msg.get("bytes")
+                text = msg.get("text")
+                if data is not None:
+                    obs = self._parse_binary_obs(data)
+                elif text is not None:
+                    payload = json.loads(text)
+                    obs = self._parse_obs(payload)
+                else:
+                    continue
             except Exception as e:  # noqa: BLE001
                 print(f"[serve] bad obs payload: {e!r}")
                 continue
-            obs = self._parse_obs(payload)
             with self._obs_lock:
                 self._latest_obs = obs
             if self.controller is None and not self._controller_starting:
@@ -297,6 +310,28 @@ class Server:
         out["text"] = str(payload.get("text", "perform the task"))
         if "proprio" in payload:
             out["proprio"] = np.asarray(payload["proprio"], dtype=np.float32)
+        return out
+
+    @staticmethod
+    def _parse_binary_obs(data: bytes) -> dict[str, Any]:
+        """Decode a single binary WS frame produced by the bridge:
+
+            [4 bytes BE: header_len N]
+            [N bytes:    JSON header — text, proprio, img_shape, img_dtype]
+            [remaining:  raw image bytes (C-contiguous)]
+        """
+        header_len = int.from_bytes(data[:4], "big")
+        header = json.loads(data[4 : 4 + header_len])
+        img_bytes = data[4 + header_len :]
+        shape = tuple(int(x) for x in header["img_shape"])
+        dtype = np.dtype(header["img_dtype"])
+        img_np = np.frombuffer(img_bytes, dtype=dtype).reshape(shape)
+        out: dict[str, Any] = {
+            "image": _TRAIN_IMG_TRANSFORM(Image.fromarray(img_np)),
+            "text": str(header.get("text", "perform the task")),
+        }
+        if "proprio" in header:
+            out["proprio"] = np.asarray(header["proprio"], dtype=np.float32)
         return out
 
 

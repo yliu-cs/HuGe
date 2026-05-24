@@ -7,9 +7,13 @@ NVIDIA GR00T stack. Differences:
 * The Kappa server speaks WebSocket JSON (see ``src/inference/kappa_serve_rtc.py``)
   instead of Isaac-GR00T's ZMQ REQ/REP ``PolicyClient``.
 * The server's ``RealTimeChunkController`` already runs the RTC chunker
-  internally at 50 Hz, so the bridge drives one ws send -> one ws recv ->
-  one ZMQ pose publish per tick. There is no client-side chunk indexing
-  or latency-compensated horizon advance.
+  internally at ``ctrl_hz`` (default 50 Hz). The bridge runs three
+  concurrent asyncio tasks sharing a single ``SharedSlot``: ``obs_publisher``
+  paces obs sends at ``tick_hz``, ``action_consumer`` drains server-pushed
+  actions into the slot, and ``wbc_publisher`` fires the latest slot value
+  to WBC at strict ``tick_hz`` cadence. Decoupling obs send from action
+  recv means WBC sees a steady 50 Hz frame_index stream even when an
+  individual obs round-trip takes longer than the tick period.
 * The server returns ``[64 SONIC latent | 2 hand bits]``; the bridge
   thresholds the 2 hand bits at 0.5 and expands them to 7-DoF left/right
   hand joints using ``G1GripperInverseKinematicsSolver`` (open = zeros,
@@ -22,8 +26,6 @@ are up.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import time
 from dataclasses import dataclass
@@ -32,7 +34,6 @@ import numpy as np
 import tyro
 import websockets
 import zmq
-from PIL import Image
 
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.keyboard_subscriber import (
@@ -318,25 +319,40 @@ def make_keyboard_handler(
 
 
 # ---------------------------------------------------------------------------
-# Main tick loop
+# Concurrent producer/consumer tasks
 # ---------------------------------------------------------------------------
+#
+# We split the bridge into three independent asyncio tasks sharing a single
+# ``SharedSlot`` for the latest action. This decouples WBC pacing from the
+# WS round-trip and obs-encode cost so the ZMQ action stream to WBC fires
+# at a strict ``cfg.tick_hz`` cadence even when an individual obs send is
+# slow. The server's ``_send_loop`` already pushes a new action version per
+# server tick — we simply consume them as they arrive.
 
 
-async def tick_loop(
+class SharedSlot:
+    """Latest action from the server. Single-writer/single-reader via the
+    asyncio event loop, so no lock is needed."""
+
+    __slots__ = ("action", "version")
+
+    def __init__(self) -> None:
+        self.action: np.ndarray | None = None
+        self.version: int = -1
+
+
+async def obs_publisher(
     cfg: Cfg,
     ws,
     state_sub: ZMQStateSubscriber,
     cam_sub: ComposedCameraClientSensor,
-    zmq_socket: zmq.Socket,
     state: LoopState,
-    handle_kb,
 ) -> None:
+    """Pace obs at ``tick_hz`` and push to the server WS without waiting for
+    a reply. Replies are drained by ``action_consumer``."""
     period = 1.0 / float(cfg.tick_hz)
     next_t = time.perf_counter()
-    last_log = time.perf_counter()
     while True:
-        handle_kb()
-
         if state.pause:
             await asyncio.sleep(0.05)
             next_t = time.perf_counter()
@@ -346,32 +362,89 @@ async def tick_loop(
         cam_msg = await asyncio.to_thread(cam_sub.read)
         if state_msg is None or cam_msg is None:
             await asyncio.sleep(period)
+            next_t = time.perf_counter()
             continue
 
         img = cam_msg["images"]["ego_view"]
         if img.dtype != np.uint8:
             img = np.clip(img, 0, 255).astype(np.uint8)
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        img = np.ascontiguousarray(img)
 
         proprio, state.prev_jp = assemble_proprio(state_msg, state.prev_jp, cfg.tick_hz)
 
-        payload = {
-            "image": img_b64,
+        # Binary WS frame: 4-byte BE header length + UTF-8 JSON header + raw
+        # image bytes. Skips the PNG encode that previously cost ~5-15ms/tick
+        # on 480x640 frames; server decodes via np.frombuffer + reshape.
+        header = {
             "text": state.prompt,
             "proprio": proprio.tolist(),
+            "img_shape": list(img.shape),
+            "img_dtype": str(img.dtype),
         }
-        await ws.send(json.dumps(payload))
-        reply = json.loads(await ws.recv())
-        sonic = np.asarray(reply["sonic"], dtype=np.float32)
+        header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        payload = (
+            len(header_bytes).to_bytes(4, "big") + header_bytes + img.tobytes()
+        )
+        await ws.send(payload)
+
+        next_t += period
+        sleep_for = next_t - time.perf_counter()
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+        else:
+            next_t = time.perf_counter()
+
+
+async def action_consumer(ws, slot: SharedSlot) -> None:
+    """Drain server-pushed actions and update ``slot`` with the latest one."""
+    while True:
+        raw = await ws.recv()
+        try:
+            reply = json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            print(f"[bridge] bad reply: {e!r}")
+            continue
+        sonic = np.asarray(reply.get("sonic", []), dtype=np.float32)
         if sonic.shape != (66,):
             print(f"[bridge] unexpected sonic shape {sonic.shape}; skipping")
-            await asyncio.sleep(period)
             continue
+        slot.action = sonic
+        slot.version = int(reply.get("version", slot.version + 1))
+
+
+async def wbc_publisher(
+    cfg: Cfg,
+    zmq_socket: zmq.Socket,
+    state: LoopState,
+    slot: SharedSlot,
+    handle_kb,
+) -> None:
+    """At strict ``tick_hz`` cadence, pack the latest action in ``slot`` and
+    publish it to WBC over ZMQ. Repeats the latest action if no new version
+    has arrived since the last tick — WBC keys on ``frame_index`` and the
+    SONIC decoder expects a steady 50 Hz pulse."""
+    period = 1.0 / float(cfg.tick_hz)
+    next_t = time.perf_counter()
+    last_log = next_t
+    while True:
+        handle_kb()
+
+        if state.pause:
+            await asyncio.sleep(0.05)
+            next_t = time.perf_counter()
+            continue
+
+        sonic = slot.action
+        if sonic is None:
+            # Server hasn't pushed a chunk yet (warm-up). Idle until it does.
+            await asyncio.sleep(period)
+            next_t = time.perf_counter()
+            continue
+
         motion_token = sonic[:64]
         hand_bits = sonic[64:66]
         lh, rh = hand_bits_to_joints(hand_bits, cfg.hand_bit_threshold)
+        version = slot.version
 
         msg = pack_latent_action_message(
             motion_token=motion_token,
@@ -381,7 +454,7 @@ async def tick_loop(
         )
         if cfg.dry_run:
             print(
-                f"[dry-run] frame={state.frame} version={reply.get('version')} "
+                f"[dry-run] frame={state.frame} version={version} "
                 f"motion[:4]={motion_token[:4]} bits={hand_bits}"
             )
         else:
@@ -389,7 +462,7 @@ async def tick_loop(
             now = time.perf_counter()
             if now - last_log > 1.0:
                 _green(
-                    f"ZMQ: sent action frame={state.frame} version={reply.get('version')} "
+                    f"ZMQ: sent action frame={state.frame} version={version} "
                     f"bits={hand_bits.round(2).tolist()}"
                 )
                 last_log = now
@@ -401,6 +474,37 @@ async def tick_loop(
             await asyncio.sleep(sleep_for)
         else:
             next_t = time.perf_counter()
+
+
+async def run_session(
+    cfg: Cfg,
+    ws,
+    state_sub: ZMQStateSubscriber,
+    cam_sub: ComposedCameraClientSensor,
+    zmq_socket: zmq.Socket,
+    state: LoopState,
+    handle_kb,
+) -> None:
+    """Run the three concurrent tasks for the lifetime of one WS connection.
+    Returns (and propagates) when any task raises — the outer reconnect loop
+    handles WS exceptions."""
+    slot = SharedSlot()
+    tasks = [
+        asyncio.create_task(obs_publisher(cfg, ws, state_sub, cam_sub, state)),
+        asyncio.create_task(action_consumer(ws, slot)),
+        asyncio.create_task(wbc_publisher(cfg, zmq_socket, state, slot, handle_kb)),
+    ]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +539,7 @@ async def run(cfg: Cfg) -> None:
                 ) as ws:
                     _green(f"[bridge] connected to {url}")
                     backoff = 0.5
-                    await tick_loop(cfg, ws, state_sub, cam_sub, zmq_socket, state, handle_kb)
+                    await run_session(cfg, ws, state_sub, cam_sub, zmq_socket, state, handle_kb)
             except (websockets.WebSocketException, OSError, ConnectionRefusedError) as e:
                 # WebSocketException covers ConnectionClosed *and* handshake
                 # failures like InvalidMessage (raised when the server's TCP

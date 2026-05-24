@@ -1,5 +1,7 @@
 # $\kappa_{0}$: A Foundation Vision-Language-Action Model for General Humanoid Robot Loco-Manipulation Control
 
+`claude --resume 28545022-29bc-4a84-92dc-84e40fa7f9ca`
+
 ## 🏠 Installation
 
 ```bash
@@ -71,6 +73,35 @@ the deployed chain can drive the MuJoCo G1 stably from offline inputs.
 
 Attach with `tmux attach -t kappa_sim_test`. Logs land in
 `.runs/sim_test/<timestamp>/`.
+
+## ⏱️ Kappa Inference Speed Benchmark
+
+Use this script to benchmark the Kappa model inference path used by
+`scripts/eval/run_kappa_sim_test.sh` without launching WebSocket, bridge, WBC,
+or MuJoCo. It reuses the server-side model loading, image preprocessing,
+proprio normalization, scheduler setup, and RTC chunk inference call.
+
+```bash
+.venv/bin/python scripts/eval/benchmark_kappa_inference_speed.py \
+  --weights .runs/kappa/170R+85E/real/checkpoints/ckpt_1300/model.safetensors \
+  --backbone resource/model/Qwen3-VL-2B-Instruct \
+  --proprio-stats resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json \
+  --device cuda:0 \
+  --input-source offline \
+  --data-root resource/dataset/proprietary/real/2026-05-23 \
+  --episode-index 123 \
+  --warmup 3 \
+  --iters 30 \
+  --json-out .runs/eval/kappa_infer_speed.json
+```
+
+For a quick model-path smoke benchmark without reading the offline dataset:
+
+```bash
+.venv/bin/python scripts/eval/benchmark_kappa_inference_speed.py \
+  --input-source dummy \
+  --weights .runs/kappa/170R+85E/real/checkpoints/ckpt_1300/model.safetensors
+```
 
 ## 🤖 Deployment
 
