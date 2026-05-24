@@ -2,7 +2,7 @@
 
 Mirrors :class:`HEDataset` minus the G1/H1 robot-type filter (the proprietary
 set is G1-only) and with the small schema deltas needed to consume the
-LeRobot v2.1 layout in ``resource/dataset/proprietary/2026-05-16``:
+LeRobot v2.1 layout in ``resource/dataset/proprietary/real/2026-05-16``:
 
 * ``tasks.jsonl`` uses the key ``"task"`` (HE uses ``"description"``).
 * Episode mp4s live under ``videos/chunk-XXX/observation.images.ego_view/``

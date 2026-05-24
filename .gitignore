@@ -36,3 +36,5 @@ bench_*.py
 *.zip
 tmp
 G1 deploy doc.pdf
+tools
+upload.sh
