@@ -23,7 +23,10 @@ class KappaPolicyConfig:
 
     weights: str
     backbone: str = "resource/model/Qwen3-VL-2B-Instruct"
-    proprio_stats: str = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
+    # Optional override. When ``None``, ``_load_stats`` discovers
+    # ``proprio_stats.json`` bundled next to ``weights`` (written by Trainer
+    # at fine-tune save time), with the legacy HE+WBT global as last fallback.
+    proprio_stats: Optional[str] = None
     # Must match the training-time ``data.normalize_mode``. ``bounds_q99`` reads
     # q01/q99 (the default Kappa training pipeline); ``bounds`` reads min/max.
     normalize_mode: str = "bounds_q99"
@@ -110,25 +113,20 @@ class KappaPolicy:
         self._scheduler_sonic = FlowMatchEulerDiscreteScheduler(num_train_timesteps=n)
 
     def _load_stats(self) -> None:
-        with open(self.cfg.proprio_stats) as f:
-            pstats = json.load(f).get("proprio", {})
+        from src.data.tokenized_video_dataset import _load_normalize_bounds
+        from src.inference.proprio_stats_loader import discover_proprio_stats
 
-        mode = self.cfg.normalize_mode
-        if mode == "bounds":
-            lo_key, hi_key = "min", "max"
-        elif mode == "bounds_q99":
-            lo_key, hi_key = "q01", "q99"
-        else:
-            raise ValueError(f"unknown normalize_mode {mode!r}")
-
-        def _bounds(d: dict) -> tuple[np.ndarray, np.ndarray]:
-            lo = np.asarray(d[lo_key], dtype=np.float32)
-            hi = np.asarray(d[hi_key], dtype=np.float32)
-            ill = np.abs(hi - lo) < 1e-4 * (np.abs(hi) + np.abs(lo) + 1e-8)
-            hi = np.where(ill, lo + 1.0, hi)
-            return lo, hi
-
-        self.proprio_min, self.proprio_max = _bounds(pstats)
+        resolved_path, parsed = discover_proprio_stats(
+            self.cfg.weights, explicit_path=self.cfg.proprio_stats,
+        )
+        out = _load_normalize_bounds(parsed, "proprio", 64, self.cfg.normalize_mode)
+        if out is None:
+            raise ValueError(
+                f"proprio stats JSON at {resolved_path!r} has no 'proprio' section"
+            )
+        self.proprio_min, hi_safe, _ = out
+        self.proprio_max = hi_safe
+        print(f"[kappa-policy] loaded proprio bounds ({self.cfg.normalize_mode}) from {resolved_path}")
 
     # ------------------------------------------------------------------
     # Normalization helpers

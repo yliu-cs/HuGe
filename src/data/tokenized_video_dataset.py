@@ -79,10 +79,17 @@ def _load_normalize_bounds(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Pre-compute (lo, hi, ill_mask) from a stats dict.
 
-    ``stats`` is the parsed JSON written by ``calc_g1_proprio_stats.py``.
-    ``mode`` selects between ``"bounds"`` (uses ``min``/``max``) and
-    ``"bounds_q99"`` (uses ``q01``/``q99``). Returns ``None`` if ``stats`` is
-    missing — datasets fall back to raw pass-through.
+    Accepts two on-disk schemas under ``stats[key]``:
+      * legacy flat: ``{lo_key: [dim], hi_key: [dim]}`` (HE+WBT
+        ``g1_proprio_stats.json`` written by ``calc_g1_proprio_stats.py``).
+      * grouped: ``{<group>: {lo_key: [...], hi_key: [...]}, ...}`` written
+        by ``scripts/preprocess/proprietary/calc_proprio_stats.py``. The
+        13-group layout in ``src.data.proprio_layout`` is concatenated back
+        to a flat ``(dim,)`` vector in layout order.
+
+    ``mode`` selects ``"bounds"`` (min/max) vs ``"bounds_q99"`` (q01/q99).
+    Returns ``None`` if ``stats`` is missing — datasets fall back to raw
+    pass-through.
     """
     if stats is None:
         return None
@@ -95,8 +102,16 @@ def _load_normalize_bounds(
         lo_key, hi_key = "q01", "q99"
     else:
         raise ValueError(f"unknown stats mode {mode!r}")
-    lo = np.asarray(section[lo_key], dtype=np.float32)
-    hi = np.asarray(section[hi_key], dtype=np.float32)
+    # Flat schema has the stat key directly under ``section``; grouped has
+    # group names instead, each carrying its own ``{min,max,q01,q99}``.
+    if lo_key in section and hi_key in section:
+        lo = np.asarray(section[lo_key], dtype=np.float32)
+        hi = np.asarray(section[hi_key], dtype=np.float32)
+    else:
+        from src.data.proprio_layout import assemble_flat_from_groups
+        assembled = assemble_flat_from_groups(section, stat_keys=(lo_key, hi_key))
+        lo = assembled[lo_key].astype(np.float32, copy=False)
+        hi = assembled[hi_key].astype(np.float32, copy=False)
     if lo.shape != (dim,) or hi.shape != (dim,):
         raise ValueError(
             f"stats[{key}][{lo_key}/{hi_key}] expected ({dim},), got {lo.shape}/{hi.shape}"

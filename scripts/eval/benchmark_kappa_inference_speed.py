@@ -43,7 +43,6 @@ from src.inference.kappa_rtc_controller import RealTimeChunkController  # noqa: 
 
 DEFAULT_CKPT = ".runs/kappa/170R+85E/real/checkpoints/ckpt_1300/model.safetensors"
 DEFAULT_BACKBONE = "resource/model/Qwen3-VL-2B-Instruct"
-DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
 DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
 DEFAULT_PROMPT = "Grab the cola, turn left, throw into the trash bin"
 
@@ -320,7 +319,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--backbone", default=os.environ.get("KAPPA_BACKBONE", DEFAULT_BACKBONE))
     ap.add_argument(
         "--proprio-stats",
-        default=os.environ.get("KAPPA_PROPRIO_STATS", DEFAULT_PROPRIO_STATS),
+        default=os.environ.get("KAPPA_PROPRIO_STATS") or None,
+        help="Optional override. When omitted, the controller auto-discovers "
+             "proprio_stats.json next to the checkpoint (bundled by Trainer).",
     )
     ap.add_argument("--device", default=os.environ.get("KAPPA_DEVICE", "cuda:0"))
     ap.add_argument("--ctrl-hz", type=float, default=float(os.environ.get("CTRL_HZ", "50")))
@@ -375,8 +376,8 @@ def main() -> None:
     args = parse_args()
     if not Path(args.weights).exists():
         raise FileNotFoundError(f"Kappa checkpoint not found: {args.weights}")
-    if args.use_proprio and not Path(args.proprio_stats).exists():
-        raise FileNotFoundError(f"Proprio stats not found: {args.proprio_stats}")
+    if args.use_proprio and args.proprio_stats and not Path(args.proprio_stats).exists():
+        raise FileNotFoundError(f"Proprio stats override not found: {args.proprio_stats}")
 
     torch.set_grad_enabled(False)
     controller = _load_controller(args)

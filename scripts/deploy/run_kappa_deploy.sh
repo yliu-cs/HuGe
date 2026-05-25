@@ -24,9 +24,12 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:=.runs/kappa/170R+85E_real.kappa.b1024.gpus8.2605241244/ckpt_1300/model.safetensors}"
+: "${KAPPA_CKPT:=.runs/kappa/170R+85E/real.kappa.b1024.gpus8.2605242023/checkpoints/ckpt_3000/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
-: "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
+# Proprio stats are auto-discovered next to KAPPA_CKPT (Trainer bundles
+# proprio_stats.json into each ckpt_<step>/). Export KAPPA_PROPRIO_STATS to
+# force an override; otherwise leave unset.
+: "${KAPPA_PROPRIO_STATS:=}"
 : "${KAPPA_HOST:=0.0.0.0}"
 : "${WS_PORT:=8765}"
 : "${CTRL_HZ:=50}"
@@ -34,6 +37,9 @@ cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 : "${WBC_MODE:=real}"               # `real` for hardware, `sim` for MuJoCo loopback
 : "${WBC_INPUT_TYPE:=zmq_manager}"
+: "${HAND_TYPE:=inspire}"           # `inspire` or `dex3`; MUST match the C++ deploy's --hand-type
+                                    # so the bridge thresholds g1_debug.*_q_measured
+                                    # using the right polarity (see run_kappa_inference.py).
 
 : "${WS_CLIENT_HOST:=localhost}"    # how the bridge reaches the server
 # Real-robot deploy: camera frames are always published by the G1 itself,
@@ -129,14 +135,14 @@ REPO=$(pwd)
 SERVE_CMD="cd $REPO && $PY src/inference/kappa_serve_rtc.py \
   --weights '$KAPPA_CKPT' \
   --backbone '$KAPPA_BACKBONE' \
-  --proprio-stats '$KAPPA_PROPRIO_STATS' \
+  ${KAPPA_PROPRIO_STATS:+--proprio-stats '$KAPPA_PROPRIO_STATS' }\
   --normalize-mode bounds_q99 \
   --device '$KAPPA_DEVICE' \
   --ctrl-hz $CTRL_HZ \
   --host $KAPPA_HOST --port $WS_PORT"
 
 WBC_CMD="cd $REPO/GR00T-WholeBodyControl/gear_sonic_deploy && \
-  ./deploy.sh --input-type $WBC_INPUT_TYPE --hand-type inspire $WBC_MODE"
+  ./deploy.sh --input-type $WBC_INPUT_TYPE --hand-type $HAND_TYPE $WBC_MODE"
 
 BRIDGE_CMD="cd $REPO && $PY scripts/deploy/run_kappa_inference.py \
   --ws-host $WS_CLIENT_HOST --ws-port $WS_PORT \
@@ -145,6 +151,7 @@ BRIDGE_CMD="cd $REPO && $PY scripts/deploy/run_kappa_inference.py \
   --action-zmq-host $ACTION_HOST --action-zmq-port $ACTION_PORT \
   --keyboard-zmq-host $KEYBOARD_HOST --keyboard-zmq-port $KEYBOARD_PORT \
   --prompt '$BRIDGE_PROMPT' \
+  --hand-type $HAND_TYPE \
   --tick-hz $CTRL_HZ${LOG_DIR:+ --log-dir '$LOG_DIR'}"
 
 KBD_CMD="cd $REPO && $PY scripts/deploy/keyboard_pub.py --port $KEYBOARD_PORT"

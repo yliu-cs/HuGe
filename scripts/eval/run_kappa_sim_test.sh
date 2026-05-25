@@ -36,9 +36,12 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # cd to Kappa repo root
 
 # ---------- env defaults (override before invocation) ----------
-: "${KAPPA_CKPT:=.runs/kappa/170R+85E_real.kappa.b1024.gpus8.2605241244/ckpt_1300/model.safetensors}"
+: "${KAPPA_CKPT:=.runs/kappa/170R+85E/real.kappa.b1024.gpus8.2605242023/checkpoints/ckpt_3000/model.safetensors}"
 : "${KAPPA_BACKBONE:=resource/model/Qwen3-VL-2B-Instruct}"
-: "${KAPPA_PROPRIO_STATS:=resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json}"
+# Proprio stats are auto-discovered next to KAPPA_CKPT (Trainer bundles
+# proprio_stats.json into each ckpt_<step>/). Export KAPPA_PROPRIO_STATS to
+# force an override; otherwise leave unset.
+: "${KAPPA_PROPRIO_STATS:=}"
 : "${KAPPA_HOST:=0.0.0.0}"
 : "${WS_PORT:=8765}"
 : "${CTRL_HZ:=50}"
@@ -290,7 +293,7 @@ REPO=$(pwd)
 SERVE_CMD="cd $REPO && $PY src/inference/kappa_serve_rtc.py \
   --weights '$KAPPA_CKPT' \
   --backbone '$KAPPA_BACKBONE' \
-  --proprio-stats '$KAPPA_PROPRIO_STATS' \
+  ${KAPPA_PROPRIO_STATS:+--proprio-stats '$KAPPA_PROPRIO_STATS' }\
   --normalize-mode bounds_q99 \
   --device '$KAPPA_DEVICE' \
   --ctrl-hz $CTRL_HZ \

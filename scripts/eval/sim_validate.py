@@ -192,7 +192,9 @@ def main() -> None:
     ap.add_argument("--backbone", help="Backbone path. Maps to KAPPA_BACKBONE.")
     ap.add_argument(
         "--proprio-stats",
-        help="Proprio stats JSON. Maps to KAPPA_PROPRIO_STATS.",
+        help="Optional proprio stats JSON override. Maps to KAPPA_PROPRIO_STATS. "
+             "When unset, the inner server auto-discovers proprio_stats.json "
+             "bundled next to the checkpoint (written by Trainer.save_checkpoint).",
     )
     ap.add_argument("--device", help="Inference device. Maps to KAPPA_DEVICE.")
     ap.add_argument("--ctrl-hz", type=float, help="Control rate. Maps to CTRL_HZ.")

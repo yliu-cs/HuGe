@@ -350,6 +350,7 @@ class Trainer(ABC):
                 seen_ptrs.add(ptr)
                 state_dict[k] = v.cpu()
             save_safetensors(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
+            self._bundle_proprio_stats(ckpt_dir)
 
         self.accelerator.wait_for_everyone()
 
@@ -368,6 +369,38 @@ class Trainer(ABC):
 
         self.accelerator.wait_for_everyone()
         return ckpt_dir
+
+    def _bundle_proprio_stats(self, ckpt_dir: str) -> None:
+        """Copy the active dataset's proprio stats JSON into ``ckpt_dir``.
+
+        Discovery order (first existing source wins): top-level
+        ``data_cfg.proprio_stats_path`` for single-dataset configs (prop /
+        he / wbt), then mix children ``data_cfg.{prop,he,wbt}.proprio_stats_path``.
+        This makes each ckpt self-contained so inference / deploy / eval can
+        ``discover_proprio_stats(weights_path)`` without a hardcoded global
+        default.
+        """
+        candidates: list[str] = []
+        top = getattr(self.data_cfg, "proprio_stats_path", None)
+        if top:
+            candidates.append(top)
+        for child in ("prop", "he", "wbt"):
+            sub = getattr(self.data_cfg, child, None)
+            sub_path = getattr(sub, "proprio_stats_path", None) if sub is not None else None
+            if sub_path:
+                candidates.append(sub_path)
+        src_path: str | None = next((p for p in candidates if p and os.path.isfile(p)), None)
+        if src_path is None:
+            overwatch.warning(
+                "no proprio_stats_path resolves to an existing file on data_cfg; "
+                "ckpt will not bundle proprio_stats.json (inference will fall back to legacy default)."
+            )
+            return
+        dst = os.path.join(ckpt_dir, "proprio_stats.json")
+        try:
+            shutil.copyfile(src_path, dst)
+        except OSError as e:
+            overwatch.warning(f"failed to bundle proprio_stats.json into {ckpt_dir}: {e}")
 
     def set_train(self):
         self.model.train()

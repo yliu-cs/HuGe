@@ -89,6 +89,13 @@ class Cfg:
     tick_hz: float = 50.0
     hand_bit_threshold: float = 0.5
 
+    # Hand backend on the C++ side — selects how `*_q_measured` joint vectors
+    # are thresholded into the binary [closed_left, closed_right] proprio bits.
+    # MUST match `--hand-type` passed to gear_sonic_deploy/deploy.sh, otherwise
+    # the policy sees polarity-flipped or stuck-at-zero hand feedback and the
+    # downstream inference goes off-distribution.
+    hand_type: str = "dex3"
+
     # Debug: print actions instead of publishing ZMQ
     dry_run: bool = False
 
@@ -163,30 +170,65 @@ def hand_bits_to_joints(bits: np.ndarray, threshold: float) -> tuple[np.ndarray,
 # Hand-state -> 1-bit detector (mirror of training-side observation.hand_binary_state)
 # ---------------------------------------------------------------------------
 #
-# Dex3 ``_get_middle_close_q_desired()`` puts q[1] at ±0.7 (closed) and 0
-# (open), with the right hand mirroring the left's sign convention. abs()
-# collapses the L/R polarity into a single 0..0.7 magnitude, and 0.35 is the
-# midpoint — wide hysteresis-free detector that matches the training-side
-# binary state without needing the IK solver at runtime.
-_HAND_CLOSED_Q1_THRESHOLD = 0.35
+# Training-side thresholds — kept verbatim from
+# GR00T-WholeBodyControl/gear_sonic/scripts/run_data_exporter.py so the policy
+# sees the same observation.hand_binary_state convention at deploy time.
+#
+# Dex3 (7-DoF, signed angles): closed iff max(|q|) / 1.5 >= 0.5, i.e. any DoF
+#   has |q| >= 0.75 rad.
+# Inspire (6 motors + 1 padding, q in [0, 1] with 1 = fully OPEN): closed iff
+#   max(1 - clip(q[:6], 0, 1)) >= 0.5, i.e. any of the first six DoF has
+#   dropped to <= 0.5. Polarity is INVERTED from Dex3 — using the Dex3 rule on
+#   Inspire data produces a hand_bit that is wrong in the common case (closed
+#   hand reads as open, open hand reads as closed) and silently sticks at 0
+#   when the Inspire DDS service is down (getStateQ7 returns zero-init array).
+_HAND_BINARY_CLOSE_THRESHOLD = 0.5
+_DEX3_FULL_CLOSE_ABS = 1.5
 
 # Once-per-process diagnostic flags so we don't spam every tick.
 _HAND_SOURCE_LOGGED: set[str] = set()
 
+# Watchdog: count consecutive ticks where the raw q vectors are exactly
+# all-zero on both hands. A live robot's hand encoders never read identically
+# zero on every joint — getting a fresh all-zero q is the unambiguous
+# signature of a stale DDS state (Inspire's getStateQ7 returns its zero-init
+# array; Dex3 returns zeros when encoders haven't come up). We watch this on
+# raw q rather than on the binary bit because the bit is hand_type-dependent
+# (Inspire emits 1 on all-zero q, Dex3 emits 0) so a bit-level check would
+# miss one of the two failure modes.
+_HAND_ZERO_STREAK = [0]  # mutable container so we can update from a function
 
-def _q7_to_hand_bit(q7) -> float | None:
-    """Threshold a Dex3 7-DoF joint vector into a binary closed bit, or
-    return ``None`` if the array is missing / wrong-shape so the caller can
-    fall back to the next preferred source."""
+
+def _q7_to_hand_bit(q7, hand_type: str) -> float | None:
+    """Threshold a 7-DoF hand joint vector into a binary closed bit per the
+    training-side ``_hand_binary_state`` convention. Returns ``None`` when the
+    input is missing or wrong-shape so the caller can fall through to the
+    next preferred source.
+
+    ``hand_type`` must be one of ``"dex3"`` or ``"inspire"``. Unknown values
+    fall back to the Dex3 rule with a one-shot warning so a typo in the bridge
+    CLI doesn't go unnoticed.
+    """
     if q7 is None:
         return None
     arr = np.asarray(q7, dtype=np.float32)
     if arr.shape != (7,):
         return None
-    return float(abs(arr[1]) > _HAND_CLOSED_Q1_THRESHOLD)
+    if hand_type == "inspire":
+        q6 = np.clip(arr[:6], 0.0, 1.0)
+        return float(np.max(1.0 - q6) >= _HAND_BINARY_CLOSE_THRESHOLD)
+    if hand_type != "dex3" and "hand_type_unknown" not in _HAND_SOURCE_LOGGED:
+        _HAND_SOURCE_LOGGED.add("hand_type_unknown")
+        print(
+            f"[bridge] WARNING: unknown --hand-type {hand_type!r}; falling "
+            "back to Dex3 thresholding. Pass --hand-type dex3 or "
+            "--hand-type inspire to silence."
+        )
+    close_amount = float(np.clip(np.max(np.abs(arr)) / _DEX3_FULL_CLOSE_ABS, 0.0, 1.0))
+    return float(close_amount >= _HAND_BINARY_CLOSE_THRESHOLD)
 
 
-def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
+def _hand_bits_from_state(state_msg: dict, hand_type: str) -> np.ndarray:
     """Resolve ``[left_closed, right_closed]`` (float32, 0/1) from the
     g1_debug ZMQ message.
 
@@ -210,12 +252,14 @@ def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
     real-deploy operator notices a stale C++ build or a degenerate cache.
     """
     measured_l, measured_r = state_msg.get("left_hand_q_measured"), state_msg.get("right_hand_q_measured")
-    lb, rb = _q7_to_hand_bit(measured_l), _q7_to_hand_bit(measured_r)
+    lb, rb = _q7_to_hand_bit(measured_l, hand_type), _q7_to_hand_bit(measured_r, hand_type)
     if lb is not None and rb is not None:
-        return np.array([lb, rb], dtype=np.float32)
+        bits = np.array([lb, rb], dtype=np.float32)
+        _maybe_warn_zero_streak(bits, hand_type, source="measured", q_pair=(measured_l, measured_r))
+        return bits
 
     cmd_l, cmd_r = state_msg.get("left_hand_q"), state_msg.get("right_hand_q")
-    lb, rb = _q7_to_hand_bit(cmd_l), _q7_to_hand_bit(cmd_r)
+    lb, rb = _q7_to_hand_bit(cmd_l, hand_type), _q7_to_hand_bit(cmd_r, hand_type)
     if lb is not None and rb is not None:
         if "commanded" not in _HAND_SOURCE_LOGGED:
             _HAND_SOURCE_LOGGED.add("commanded")
@@ -224,10 +268,12 @@ def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
                 "thresholding commanded *_q instead. Fine in sim, "
                 "may indicate a stale C++ build on real hardware."
             )
-        return np.array([lb, rb], dtype=np.float32)
+        bits = np.array([lb, rb], dtype=np.float32)
+        _maybe_warn_zero_streak(bits, hand_type, source="commanded", q_pair=(cmd_l, cmd_r))
+        return bits
 
     last_l, last_r = state_msg.get("last_left_hand_action"), state_msg.get("last_right_hand_action")
-    lb, rb = _q7_to_hand_bit(last_l), _q7_to_hand_bit(last_r)
+    lb, rb = _q7_to_hand_bit(last_l, hand_type), _q7_to_hand_bit(last_r, hand_type)
     if lb is not None and rb is not None:
         if "last_action" not in _HAND_SOURCE_LOGGED:
             _HAND_SOURCE_LOGGED.add("last_action")
@@ -235,7 +281,9 @@ def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
                 "[bridge] hand-state: only last_*_hand_action available; "
                 "using it as a proxy for current hand position."
             )
-        return np.array([lb, rb], dtype=np.float32)
+        bits = np.array([lb, rb], dtype=np.float32)
+        _maybe_warn_zero_streak(bits, hand_type, source="last_action", q_pair=(last_l, last_r))
+        return bits
 
     direct = state_msg.get("hand_bits")
     if direct is not None:
@@ -257,6 +305,52 @@ def _hand_bits_from_state(state_msg: dict) -> np.ndarray:
     return np.zeros(2, dtype=np.float32)
 
 
+def _maybe_warn_zero_streak(
+    bits: np.ndarray,
+    hand_type: str,
+    source: str,
+    q_pair: tuple,
+    *,
+    warn_after_ticks: int = 250,  # ~5 s at 50 Hz
+) -> None:
+    """Bark once if both raw q vectors stay identically zero across many ticks.
+
+    A healthy hand's encoder readback never lands on exactly zero across every
+    joint; an all-zero q is the fingerprint of a stale DDS state on either
+    backend (Inspire ``getStateQ7`` returns its zero-init array, Dex3 returns
+    zeros before encoders are up). The resulting binary bit is hand_type-
+    dependent — Inspire emits 1, Dex3 emits 0 — so we monitor q rather than
+    the bit and report whichever spurious value the policy is being fed.
+    """
+    ql, qr = q_pair
+    try:
+        ql_arr = np.asarray(ql, dtype=np.float32) if ql is not None else None
+        qr_arr = np.asarray(qr, dtype=np.float32) if qr is not None else None
+    except Exception:
+        ql_arr = qr_arr = None
+    ql_zero = ql_arr is not None and not bool(np.any(ql_arr))
+    qr_zero = qr_arr is not None and not bool(np.any(qr_arr))
+    if not (ql_zero and qr_zero):
+        _HAND_ZERO_STREAK[0] = 0
+        return
+    _HAND_ZERO_STREAK[0] += 1
+    if _HAND_ZERO_STREAK[0] != warn_after_ticks:
+        return
+    suspect = (
+        "Inspire DDS service (dfx_inspire_service / inspire_g1) not publishing"
+        if hand_type == "inspire"
+        else "Dex3 encoder DDS state stale"
+    )
+    spurious = "[1, 1] (looks 'both hands closed')" if hand_type == "inspire" else "[0, 0] (looks 'both hands open')"
+    print(
+        f"[bridge] WARNING: raw {source} hand q vectors stuck at all-zero "
+        f"for {warn_after_ticks} ticks (~{warn_after_ticks / 50.0:.1f}s), "
+        f"hand_type={hand_type!r}. Current bits={bits.tolist()}; this is "
+        f"the {spurious} failure mode. Likely cause: {suspect}. The policy "
+        "is being fed a fake hand state for the entire run."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Proprio assembly (64-D RAW; server normalizes via q01/q99)
 # ---------------------------------------------------------------------------
@@ -266,6 +360,7 @@ def assemble_proprio(
     state_msg: dict,
     prev_jp: np.ndarray | None,
     tick_hz: float,
+    hand_type: str = "dex3",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build the 64-D proprio vector from a g1_debug state message.
 
@@ -293,7 +388,7 @@ def assemble_proprio(
 
     out = np.empty(64, dtype=np.float32)
     out[0:29] = jp
-    out[29:31] = _hand_bits_from_state(state_msg)
+    out[29:31] = _hand_bits_from_state(state_msg, hand_type)
     out[31:60] = jv
     out[60:64] = quat_xyzw
     return out, jp
@@ -653,7 +748,9 @@ async def obs_publisher(
             img = np.clip(img, 0, 255).astype(np.uint8)
         img = np.ascontiguousarray(img)
 
-        proprio, state.prev_jp = assemble_proprio(state_msg, state.prev_jp, cfg.tick_hz)
+        proprio, state.prev_jp = assemble_proprio(
+            state_msg, state.prev_jp, cfg.tick_hz, cfg.hand_type
+        )
 
         # Binary WS frame: 4-byte BE header length + UTF-8 JSON header + raw
         # image bytes. Skips the PNG encode that previously cost ~5-15ms/tick

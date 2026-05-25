@@ -114,10 +114,23 @@ bash install_scripts/install_data_collection.sh
 cd ..
 ```
 
-On the G1, launch the camera service:
+SSH to G1, launch the camera service:
 
 ```bash
+ssh root@192.168.123.164
+v4l2-ctl --list-devices
 sudo systemctl restart composed_camera_server.service
+sudo systemctl restart inspire-g1.service
+```
+
+Connect to the camera streaming:
+
+```bash
+cd GR00T-WholeBodyControl
+source .venv_data_collection/bin/activate
+python gear_sonic/scripts/run_camera_viewer.py \
+  --camera-host 192.168.123.164 \
+  --camera-port 5555
 ```
 
 ### Sim evaluation

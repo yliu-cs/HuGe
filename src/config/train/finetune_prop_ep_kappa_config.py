@@ -25,9 +25,12 @@ from src.data.transform import (
 )
 
 
-# Proprio stats reused from the HE+WBT cache: same G1 robot, same 64-D layout,
-# so the existing q01/q99 bounds apply directly to proprietary observations.
-_DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
+# Per-dataset proprio stats, produced from this dataset's own episodes by
+# ``scripts/preprocess/proprietary/calc_proprio_stats.py``. The 13-group
+# schema is read by ``_load_normalize_bounds`` via ``proprio_layout``.
+# Trainer.save_checkpoint copies this JSON into each ckpt_<step>/ so deploy
+# / sim / eval can auto-discover it.
+_DEFAULT_PROPRIO_STATS = "resource/dataset/proprietary/real/2026-05-23/meta/proprio_stats.json"
 
 
 class FineTunePropDataTransform(DataTransform):

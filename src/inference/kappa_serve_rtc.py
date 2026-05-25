@@ -114,24 +114,20 @@ def _load_json(path: Optional[str]) -> Optional[dict]:
 
 
 def _load_proprio_bounds(
-    stats_path: str, mode: str,
+    parsed_stats: dict, mode: str, dim: int = 64,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Read q01/q99 (or min/max) for the 64-D proprio. Mirrors
-    :meth:`src.eval.kappa_policy.KappaPolicy._load_stats`.
+    """Return (lo, hi_safe) for the 64-D proprio.
+
+    Delegates to :func:`src.data.tokenized_video_dataset._load_normalize_bounds`
+    which auto-detects flat (HE+WBT legacy) vs grouped (per-dataset, 13-group)
+    schemas under ``parsed_stats["proprio"]``.
     """
-    with open(stats_path) as f:
-        pstats = json.load(f).get("proprio", {})
-    if mode == "bounds":
-        lo_key, hi_key = "min", "max"
-    elif mode == "bounds_q99":
-        lo_key, hi_key = "q01", "q99"
-    else:
-        raise ValueError(f"unknown normalize_mode {mode!r}")
-    lo = np.asarray(pstats[lo_key], dtype=np.float32)
-    hi = np.asarray(pstats[hi_key], dtype=np.float32)
-    ill = np.abs(hi - lo) < 1e-4 * (np.abs(hi) + np.abs(lo) + 1e-8)
-    hi = np.where(ill, lo + 1.0, hi)
-    return lo, hi
+    from src.data.tokenized_video_dataset import _load_normalize_bounds
+    out = _load_normalize_bounds(parsed_stats, "proprio", dim, mode)
+    if out is None:
+        raise ValueError("proprio stats JSON has no 'proprio' section")
+    lo, hi_safe, _ = out
+    return lo, hi_safe
 
 
 def _decode_image(payload: dict[str, Any]) -> Image.Image:
@@ -344,12 +340,16 @@ def _build_controller(args, wrapper, cfg, device):
     )
 
     if args.use_proprio:
+        from src.inference.proprio_stats_loader import discover_proprio_stats
+        resolved_path, parsed_stats = discover_proprio_stats(
+            args.weights, explicit_path=args.proprio_stats,
+        )
         proprio_min, proprio_max = _load_proprio_bounds(
-            args.proprio_stats, args.normalize_mode,
+            parsed_stats, args.normalize_mode,
         )
         print(
             f"[serve] loaded proprio bounds ({args.normalize_mode}) from "
-            f"{args.proprio_stats}"
+            f"{resolved_path}"
         )
     else:
         proprio_min, proprio_max = None, None
@@ -377,10 +377,11 @@ def main() -> None:
     parser.add_argument("--no-proprio", dest="use_proprio", action="store_false")
     parser.add_argument(
         "--proprio-stats",
-        default="resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json",
-        help="Path to the q01/q99 stats JSON used at training time. Required "
-             "when --use-proprio (default) is on; the server uses it to map "
-             "raw client proprio into the [-1, 1] band the model was trained on.",
+        default=None,
+        help="Explicit path to a stats JSON. Optional override — by default "
+             "the server discovers proprio_stats.json bundled next to "
+             "--weights (written by Trainer.save_checkpoint at fine-tune "
+             "time), then falls back to the legacy HE+WBT global file.",
     )
     parser.add_argument(
         "--normalize-mode",
