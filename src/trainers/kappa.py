@@ -23,11 +23,8 @@ class KappaCollator:
     Labels are not produced because the MoT path supervises via
     ``velocity_target`` only; the CE fallback in the model is unused at train.
 
-    When ``use_rtc`` is on, the collator draws a SONIC RTC delay, builds a
-    prefix-aware noisy SONIC chunk, and suppresses the loss on the substituted
-    prefix positions. When ``use_proprio`` is on, the collator stacks proprio
-    from each instance and adds Gaussian jitter (skipping hand-bit + quat
-    dims).
+    When ``use_proprio`` is on, the collator stacks proprio from each instance
+    and adds Gaussian jitter (skipping hand-bit + quat dims).
     """
 
     def __init__(
@@ -35,8 +32,6 @@ class KappaCollator:
         processor,
         model_max_length: int = 8192,
         use_proprio: bool = False,
-        use_rtc: bool = False,
-        sonic_max_delay: int = 8,
         proprio_noise_std: float = 0.02,
         proprio_drop_prob: float = 0.1,
         proprio_dim: int = 64,
@@ -44,8 +39,6 @@ class KappaCollator:
         self.processor = processor
         self.model_max_length = model_max_length
         self.use_proprio = use_proprio
-        self.use_rtc = use_rtc
-        self.sonic_max_delay = sonic_max_delay
         self.proprio_noise_std = proprio_noise_std
         self.proprio_drop_prob = proprio_drop_prob
         self.proprio_dim = proprio_dim
@@ -113,33 +106,9 @@ class KappaCollator:
 
             t = self._logit_normal_t(B)
             noise_s = torch.randn_like(sonic_tokens)
-
-            if self.use_rtc:
-                # SONIC RTC: prefix region gets t=0 (clean a) and is masked
-                # out of the loss. ``timesteps`` is per-sample (single t emb
-                # token still); the prefix substitution happens in the
-                # noisy_sonic field so the model attends to clean prefix
-                # values. This matches Psi0's training-time RTC.
-                delay_s = torch.randint(0, max(1, self.sonic_max_delay), (B,))
-                arange_s = torch.arange(T_s)
-                prefix_mask_s = arange_s[None, :] < delay_s[:, None]  # (B, T_s)
-                t_per_pos_s = torch.where(
-                    prefix_mask_s, torch.zeros_like(t)[:, None].expand(-1, T_s),
-                    t[:, None].expand(-1, T_s),
-                )
-                t_for_noise = t_per_pos_s[..., None]
-                noisy_sonic_tokens = t_for_noise * noise_s + (1 - t_for_noise) * sonic_tokens
-                velocity_target = noise_s - sonic_tokens
-                # Loss is suppressed on prefix positions.
-                postfix_mask_s = (~prefix_mask_s).to(sonic_mask.dtype)
-                if sonic_mask.dim() == 2:
-                    sonic_mask = sonic_mask * postfix_mask_s
-                else:
-                    sonic_mask = sonic_mask * postfix_mask_s.unsqueeze(-1)
-            else:
-                t_expanded = t[:, None, None]
-                noisy_sonic_tokens = t_expanded * noise_s + (1 - t_expanded) * sonic_tokens
-                velocity_target = noise_s - sonic_tokens
+            t_expanded = t[:, None, None]
+            noisy_sonic_tokens = t_expanded * noise_s + (1 - t_expanded) * sonic_tokens
+            velocity_target = noise_s - sonic_tokens
 
             result["noisy_sonic_tokens"] = noisy_sonic_tokens
             result["timesteps"] = t
@@ -202,7 +171,6 @@ class KappaTrainer(Trainer):
                 action_loss_weight=model_cfg.action_loss_weight,
                 use_proprio=getattr(model_cfg, "use_proprio", False),
                 proprio_dim=getattr(model_cfg, "proprio_dim", 64),
-                use_rtc=getattr(model_cfg, "use_rtc", False),
             )
 
         self.model_wrapper = model_wrapper
@@ -237,8 +205,6 @@ class KappaTrainer(Trainer):
             processor=self.vlm_processor,
             model_max_length=model_cfg.model_max_length,
             use_proprio=getattr(model_cfg, "use_proprio", False),
-            use_rtc=getattr(model_cfg, "use_rtc", False),
-            sonic_max_delay=getattr(model_cfg, "sonic_max_delay", 8),
             proprio_noise_std=getattr(model_cfg, "proprio_noise_std", 0.02),
             proprio_drop_prob=getattr(model_cfg, "proprio_drop_prob", 0.1),
             proprio_dim=getattr(model_cfg, "proprio_dim", 64),

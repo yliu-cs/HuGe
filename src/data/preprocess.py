@@ -11,8 +11,7 @@ Common pieces used by both ``scripts/preprocess/humanoid-everyday/`` and
   resume logic would skip.
 * :func:`build_loco_cmd` / :func:`pelvis_roll_pitch` — derive locomotion
   command components from pelvis pos/quat at the SONIC timeline. Mirrors
-  ``episode_source._build_loco_cmd`` so offline cache and sim_validate's
-  GT-derivation produce identical values.
+  ``episode_source._build_loco_cmd`` for bit-identical GT-derivation.
 """
 from __future__ import annotations
 
@@ -87,7 +86,7 @@ def atomic_save_npy(arr: Any, final_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 # WBC ONNX training-time range. Values outside push the policy OOD, so we clip
-# both the training target (here) and the runtime command (sim_validate).
+# the training target here.
 WBC_VX_CLIP = 1.0
 WBC_VY_CLIP = 1.0
 WBC_WZ_CLIP = 1.5
@@ -117,7 +116,7 @@ def build_loco_cmd(
 ) -> np.ndarray:
     """Body-frame (vx, vy, ωz) from pelvis pos+quat via centered finite diff.
 
-    Pipeline mirrors ``src/eval/episode_source.py:_build_loco_cmd``:
+    Pipeline:
       1. unwrap yaw from quat to remove ±π jumps;
       2. centered finite diff window=2 frames (5 frames total) for linear vel
          and yaw rate;

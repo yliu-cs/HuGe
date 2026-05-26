@@ -10,10 +10,6 @@ When proprio is off: ``[image+text | t_emb_s (1) | sonic (T_s)]``.
 Proprio joins the **latent prefix** (Qwen base expert) so its K/V are cached
 once and reused during denoise. The 64-D proprio is projected via the
 top-level ``proprio_embedder`` Linear.
-
-Real-Time Chunking (RTC) is supported by giving the SONIC chunk a per-token
-2-D timestep and substituting clean prefix actions in the noisy input. RTC is
-controlled by ``use_rtc``.
 """
 from __future__ import annotations
 
@@ -31,11 +27,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep embedding followed by MLP.
-
-    Accepts ``t`` with shape ``(B,)`` (one timestep per sample) or ``(B, T)``
-    (per-token timesteps for RTC).
-    """
+    """Sinusoidal timestep embedding followed by MLP."""
 
     def __init__(self, hidden_size: int, freq_dim: int = 256):
         super().__init__()
@@ -153,7 +145,7 @@ class MoTAttention(nn.Module):
 
         # Latent-prefix KV caching: latent → tail is always blocked, so
         # K_latent / V_latent are constant across denoising steps. Cache them
-        # once and reuse during ``denoise_step`` / ``denoise_step_rtc``.
+        # once and reuse during ``denoise_step``.
         if kv_cache_out is not None:
             kv_cache_out["k"] = key_states[:, :, :n_latent, :].detach().contiguous()
             kv_cache_out["v"] = value_states[:, :, :n_latent, :].detach().contiguous()
@@ -313,9 +305,7 @@ class MoTKappaModel(nn.Module):
 
     See module docstring for sequence layouts. ``use_proprio`` adds a single
     64-D proprio token at the end of the latent prefix (between text/image and
-    the SONIC segment). ``use_rtc`` switches the SONIC chunk to per-token
-    timesteps and enables prefix substitution + intra-segment causal mask in
-    the collator/inference paths.
+    the SONIC segment).
     """
 
     def __init__(
@@ -325,7 +315,6 @@ class MoTKappaModel(nn.Module):
         action_loss_weight: float = 1.0,
         use_proprio: bool = False,
         proprio_dim: int = 64,
-        use_rtc: bool = False,
     ):
         super().__init__()
         self.base_model = base_model
@@ -333,7 +322,6 @@ class MoTKappaModel(nn.Module):
         self.action_loss_weight = action_loss_weight
         self.use_proprio = use_proprio
         self.proprio_dim = proprio_dim
-        self.use_rtc = use_rtc
 
         hidden_size = base_model.config.hidden_size
         self.action_embedder = nn.Linear(sonic_dim, hidden_size)
@@ -376,7 +364,6 @@ class MoTKappaModel(nn.Module):
         device,
         dtype,
         attention_mask: Optional[torch.Tensor],
-        sonic_causal: bool,
     ) -> torch.Tensor:
         """3-section attention mask covering ``[text | proprio | t_emb_s + sonic]``.
 
@@ -391,33 +378,21 @@ class MoTKappaModel(nn.Module):
           proprio feedback).
         * ``proprio → text`` full; ``proprio → proprio`` self;
           ``proprio → sonic`` blocked (KV cache invariant).
-        * ``sonic → text + proprio`` full; ``sonic → sonic`` bidirectional
-          (or causal if ``use_rtc``).
+        * ``sonic → text + proprio`` full; ``sonic → sonic`` bidirectional.
         """
         T_total = T_text + T_p + T_s
         mask = torch.zeros(B, 1, T_total, T_total, device=device, dtype=dtype)
 
         n_text_end = T_text
         n_proprio_end = n_text_end + T_p          # == n_latent
-        # n_sonic_end = n_proprio_end + T_s  (== T_total)
 
-        # text causal among text rows.
         mask[:, 0, :n_text_end, :n_text_end].masked_fill_(
             _causal_mask(T_text, device, dtype), float("-inf"),
         )
-        # text → tail (proprio + sonic) blocked.
         mask[:, 0, :n_text_end, n_text_end:] = float("-inf")
 
-        # proprio → sonic blocked.
         if T_p > 0:
             mask[:, 0, n_text_end:n_proprio_end, n_proprio_end:] = float("-inf")
-
-        # sonic intra-segment.
-        if sonic_causal and T_s > 1:
-            sonic_self = mask[:, 0, n_proprio_end:, n_proprio_end:]
-            sonic_self.masked_fill_(
-                _causal_mask(T_s, device, dtype), float("-inf"),
-            )
 
         if attention_mask is not None:
             pad_positions = attention_mask == 0
@@ -479,13 +454,7 @@ class MoTKappaModel(nn.Module):
 
         # SONIC path: timestep token + noisy sonic tokens. ``T_s`` includes
         # the leading t_emb_s token.
-        # When RTC-on-SONIC is active, ``timesteps`` is per-token ``(B, T)``;
-        # we use the mean for the leading t_emb_s and rely on the per-token
-        # noise applied upstream by the collator.
-        if timesteps.dim() == 2:
-            t_emb = self.t_embedder(timesteps.mean(dim=1)).reshape(B, 1, D)
-        else:
-            t_emb = self.t_embedder(timesteps).reshape(B, 1, D)
+        t_emb = self.t_embedder(timesteps).reshape(B, 1, D)
         sonic_embeds = self.action_embedder(noisy_sonic_tokens.to(inputs_embeds.dtype))
         sonic_segment = torch.cat([t_emb, sonic_embeds], dim=1)
         T_s = sonic_segment.shape[1]
@@ -509,11 +478,10 @@ class MoTKappaModel(nn.Module):
         T_total = T_text + T_p + T_s
         n_latent = T_text + T_p
 
-        sonic_causal = bool(self.use_rtc)
         full_attn_mask = self._build_mask(
             B=B, T_text=T_text, T_s=T_s, T_p=T_p,
             device=input_ids.device, dtype=all_embeds.dtype,
-            attention_mask=attention_mask, sonic_causal=sonic_causal,
+            attention_mask=attention_mask,
         )
 
         position_ids = torch.arange(T_total, device=input_ids.device).unsqueeze(0).expand(B, -1)
@@ -622,7 +590,6 @@ class MoTKappaModel(nn.Module):
             B=B, T_text=T_text, T_s=T_s, T_p=T_p,
             device=input_ids.device, dtype=all_embeds.dtype,
             attention_mask=attention_mask,
-            sonic_causal=bool(self.use_rtc),
         )
 
         position_ids = torch.arange(T_total, device=input_ids.device).unsqueeze(0).expand(B, -1)
@@ -668,7 +635,7 @@ class MoTKappaModel(nn.Module):
         noisy_sonic_tokens: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """SONIC denoise step. Used when RTC is off."""
+        """SONIC denoise step."""
         language_model = self.base_model.model.language_model
 
         t_emb = self.t_embedder(timesteps).reshape(cache["B"], 1, -1)
@@ -685,58 +652,3 @@ class MoTKappaModel(nn.Module):
 
         action_hidden = self.norm_action(action_h[:, 1:])
         return self.velocity_head(action_hidden)
-
-    @torch.no_grad()
-    def denoise_step_rtc(
-        self,
-        cache: dict,
-        noisy_sonic_tokens: torch.Tensor,
-        timesteps_sonic: torch.Tensor,
-        prev_sonic: Optional[torch.Tensor] = None,
-        delay_sonic: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """SONIC RTC denoise step.
-
-        Performs prefix substitution on ``noisy_sonic_tokens`` using
-        ``prev_sonic`` plus ``delay_sonic``. Returns the predicted SONIC
-        velocity.
-
-        Proprio is not handed to this step — it was embedded into the latent
-        prefix during ``encode_latent`` so its K/V already live in the
-        per-layer KV cache.
-        """
-        language_model = self.base_model.model.language_model
-        B = cache["B"]
-        D = self.base_model.config.hidden_size
-        T_action = cache["T_action"]
-
-        if prev_sonic is not None and delay_sonic is not None:
-            arange_s = torch.arange(T_action, device=noisy_sonic_tokens.device)
-            prefix_mask_s = arange_s[None, :] < delay_sonic[:, None]
-            noisy_sonic_tokens = torch.where(
-                prefix_mask_s[..., None], prev_sonic, noisy_sonic_tokens,
-            )
-            t_per_pos_s = torch.where(
-                prefix_mask_s, torch.zeros_like(prefix_mask_s, dtype=timesteps_sonic.dtype),
-                timesteps_sonic[:, None].expand(-1, T_action),
-            )
-            # Legacy single-token timestep on the t_emb_s slot — use the mean
-            # of the per-position schedule so the leading token still encodes
-            # the global noise level after prefix substitution.
-            t_emb_s = self.t_embedder(t_per_pos_s.mean(dim=1)).reshape(B, 1, D)
-        else:
-            t_emb_s = self.t_embedder(timesteps_sonic).reshape(B, 1, D)
-
-        sonic_embeds = self.action_embedder(noisy_sonic_tokens.to(cache["dtype"]))
-        action_h = torch.cat([t_emb_s, sonic_embeds], dim=1)
-
-        for layer, kv_cache in zip(language_model.layers, cache["layer_caches"]):
-            action_h = layer.forward_cached(
-                action_h=action_h,
-                position_embeddings_action=cache["position_embeddings_action"],
-                attention_mask_action=cache["attention_mask_action"],
-                kv_cache=kv_cache,
-            )
-
-        sonic_hidden = self.norm_action(action_h[:, 1:])
-        return self.velocity_head(sonic_hidden)

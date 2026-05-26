@@ -3,7 +3,7 @@
 #
 # Runs the three stages sequentially and threads each stage's output run
 # directory into the next stage's --train.pretrained-weights, so the chain
-# pretrain(egodex) -> posttrain (HE+WBT, SONIC+RTC) -> finetune (proprietary, SONIC)
+# pretrain(egodex) -> posttrain (HE+WBT, SONIC) -> finetune (proprietary, SONIC)
 # starts each stage from the previous stage's last saved checkpoint without
 # any hand-edited paths.
 #

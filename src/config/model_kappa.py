@@ -44,10 +44,3 @@ class KappaModelConfig(ModelConfig):
     # ignoring the visual conditioning when proprio is enabled.
     proprio_drop_prob: float = 0.1
     proprio_stats_path: str | None = None
-
-    # Real-Time Chunking on the SONIC chunk (per-token timestep + prefix
-    # substitution + intra-segment causal mask). Off by default — enabled
-    # starting at Post-Train so the head learns the RTC mechanism on the full
-    # HE+WBT mix before Fine-Tune inherits it.
-    use_rtc: bool = False
-    sonic_max_delay: int = 8

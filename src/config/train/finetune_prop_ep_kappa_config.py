@@ -1,14 +1,14 @@
 """Fine-tune Kappa on the proprietary 2026-05-16 dataset (all 60 episodes).
 
-Continues training the Post-Train checkpoint (SONIC tokens + RTC + proprio)
-on the proprietary set, which ships its own pre-materialized SONIC tokens
-via the ``action.motion_token`` parquet column (see
+Continues training the Post-Train checkpoint (SONIC tokens + proprio) on the
+proprietary set, which ships its own pre-materialized SONIC tokens via the
+``action.motion_token`` parquet column (see
 ``scripts/preprocess/proprietary/calc_sonic_tokens.py``).
 
-Training target is SONIC tokens with RTC (``use_rtc=True``) + proprio, fully
-inherited from Post-Train so the loaded checkpoint stays compatible without
-re-initialization. Hand bits are zeroed in the cached tokens because the
-proprietary teleop hands are fake.
+Training target is SONIC tokens + proprio, fully inherited from Post-Train so
+the loaded checkpoint stays compatible without re-initialization. Hand bits
+are zeroed in the cached tokens because the proprietary teleop hands are
+fake.
 """
 from __future__ import annotations
 
@@ -56,7 +56,6 @@ class FineTunePropLaunchConfig(LaunchConfig):
     model: KappaModelConfig = Field(
         default_factory=lambda: KappaModelConfig(
             use_proprio=True,
-            use_rtc=True,
             proprio_stats_path=_DEFAULT_PROPRIO_STATS,
         )
     )

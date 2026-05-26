@@ -1,11 +1,9 @@
-"""Post-Train config for Kappa: SONIC tokens + RTC on HE-G1 + G1-WBT.
+"""Post-Train config for Kappa: SONIC tokens on HE-G1 + G1-WBT.
 
 Inherits the EgoDex pretrain checkpoint and continues SONIC-token training on
 the HE+WBT mix at the natural frame ratio (HE-G1 ~1.7M : WBT ~2.48M ≈ 1 :
-1.46). RTC (per-token timestep + prefix substitution on SONIC) is enabled
-starting at this stage so the head learns the RTC mechanism on the full mix
-before Fine-Tune inherits it. Proprio (64-D robot joint state) is fed into
-the latent prefix as an optional conditioning signal.
+1.46). Proprio (64-D robot joint state) is fed into the latent prefix as an
+optional conditioning signal.
 """
 from pydantic import Field
 
@@ -63,7 +61,6 @@ class PostTrainHEWBTLaunchConfig(LaunchConfig):
     model: KappaModelConfig = Field(
         default_factory=lambda: KappaModelConfig(
             use_proprio=True,
-            use_rtc=True,
             proprio_stats_path=_DEFAULT_PROPRIO_STATS,
         )
     )

@@ -1,8 +1,7 @@
 """Canonical 13-group split of the 64-D G1 proprio vector.
 
-Layout (single source of truth, mirroring
-``src/inference/kappa_serve_rtc.py:15-18`` and ``JOINT_NAMES_29`` in
-``src/eval/g1_mujoco_env.py:35-47``)::
+Layout (single source of truth, mirroring the G1 actuator order:
+legs(12) + waist(3) + arms(14))::
 
     proprio[ 0:29] = jp        (rad)        legs(12) + waist(3) + arms(14)
     proprio[29:31] = hand_bits (binary)     left/right

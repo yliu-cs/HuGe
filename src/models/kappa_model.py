@@ -94,12 +94,9 @@ class KappaModelWrapper(nn.Module):
         action_loss_weight: float = 1.0,
         use_proprio: bool = False,
         proprio_dim: int = 64,
-        use_rtc: bool = False,
     ):
         from src.models.mot_kappa import MoTKappaModel
-        overwatch.info(
-            f"Converting to MoT (proprio={use_proprio}, rtc={use_rtc})..."
-        )
+        overwatch.info(f"Converting to MoT (proprio={use_proprio})...")
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         self.model = MoTKappaModel(
@@ -108,7 +105,6 @@ class KappaModelWrapper(nn.Module):
             action_loss_weight=action_loss_weight,
             use_proprio=use_proprio,
             proprio_dim=proprio_dim,
-            use_rtc=use_rtc,
         ).to(dtype=dtype, device=device)
         overwatch.info("MoT conversion complete")
 

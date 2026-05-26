@@ -376,9 +376,9 @@ class Trainer(ABC):
         Discovery order (first existing source wins): top-level
         ``data_cfg.proprio_stats_path`` for single-dataset configs (prop /
         he / wbt), then mix children ``data_cfg.{prop,he,wbt}.proprio_stats_path``.
-        This makes each ckpt self-contained so inference / deploy / eval can
-        ``discover_proprio_stats(weights_path)`` without a hardcoded global
-        default.
+        This makes each ckpt self-contained so downstream consumers can
+        resolve normalize bounds next to ``model.safetensors`` without a
+        hardcoded global default.
         """
         candidates: list[str] = []
         top = getattr(self.data_cfg, "proprio_stats_path", None)

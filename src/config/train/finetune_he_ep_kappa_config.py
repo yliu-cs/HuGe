@@ -1,12 +1,12 @@
 """Fine-tune Kappa on a single HE episode (default ep 7831), SONIC objective.
 
-Continues training the Post-Train checkpoint (SONIC tokens + RTC + proprio)
-on the filtered HE episode set — useful as a diagnostic for overfit /
-data-pipeline sanity, or to specialize the policy to a specific clip.
+Continues training the Post-Train checkpoint (SONIC tokens + proprio) on the
+filtered HE episode set — useful as a diagnostic for overfit / data-pipeline
+sanity, or to specialize the policy to a specific clip.
 
-The training target is still SONIC tokens; no G1 expert is involved. RTC
-(``use_rtc=True``) and proprio inherit the Post-Train configuration so the
-loaded weights stay compatible without re-initialization.
+The training target is still SONIC tokens; no G1 expert is involved. Proprio
+inherits the Post-Train configuration so the loaded weights stay compatible
+without re-initialization.
 """
 from __future__ import annotations
 
@@ -45,7 +45,6 @@ class FineTuneHELaunchConfig(LaunchConfig):
     model: KappaModelConfig = Field(
         default_factory=lambda: KappaModelConfig(
             use_proprio=True,
-            use_rtc=True,
             proprio_stats_path=_DEFAULT_PROPRIO_STATS,
         )
     )
