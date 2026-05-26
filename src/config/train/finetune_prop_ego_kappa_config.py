@@ -76,9 +76,8 @@ class FineTunePropEgoDataConfig(PropEgoDataConfig):
 class FineTunePropEgoLaunchConfig(LaunchConfig):
     model: KappaModelConfig = Field(
         default_factory=lambda: KappaModelConfig(
-            # Mirror pretrain_egodex_kappa_config: no proprio, no RTC.
+            # Mirror pretrain_egodex_kappa_config: no proprio.
             use_proprio=False,
-            use_rtc=False,
         )
     )
     data: FineTunePropEgoDataConfig = Field(default_factory=FineTunePropEgoDataConfig)
@@ -104,8 +103,8 @@ class FineTunePropEgoLaunchConfig(LaunchConfig):
         warmup_ratio=0.1,
         # Seeded via --train.pretrained-weights from the CLI (e.g. from the
         # EgoDex pre-train run); nothing wired in by default since the
-        # post-train checkpoint's proprio/RTC params would mismatch this
-        # config's no-proprio / no-RTC model.
+        # post-train checkpoint's proprio embedder would mismatch this
+        # config's no-proprio model.
         pretrained_weights=None,
     )
 

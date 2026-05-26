@@ -7,11 +7,11 @@ body-part groups defined there, and writes a grouped-schema JSON to
 ``<dataset-root>/meta/proprio_stats.json``.
 
 The loader (``src/data/tokenized_video_dataset.py:_load_normalize_bounds``)
-auto-detects this grouped schema vs the legacy flat schema used by HE/WBT
-(``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``). The HE+WBT
-producer (``scripts/preprocess/calc_g1_proprio_stats.py``) is untouched —
-this script is per-dataset and only computes from the dataset you point it
-at, so each fine-tune dataset can carry its own distribution.
+reads the same 13-group schema produced by the HE+WBT counterpart
+(``scripts/preprocess/calc_g1_proprio_stats.py`` ->
+``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``). This script is
+per-dataset and only computes from the dataset you point it at, so each
+fine-tune dataset can carry its own distribution.
 
 Per-dim ``q01/q99`` values are bit-identical to a flat 64-D computation on
 the same episodes; the grouped schema only changes file structure (enables

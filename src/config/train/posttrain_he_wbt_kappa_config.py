@@ -20,9 +20,11 @@ from src.data.transform import (
 )
 
 
-# Proprio stats live next to the WBT cache (HE+WBT combined stats; WBT is the
-# larger of the two so its meta dir already exists). The on-disk filename
-# keeps the ``g1_`` prefix because it describes the G1 *robot's* joint state.
+# HE+WBT combined proprio stats, written in the 13-group GR00T-aligned schema
+# by ``scripts/preprocess/calc_g1_proprio_stats.py``. Lives next to the WBT
+# cache; the ``g1_`` prefix is kept because the vector describes the G1
+# *robot's* joint state. Trainer.save_checkpoint copies this JSON into each
+# ckpt_<step>/ so deploy / sim / eval can auto-discover it.
 _DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
 
 
@@ -70,7 +72,7 @@ class PostTrainHEWBTLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        num_train_epochs=3,
+        num_train_epochs=2,
         train_batch_size=128,
         gradient_accumulation_steps=1,
         num_workers=8,

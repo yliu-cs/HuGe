@@ -12,8 +12,10 @@ Selecting training data
 -----------------------
 
 The CLI exposes ``--data.data-roots`` (``list[str]``, nargs='*'). Default is
-``real/2026-05-16`` (the original 60-episode set) for backward compatibility
-with existing pipelines.
+``real/2026-05-23`` so it matches the per-dataset proprio stats default;
+``run_kappa.sh`` can then drive the post-train → fine-tune chain with no
+data flags. The original 60-episode ``real/2026-05-16`` set stays available
+via an explicit ``--data.data-roots`` override (pair with its own stats).
 
   # single root, original behavior
   ./scripts/train/train_kappa.sh finetune_prop_ep_kappa_config
@@ -52,12 +54,20 @@ from src.data.transform import (
 )
 
 
+# Default fine-tune dump. The proprio stats path below MUST point at the same
+# root so the q01/q99 bounds match the dump's own distribution; otherwise the
+# trainer normalizes 05-23 frames against 05-16 stats (or vice versa) and the
+# proprio prefix carries silently wrong values. Override both together when
+# switching dumps:
+#   --data.data-roots PATH  --data.proprio-stats-path PATH/meta/proprio_stats.json
+_DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
+
 # Per-dataset proprio stats, produced from this dataset's own episodes by
 # ``scripts/preprocess/proprietary/calc_proprio_stats.py``. The 13-group
 # schema is read by ``_load_normalize_bounds`` via ``proprio_layout``.
 # Trainer.save_checkpoint copies this JSON into each ckpt_<step>/ so deploy
 # / sim / eval can auto-discover it.
-_DEFAULT_PROPRIO_STATS = "resource/dataset/proprietary/real/2026-05-23/meta/proprio_stats.json"
+_DEFAULT_PROPRIO_STATS = f"{_DEFAULT_DATA_ROOT}/meta/proprio_stats.json"
 
 
 class FineTunePropDataTransform(DataTransform):
@@ -74,9 +84,13 @@ class FineTunePropDataConfig(PropDataConfig):
     emit_proprio: bool = True
     proprio_stats_path: str = _DEFAULT_PROPRIO_STATS
     normalize_mode: str = "bounds_q99"
-    # ``data_roots`` defaults to the original single-root set (inherited from
-    # PropDataConfig). Override via ``--data.data-roots PATH1 [PATH2 ...]``
-    # to pick a different dump or concat several.
+    # Default to the same root that ``_DEFAULT_PROPRIO_STATS`` points at, so
+    # ``./scripts/train/run_kappa.sh`` (which forwards args to every stage and
+    # can't set per-stage data overrides) lands on a self-consistent
+    # (dump, stats) pair. Override via ``--data.data-roots PATH1 [PATH2 ...]``;
+    # remember to pass ``--data.proprio-stats-path`` alongside when switching
+    # to a dump that ships its own stats.
+    data_roots: list[str] = Field(default_factory=lambda: [_DEFAULT_DATA_ROOT])
     # ``episode_indices=None`` keeps every episode in each selected root;
     # override via ``--data.episode-indices`` for sanity-check / overfit runs.
 
@@ -92,7 +106,7 @@ class FineTunePropLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        max_training_steps=2000,
+        max_training_steps=3000,
         train_batch_size=128,
         gradient_accumulation_steps=1,
         num_workers=8,
