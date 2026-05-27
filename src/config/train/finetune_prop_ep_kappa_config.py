@@ -12,10 +12,13 @@ Selecting training data
 -----------------------
 
 The CLI exposes ``--data.data-roots`` (``list[str]``, nargs='*'). Default is
-``real/2026-05-23`` so it matches the per-dataset proprio stats default;
-``run_kappa.sh`` can then drive the post-train → fine-tune chain with no
-data flags. The original 60-episode ``real/2026-05-16`` set stays available
-via an explicit ``--data.data-roots`` override (pair with its own stats).
+``real/2026-05-23``; ``run_kappa.sh`` can then drive the post-train →
+fine-tune chain with no data flags. The original 60-episode
+``real/2026-05-16`` set stays available via an explicit ``--data.data-roots``
+override. Proprio normalization stats are NOT per-dataset by default — they
+are inherited from Post-Train (see ``_DEFAULT_PROPRIO_STATS`` below) so the
+normalization space stays coupled across the chain. Override with
+``--data.proprio-stats-path`` if you want to A/B per-dataset stats.
 
   # single root, original behavior
   ./scripts/train/train_kappa.sh finetune_prop_ep_kappa_config
@@ -54,20 +57,23 @@ from src.data.transform import (
 )
 
 
-# Default fine-tune dump. The proprio stats path below MUST point at the same
-# root so the q01/q99 bounds match the dump's own distribution; otherwise the
-# trainer normalizes 05-23 frames against 05-16 stats (or vice versa) and the
-# proprio prefix carries silently wrong values. Override both together when
-# switching dumps:
-#   --data.data-roots PATH  --data.proprio-stats-path PATH/meta/proprio_stats.json
 _DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
 
-# Per-dataset proprio stats, produced from this dataset's own episodes by
-# ``scripts/preprocess/proprietary/calc_proprio_stats.py``. The 13-group
-# schema is read by ``_load_normalize_bounds`` via ``proprio_layout``.
-# Trainer.save_checkpoint copies this JSON into each ckpt_<step>/ so deploy
-# / sim / eval can auto-discover it.
-_DEFAULT_PROPRIO_STATS = f"{_DEFAULT_DATA_ROOT}/meta/proprio_stats.json"
+# Inherit the Post-Train HE+WBT stats verbatim instead of refitting on the
+# proprietary subset. Each proprietary dump (~tens to ~hundreds of episodes)
+# is too small to refit q01/q99 cleanly — narrower bounds shift deploy-time
+# proprio OOD vs the model's learned conditioning, which we observed as a
+# near-zero motion delta on real-robot rollouts. Keeping the post-train
+# stats means fine-tune only updates weights while the normalization space
+# stays coupled to what Stage 2 saw. The HE+WBT producer
+# (``scripts/preprocess/calc_g1_proprio_stats.py``) now ships the same
+# 13-group schema, so ``_load_normalize_bounds`` reads this path the same
+# way it would a per-dataset stats file. Trainer.save_checkpoint still
+# copies it into each ckpt_<step>/ for deploy / sim / eval auto-discovery.
+# Override with ``--data.proprio-stats-path`` (pair with the matching
+# ``--data.data-roots``) when running per-dataset A/B comparisons via
+# ``scripts/preprocess/proprietary/calc_proprio_stats.py``.
+_DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
 
 
 class FineTunePropDataTransform(DataTransform):
@@ -84,12 +90,14 @@ class FineTunePropDataConfig(PropDataConfig):
     emit_proprio: bool = True
     proprio_stats_path: str = _DEFAULT_PROPRIO_STATS
     normalize_mode: str = "bounds_q99"
-    # Default to the same root that ``_DEFAULT_PROPRIO_STATS`` points at, so
-    # ``./scripts/train/run_kappa.sh`` (which forwards args to every stage and
-    # can't set per-stage data overrides) lands on a self-consistent
-    # (dump, stats) pair. Override via ``--data.data-roots PATH1 [PATH2 ...]``;
-    # remember to pass ``--data.proprio-stats-path`` alongside when switching
-    # to a dump that ships its own stats.
+    # Default to the most recent real dump so ``./scripts/train/run_kappa.sh``
+    # (which forwards args to every stage and can't set per-stage data
+    # overrides) lands on a sane post-train -> fine-tune chain. The stats
+    # path stays pinned at the Post-Train HE+WBT JSON regardless of which
+    # data roots are selected, so swapping roots does NOT silently change
+    # the normalization space. Override via
+    # ``--data.data-roots PATH1 [PATH2 ...]``; only also pass
+    # ``--data.proprio-stats-path`` when you explicitly want per-dataset stats.
     data_roots: list[str] = Field(default_factory=lambda: [_DEFAULT_DATA_ROOT])
     # ``episode_indices=None`` keeps every episode in each selected root;
     # override via ``--data.episode-indices`` for sanity-check / overfit runs.

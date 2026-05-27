@@ -1,4 +1,11 @@
-"""Compute per-group min/max/q01/q99 stats for a Kappa proprietary dataset.
+"""[Diagnostic] Compute per-group proprio stats on a proprietary dataset.
+
+NOTE: fine-tune training (``finetune_prop_ep_kappa_config``) no longer reads
+the JSON this script produces. The fine-tune stage inherits the Post-Train
+HE+WBT stats (``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``)
+so the normalization space stays coupled to what Stage 2 conditioned on.
+This script is kept only as a one-off audit / distribution-shift inspector
+for the proprietary set; running it does NOT affect any training run.
 
 Reads every ``g1_proprio/episode_*.npy`` under ``--dataset-root`` (each a
 ``(T, 64)`` float32 array in the canonical layout from
@@ -9,9 +16,12 @@ body-part groups defined there, and writes a grouped-schema JSON to
 The loader (``src/data/tokenized_video_dataset.py:_load_normalize_bounds``)
 reads the same 13-group schema produced by the HE+WBT counterpart
 (``scripts/preprocess/calc_g1_proprio_stats.py`` ->
-``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``). This script is
-per-dataset and only computes from the dataset you point it at, so each
-fine-tune dataset can carry its own distribution.
+``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``), which is what
+``finetune_prop_ep_kappa_config`` now inherits verbatim — so this script is
+no longer in the training path. It remains useful as a per-dataset audit /
+distribution-shift inspector, and the JSON it writes can still be wired in
+manually via ``--data.proprio-stats-path`` for A/B comparisons against the
+inherited Post-Train stats.
 
 Per-dim ``q01/q99`` values are bit-identical to a flat 64-D computation on
 the same episodes; the grouped schema only changes file structure (enables
