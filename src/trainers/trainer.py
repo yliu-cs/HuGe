@@ -371,36 +371,56 @@ class Trainer(ABC):
         return ckpt_dir
 
     def _bundle_proprio_stats(self, ckpt_dir: str) -> None:
-        """Copy the active dataset's proprio stats JSON into ``ckpt_dir``.
+        """Copy the active dataset's proprio stats JSON into ``ckpt_dir`` and
+        write a ``proprio_norm_mode.txt`` sidecar with the matching
+        ``normalize_mode``.
 
         Discovery order (first existing source wins): top-level
-        ``data_cfg.proprio_stats_path`` for single-dataset configs (prop /
-        he / wbt), then mix children ``data_cfg.{prop,he,wbt}.proprio_stats_path``.
-        This makes each ckpt self-contained so downstream consumers can
-        resolve normalize bounds next to ``model.safetensors`` without a
-        hardcoded global default.
+        ``data_cfg.{proprio_stats_path,normalize_mode}`` for single-dataset
+        configs (prop / he / wbt), then mix children
+        ``data_cfg.{prop,he,wbt}.{proprio_stats_path,normalize_mode}``. The
+        winning source supplies BOTH the stats path and the normalize mode so
+        deploy / sim / eval auto-pick the matching clip behavior — pinning
+        ``--proprio-normalize-mode`` on the CLI is no longer required.
         """
-        candidates: list[str] = []
-        top = getattr(self.data_cfg, "proprio_stats_path", None)
-        if top:
-            candidates.append(top)
+        candidates: list[tuple[str | None, str | None]] = []
+        top_path = getattr(self.data_cfg, "proprio_stats_path", None)
+        top_mode = getattr(self.data_cfg, "normalize_mode", None)
+        if top_path:
+            candidates.append((top_path, top_mode))
         for child in ("prop", "he", "wbt"):
             sub = getattr(self.data_cfg, child, None)
-            sub_path = getattr(sub, "proprio_stats_path", None) if sub is not None else None
+            if sub is None:
+                continue
+            sub_path = getattr(sub, "proprio_stats_path", None)
+            sub_mode = getattr(sub, "normalize_mode", None)
             if sub_path:
-                candidates.append(sub_path)
-        src_path: str | None = next((p for p in candidates if p and os.path.isfile(p)), None)
-        if src_path is None:
+                candidates.append((sub_path, sub_mode))
+        chosen = next(
+            ((p, m) for p, m in candidates if p and os.path.isfile(p)), None
+        )
+        if chosen is None:
             overwatch.warning(
                 "no proprio_stats_path resolves to an existing file on data_cfg; "
                 "ckpt will not bundle proprio_stats.json (inference will fall back to legacy default)."
             )
             return
+        src_path, src_mode = chosen
         dst = os.path.join(ckpt_dir, "proprio_stats.json")
         try:
             shutil.copyfile(src_path, dst)
         except OSError as e:
             overwatch.warning(f"failed to bundle proprio_stats.json into {ckpt_dir}: {e}")
+            return
+        if src_mode:
+            mode_path = os.path.join(ckpt_dir, "proprio_norm_mode.txt")
+            try:
+                with open(mode_path, "w") as f:
+                    f.write(str(src_mode).strip() + "\n")
+            except OSError as e:
+                overwatch.warning(
+                    f"failed to write proprio_norm_mode.txt into {ckpt_dir}: {e}"
+                )
 
     def set_train(self):
         self.model.train()

@@ -6,8 +6,8 @@ materialized via ``scripts/preprocess/proprietary/calc_sonic_tokens.py``.
 
 CLI:
 
-    --data.data-roots resource/dataset/proprietary/real/2026-05-16 \
-                      resource/dataset/proprietary/real/2026-05-23
+    --data.data-roots resource/dataset/proprietary/real/2026-05-23 \
+                      resource/dataset/proprietary/real/2026-05-16
 
 A single root produces a plain :class:`PropDataset`. Multiple roots are
 stitched with :class:`ConcatMixDataset`, mirroring ``HEWBTMixDataConfig`` so
@@ -24,7 +24,10 @@ from pydantic import Field
 from src.config.config import DataConfig
 
 
-_DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-16"
+# Default to the latest real dump so ``./scripts/train/run_kappa.sh`` lands on
+# a real-hand-bits fine-tune without per-stage data overrides. Older dumps
+# (e.g. ``real/2026-05-16``) remain accessible via ``--data.data-roots``.
+_DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
 
 
 class PropDataConfig(DataConfig):

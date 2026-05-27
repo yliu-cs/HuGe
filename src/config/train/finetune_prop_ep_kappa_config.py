@@ -59,21 +59,29 @@ from src.data.transform import (
 
 _DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
 
-# Inherit the Post-Train HE+WBT stats verbatim instead of refitting on the
-# proprietary subset. Each proprietary dump (~tens to ~hundreds of episodes)
-# is too small to refit q01/q99 cleanly — narrower bounds shift deploy-time
-# proprio OOD vs the model's learned conditioning, which we observed as a
-# near-zero motion delta on real-robot rollouts. Keeping the post-train
-# stats means fine-tune only updates weights while the normalization space
-# stays coupled to what Stage 2 saw. The HE+WBT producer
-# (``scripts/preprocess/calc_g1_proprio_stats.py``) now ships the same
-# 13-group schema, so ``_load_normalize_bounds`` reads this path the same
-# way it would a per-dataset stats file. Trainer.save_checkpoint still
-# copies it into each ckpt_<step>/ for deploy / sim / eval auto-discovery.
-# Override with ``--data.proprio-stats-path`` (pair with the matching
-# ``--data.data-roots``) when running per-dataset A/B comparisons via
-# ``scripts/preprocess/proprietary/calc_proprio_stats.py``.
-_DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
+# Stage 3 normalizes against the UNION of HE + WBT + PROP, produced by
+# ``scripts/preprocess/calc_union_proprio_stats.py``. The envelope inherits
+# WBT's wide arm / quat-yaw workspace AND PROP's squat / torso-rotation
+# range, so deploy poses stop landing OOD vs the model's conditioning --
+# WBT-only would clip squat signals, PROP-only would clip manipulation.
+#
+# File lives under the PROP dump's ``meta/`` (not ``G1_WBT-cache/``) because
+# these stats are a Stage 3 asset: Stage 2 (HE+WBT post-train) still uses
+# ``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``. The
+# Stage 2 -> Stage 3 normalization-space mismatch is covariate shift the
+# embedder re-calibrates over the 5k fine-tune steps; we accept it because
+# "deploy must squat" is a hard requirement and the alternative
+# (Stage 2 re-run with union stats) costs an extra post-train.
+#
+# The 13-group schema matches ``_load_normalize_bounds`` and
+# ``Trainer._bundle_proprio_stats`` copies the file into each ckpt_<step>/
+# for deploy / sim / eval auto-discovery. The stats path stays decoupled
+# from ``--data.data-roots`` so swapping roots does NOT silently change the
+# normalization space; override via ``--data.proprio-stats-path`` only when
+# explicitly A/B-ing a different stats file.
+_DEFAULT_PROPRIO_STATS = (
+    "resource/dataset/proprietary/real/2026-05-23/meta/proprio_stats_union.json"
+)
 
 
 class FineTunePropDataTransform(DataTransform):

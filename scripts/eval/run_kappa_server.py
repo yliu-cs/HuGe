@@ -172,15 +172,44 @@ def _maybe_load_proprio_bounds(
     return _load_normalize_bounds(stats, "proprio", dim, mode)
 
 
+_LEGACY_DEFAULT_NORM_MODE = "bounds_q99"
+
+
+def _resolve_proprio_normalize_mode(
+    ckpt_file: Path, override: str | None,
+) -> tuple[str, str]:
+    """Pick the proprio normalize mode for deploy.
+
+    Priority: ``override`` (CLI) → ``proprio_norm_mode.txt`` next to the
+    checkpoint (bundled by ``Trainer._bundle_proprio_stats``) → legacy default
+    ``"bounds_q99"`` with a warning. Returns ``(mode, source)`` so the caller
+    can log how the mode was chosen.
+    """
+    if override:
+        return override, "cli"
+    sidecar = ckpt_file.parent / "proprio_norm_mode.txt"
+    if sidecar.is_file():
+        try:
+            text = sidecar.read_text().strip()
+            if text:
+                return text, f"sidecar({sidecar.name})"
+        except OSError:
+            pass
+    return _LEGACY_DEFAULT_NORM_MODE, "legacy-default"
+
+
 def _normalize_proprio(
     raw: np.ndarray,
     bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    clip: bool = True,
 ) -> np.ndarray:
     if bounds is None:
         return raw.astype(np.float32, copy=False)
     lo, hi, _ = bounds
     out = (raw - lo) / (hi - lo) * 2.0 - 1.0
-    return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+    if clip:
+        out = np.clip(out, -1.0, 1.0)
+    return out.astype(np.float32, copy=False)
 
 
 # =============================================================================
@@ -487,7 +516,7 @@ class KappaPolicy:
         num_inference_steps: int = 4,
         deploy_proprio: bool = True,
         proprio_dim: int = 64,
-        proprio_normalize_mode: str = "bounds_q99",
+        proprio_normalize_mode: str | None = None,
         seed: int | None = None,
         state_tap: _G1StateTap | None = None,
     ):
@@ -557,9 +586,31 @@ class KappaPolicy:
         self.motion_dim = 64  # first 64 dims are SONIC motion latents
         self.hand_dim = max(0, sonic_dim - self.motion_dim)  # trailing dims are hand_binary
 
-        # Proprio normalize bounds (per-checkpoint when bundled).
+        # Proprio normalize bounds (per-checkpoint when bundled). ``proprio_clip``
+        # mirrors the training-side decision: ``bounds_q99_noclip`` keeps the
+        # linear extrapolation, every other mode saturates outside ``[-1, 1]``.
+        # When the CLI doesn't pin the mode, fall back to the sidecar bundled
+        # by ``Trainer._bundle_proprio_stats``; this keeps deploy in sync with
+        # training without requiring the operator to remember the flag.
+        from src.data.tokenized_video_dataset import _NOCLIP_MODES
+        resolved_mode, mode_source = _resolve_proprio_normalize_mode(
+            ckpt_file, proprio_normalize_mode,
+        )
+        self.proprio_normalize_mode = resolved_mode
+        self.proprio_clip = resolved_mode not in _NOCLIP_MODES
+        print(
+            f"[Kappa] proprio_normalize_mode={resolved_mode} "
+            f"(source={mode_source}, clip={self.proprio_clip})"
+        )
+        if mode_source == "legacy-default" and self.use_proprio_inference:
+            print(
+                "[Kappa] WARNING: no --proprio-normalize-mode override and "
+                "ckpt has no proprio_norm_mode.txt sidecar; defaulting to "
+                f"'{_LEGACY_DEFAULT_NORM_MODE}'. Verify this matches training "
+                "or pass --proprio-normalize-mode explicitly."
+            )
         self.proprio_bounds = (
-            _maybe_load_proprio_bounds(ckpt_file, self.proprio_dim, proprio_normalize_mode)
+            _maybe_load_proprio_bounds(ckpt_file, self.proprio_dim, resolved_mode)
             if self.use_proprio_inference else None
         )
         if self.use_proprio_inference and self.proprio_bounds is None:
@@ -699,7 +750,7 @@ class KappaPolicy:
         raw = self._assemble_proprio_raw(observation)
         if raw is None:
             return None
-        return _normalize_proprio(raw, self.proprio_bounds)
+        return _normalize_proprio(raw, self.proprio_bounds, clip=self.proprio_clip)
 
     def _build_vlm_inputs(self, image_np: np.ndarray, prompt: str) -> dict[str, torch.Tensor]:
         """Mirror the training-time chat-template + processor call."""
@@ -822,7 +873,9 @@ class KappaPolicy:
                 # the velocity head sees a well-formed but uninformative input.
                 proprio = np.zeros(self.proprio_dim, dtype=np.float32)
             else:
-                proprio = _normalize_proprio(proprio_raw, self.proprio_bounds)
+                proprio = _normalize_proprio(
+                    proprio_raw, self.proprio_bounds, clip=self.proprio_clip,
+                )
 
         tokens = self._sample_sonic(vlm_inputs, proprio)  # (T, sonic_dim) float32
 
@@ -972,8 +1025,13 @@ class ServerConfig:
     was trained with proprio. The model's velocity head will then receive a
     zero proprio token via the encode_latent T_proprio=0 path."""
 
-    proprio_normalize_mode: str = "bounds_q99"
-    """Match training: ``bounds`` (min/max) or ``bounds_q99`` (q01/q99)."""
+    proprio_normalize_mode: str | None = None
+    """Match training: ``bounds`` (min/max), ``bounds_q99`` (q01/q99 + clip
+    to ±1), or ``bounds_q99_noclip`` (q01/q99, linear extrapolation beyond ±1
+    — preserves tail magnitude for samples outside the envelope). When unset
+    (default), reads ``proprio_norm_mode.txt`` next to the checkpoint;
+    Trainer bundles that sidecar so deploy auto-picks the training value
+    without needing the flag."""
 
     state_tap_enable: bool = True
     """Subscribe to the C++ deploy's ``g1_debug`` ZMQ topic to recover the

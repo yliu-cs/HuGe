@@ -19,6 +19,7 @@ import numpy as np
 import polars as pl
 
 from src.data.tokenized_video_dataset import (
+    _NOCLIP_MODES,
     TokenizedVideoDataset,
     _load_normalize_bounds,
     get_token_mmap,
@@ -70,6 +71,7 @@ class PropDataset(TokenizedVideoDataset):
         self._proprio_bounds = _load_normalize_bounds(
             proprio_stats, "proprio", self.proprio_dim, normalize_mode,
         )
+        self._proprio_clip = normalize_mode not in _NOCLIP_MODES
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
         task_map: dict[int, str] = {}

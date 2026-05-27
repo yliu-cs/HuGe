@@ -42,11 +42,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.eval.run_kappa_server import (  # noqa: E402
+    _LEGACY_DEFAULT_NORM_MODE,
     _detect_proprio_in_ckpt,
     _detect_sonic_dim_from_ckpt,
     _maybe_load_proprio_bounds,
     _normalize_proprio,
     _resolve_ckpt_file,
+    _resolve_proprio_normalize_mode,
 )
 from src.data.video_reader import decode_frame  # noqa: E402
 
@@ -143,7 +145,7 @@ class _OfflinePolicy:
         action_horizon: int,
         num_inference_steps: int,
         use_proprio: bool,
-        proprio_normalize_mode: str,
+        proprio_normalize_mode: str | None,
         seed: int | None,
     ):
         self.device = torch.device(device)
@@ -198,8 +200,29 @@ class _OfflinePolicy:
         self.motion_dim = 64
         self.hand_dim = max(0, sonic_dim - 64)
 
+        # ``bounds_q99_noclip`` keeps the linear extrapolation beyond ±1;
+        # every other mode saturates. Mirror the training-side decision so the
+        # offline replay matches what the model was actually trained on. When
+        # the CLI doesn't pin the mode, fall back to the sidecar bundled by
+        # ``Trainer._bundle_proprio_stats`` next to the checkpoint.
+        from src.data.tokenized_video_dataset import _NOCLIP_MODES
+        resolved_mode, mode_source = _resolve_proprio_normalize_mode(
+            ckpt_file, proprio_normalize_mode,
+        )
+        self.proprio_normalize_mode = resolved_mode
+        self.proprio_clip = resolved_mode not in _NOCLIP_MODES
+        print(
+            f"[offline] proprio_normalize_mode={resolved_mode} "
+            f"(source={mode_source}, clip={self.proprio_clip})"
+        )
+        if mode_source == "legacy-default" and self.use_proprio:
+            print(
+                "[offline] WARNING: no --proprio-normalize-mode override and "
+                "ckpt has no proprio_norm_mode.txt sidecar; defaulting to "
+                f"'{_LEGACY_DEFAULT_NORM_MODE}'."
+            )
         self.proprio_bounds = (
-            _maybe_load_proprio_bounds(ckpt_file, 64, proprio_normalize_mode)
+            _maybe_load_proprio_bounds(ckpt_file, 64, resolved_mode)
             if self.use_proprio else None
         )
         if self.use_proprio and self.proprio_bounds is None:
@@ -258,7 +281,9 @@ class _OfflinePolicy:
 
         proprio_t: torch.Tensor | None = None
         if T_p > 0:
-            proprio_norm = _normalize_proprio(proprio_raw, self.proprio_bounds)
+            proprio_norm = _normalize_proprio(
+                proprio_raw, self.proprio_bounds, clip=self.proprio_clip,
+            )
             proprio_t = torch.from_numpy(
                 np.asarray(proprio_norm, dtype=np.float32).reshape(1, -1)
             ).to(self.device, dtype=torch.bfloat16)
@@ -538,7 +563,13 @@ class OfflineConfig:
     use_proprio: bool = True
     """If False, skip proprio even when the checkpoint was trained with it."""
 
-    proprio_normalize_mode: str = "bounds_q99"
+    proprio_normalize_mode: str | None = None
+    """Match training: ``bounds`` (min/max), ``bounds_q99`` (q01/q99 + clip
+    to ±1), or ``bounds_q99_noclip`` (q01/q99, linear extrapolation beyond
+    ±1 — preserves tail magnitude for samples outside the envelope). When
+    unset (default), reads ``proprio_norm_mode.txt`` next to the checkpoint;
+    Trainer bundles that sidecar so offline replay auto-picks the training
+    value without needing the flag."""
 
     device: str = "cuda:0"
 

@@ -82,6 +82,24 @@ fi
 
 mkdir -p "$RUNS_DIR"
 
+# Cluster single-runner lock. The user排 N 个八卡节点；only the first node to
+# pass this barrier owns the run, the rest detect the flag file and bail so
+# the scheduler can reclaim their GPUs. ``set -o noclobber`` + O_EXCL redirect
+# is atomic on local FS and on NFS v3+, so the race between concurrent nodes
+# is resolved by the kernel/server, not by application code. Flag carries the
+# winner's host/pid/start so a stale flag (crashed earlier run) is greppable
+# without having to chase the scheduler.
+FLAG_FILE=".runs/flag.log"
+if ! (set -o noclobber
+      printf 'host=%s\npid=%s\nstart=%s\n' \
+          "$(hostname)" "$$" "$(date -Iseconds)" > "$FLAG_FILE") 2>/dev/null; then
+    echo "==> [pipeline] $FLAG_FILE already exists — another node owns this run:"
+    sed 's/^/    /' "$FLAG_FILE" 2>/dev/null || true
+    echo "==> [pipeline] exiting cleanly (delete $FLAG_FILE manually to retry)."
+    exit 0
+fi
+echo "==> [pipeline] acquired $FLAG_FILE on $(hostname); other nodes will skip."
+
 discover_latest_run() {
     local marker="$1"
     find "$RUNS_DIR" -mindepth 1 -maxdepth 1 -type d -newer "$marker" \
@@ -147,3 +165,9 @@ echo "============================================================"
 echo "==> [pipeline] all stages completed"
 echo "==> [pipeline] final run: $CURRENT_WEIGHTS"
 echo "============================================================"
+
+# Release the lock only on full success — ``set -e`` would have exited on any
+# stage failure with the flag still in place, which is the desired behavior
+# (operator can investigate the crashed run without other nodes stampeding in).
+rm -f "$FLAG_FILE"
+echo "==> [pipeline] released $FLAG_FILE"

@@ -52,9 +52,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--he-cache-root", default="resource/dataset/humanoid-everyday-cache",
+        help="Scan <root>/g1_proprio/**/episode_*.npy for HE.",
+    )
+    parser.add_argument(
+        "--wbt-source-root", default="resource/dataset/G1_WBT",
+        help=(
+            "Scan <root>/g1_proprio/**/episode_*.npy for WBT. The cache dir "
+            "(G1_WBT-cache/) only holds derived stats; raw npy live under the "
+            "source dataset symlink G1_WBT/."
+        ),
     )
     parser.add_argument(
         "--wbt-cache-root", default="resource/dataset/G1_WBT-cache",
+        help="Only used for --out default location.",
     )
     parser.add_argument(
         "--out", default=None,
@@ -62,35 +72,41 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    files: List[str] = []
-    for root in (args.he_cache_root, args.wbt_cache_root):
-        if not os.path.isdir(root):
-            continue
-        sub = os.path.join(root, "g1_proprio")
-        files.extend(_iter_proprio_files(sub))
-    if not files:
-        raise SystemExit(
-            "No g1_proprio episodes found under either cache root. "
-            "Re-run calc_sonic_tokens.py / calc_wbt_sonic_tokens.py first."
-        )
+    sources = (
+        ("HE",  os.path.join(args.he_cache_root,   "g1_proprio")),
+        ("WBT", os.path.join(args.wbt_source_root, "g1_proprio")),
+    )
 
     bufs: list[np.ndarray] = []
-    for path in tqdm(files, desc="Loading g1_proprio for stats", unit="ep"):
-        try:
-            arr = np.load(path, mmap_mode="r")
-        except Exception as e:
-            print(f"[!] skip {path}: {e}")
-            continue
-        if arr.ndim != 2 or arr.shape[1] != G1_PROPRIO_DIM:
-            print(f"[!] skip {path}: shape {arr.shape}, expected (T, {G1_PROPRIO_DIM})")
-            continue
-        bufs.append(np.asarray(arr, dtype=np.float32))
+    counts: dict[str, tuple[int, int]] = {}
+    for tag, root in sources:
+        files = _iter_proprio_files(root)
+        n_ep = n_fr = 0
+        for path in tqdm(files, desc=f"{tag:4s} g1_proprio", unit="ep"):
+            try:
+                arr = np.load(path, mmap_mode="r")
+            except Exception as e:
+                print(f"[!] skip {path}: {e}")
+                continue
+            if arr.ndim != 2 or arr.shape[1] != G1_PROPRIO_DIM:
+                print(f"[!] skip {path}: shape {arr.shape}, expected (T, {G1_PROPRIO_DIM})")
+                continue
+            bufs.append(np.asarray(arr, dtype=np.float32))
+            n_ep += 1
+            n_fr += arr.shape[0]
+        counts[tag] = (n_ep, n_fr)
+
     if not bufs:
-        raise SystemExit("All proprio files filtered out.")
+        raise SystemExit(
+            "No g1_proprio episodes found under either HE or WBT root. "
+            "Re-run calc_sonic_tokens.py / calc_wbt_sonic_tokens.py first."
+        )
     flat = np.concatenate(bufs, axis=0)
-    n_episodes = len(bufs)
+    n_episodes = sum(ne for ne, _ in counts.values())
     n_frames = int(flat.shape[0])
-    print(f"Stacked {n_episodes} episodes -> {n_frames} rows × {G1_PROPRIO_DIM} dims")
+    print(f"\nStacked {n_episodes} episodes -> {n_frames} rows x {G1_PROPRIO_DIM} dims")
+    for tag, (ne, nf) in counts.items():
+        print(f"  {tag:5s}: {ne:5d} ep / {nf:9d} fr")
 
     groups_out: dict[str, dict[str, list[float]]] = {}
     print(f"\n{'group':22s}{'dim':>4s}  {'min':>10s} {'max':>10s} {'q01':>10s} {'q99':>10s}")
@@ -115,7 +131,11 @@ def main() -> None:
         "proprio": groups_out,
         "_meta": {
             "he_cache_root": args.he_cache_root,
-            "wbt_cache_root": args.wbt_cache_root,
+            "wbt_source_root": args.wbt_source_root,
+            "sources": {
+                tag: {"n_episodes": ne, "n_frames": nf}
+                for tag, (ne, nf) in counts.items()
+            },
             "n_episodes": n_episodes,
             "n_frames": n_frames,
             "layout": "13-group v1",

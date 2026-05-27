@@ -31,9 +31,24 @@ per episode) plus any source-specific arrays the hooks need, then calls
 
 Proprio normalization
 ---------------------
-When ``proprio_stats`` is passed to the constructor the dataset normalizes
-the stream to ``[-1, 1]`` (ActionStateTransform style: ``ill_mask`` collapses
-degenerate dims and clip after rescale).
+When ``proprio_stats`` is passed to the constructor the dataset rescales
+each dim by ``(lo, hi)`` so that ``lo -> -1`` and ``hi -> +1``. ``mode``
+selects which stat keys back ``lo / hi``:
+
+* ``"bounds"``        — ``min / max`` (no train-time saturation by design,
+  but raw min/max is sensitive to outliers).
+* ``"bounds_q99"``    — ``q01 / q99`` + ``np.clip(..., -1, 1)``. Mirrors
+  Isaac-GR00T's default ``use_percentiles=True, clip_outliers=True`` path.
+  The 1% tails on each side saturate at ``±1``.
+* ``"bounds_q99_noclip"`` — ``q01 / q99``, **no clip**. Values outside the
+  envelope are linearly extrapolated to ``|x| > 1`` and the model sees the
+  real magnitude (e.g. PROP deep-squat knees keep their dynamic range
+  instead of saturating). Matches GR00T's behavior when called with
+  ``clip_outliers=False``; GR00T's own G1 finetunes default to clip on.
+
+Degenerate dims (``min == max``) are skipped via ``ill_mask``: ``hi`` is
+overwritten with ``lo + 1`` so the transform becomes ``(x - lo)`` and never
+divides by zero.
 """
 from __future__ import annotations
 
@@ -74,6 +89,20 @@ def get_token_mmap(path: str) -> np.ndarray:
     return arr
 
 
+# Modes that skip the post-rescale clamp. The same (lo, hi) come back as in
+# the clipped variant; the dataset's normalize step picks behavior off this
+# set so deploy / sim / eval can mirror the choice via the same string.
+_NOCLIP_MODES = frozenset({"bounds_q99_noclip"})
+
+# Maps a normalize mode string to the (lo_key, hi_key) pair used to pull
+# bounds out of the 13-group stats JSON.
+_MODE_TO_KEYS = {
+    "bounds":            ("min", "max"),
+    "bounds_q99":        ("q01", "q99"),
+    "bounds_q99_noclip": ("q01", "q99"),
+}
+
+
 def _load_normalize_bounds(
     stats: dict | None, key: str, dim: int, mode: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -86,21 +115,18 @@ def _load_normalize_bounds(
     ``src.data.proprio_layout`` concatenates the groups back to a flat
     ``(dim,)`` vector.
 
-    ``mode`` selects ``"bounds"`` (min/max) vs ``"bounds_q99"`` (q01/q99).
-    Returns ``None`` if ``stats`` is missing — datasets fall back to raw
-    pass-through.
+    See module docstring for the available modes. Returns ``None`` if
+    ``stats`` is missing — datasets fall back to raw pass-through.
     """
     if stats is None:
         return None
     section = stats.get(key)
     if section is None:
         return None
-    if mode == "bounds":
-        lo_key, hi_key = "min", "max"
-    elif mode == "bounds_q99":
-        lo_key, hi_key = "q01", "q99"
-    else:
-        raise ValueError(f"unknown stats mode {mode!r}")
+    try:
+        lo_key, hi_key = _MODE_TO_KEYS[mode]
+    except KeyError as e:
+        raise ValueError(f"unknown stats mode {mode!r}") from e
     from src.data.proprio_layout import assemble_flat_from_groups
     assembled = assemble_flat_from_groups(section, stat_keys=(lo_key, hi_key))
     lo = assembled[lo_key].astype(np.float32, copy=False)
@@ -118,15 +144,25 @@ def _load_normalize_bounds(
 
 
 def _normalize_to_pm1(
-    x: np.ndarray, bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    x: np.ndarray,
+    bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    clip: bool = True,
 ) -> np.ndarray:
-    """Rescale ``x`` (..., D) to ``[-1, 1]`` using ``(lo, hi, ill_mask)``."""
+    """Rescale ``x`` (..., D) to ``[-1, 1]`` using ``(lo, hi, ill_mask)``.
+
+    ``clip=True`` saturates values outside ``[lo, hi]`` at ``±1`` (the
+    classic ``bounds`` / ``bounds_q99`` behavior). ``clip=False`` keeps the
+    linear extrapolation so the model sees values beyond ``±1`` for tail
+    samples — used by ``bounds_q99_noclip``.
+    """
     if bounds is None:
         return x
     lo, hi, _ = bounds
     rng = hi - lo
     out = (x - lo) / rng * 2.0 - 1.0
-    return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+    if clip:
+        out = np.clip(out, -1.0, 1.0)
+    return out.astype(np.float32, copy=False)
 
 
 class TokenizedVideoDataset(Dataset):
@@ -144,6 +180,11 @@ class TokenizedVideoDataset(Dataset):
     # via the constructor / config.
     proprio_dim: int = 64
     _proprio_bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    # Whether to clip post-rescale proprio to ``[-1, 1]``. Subclasses set this
+    # off ``normalize_mode`` so ``bounds_q99_noclip`` lets tail values exceed
+    # ±1 (real magnitude preserved); legacy ``bounds`` / ``bounds_q99`` keep
+    # the historical clamp.
+    _proprio_clip: bool = True
 
     def __init__(self, action_chunk_size: int) -> None:
         super().__init__()
@@ -218,7 +259,7 @@ class TokenizedVideoDataset(Dataset):
         n = int(self._ep_lengths[ep])
         idx = min(t, n - 1)
         raw = proprio[idx].astype(np.float32, copy=False)
-        return _normalize_to_pm1(raw, self._proprio_bounds)
+        return _normalize_to_pm1(raw, self._proprio_bounds, clip=self._proprio_clip)
 
     # -- sampling ------------------------------------------------------------
 
