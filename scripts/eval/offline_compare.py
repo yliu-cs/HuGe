@@ -9,24 +9,24 @@ Usage
 -----
     cd /home/kinetra-5090-01/code/liuyang/Kappa
     .venv/bin/python scripts/eval/offline_compare.py \\
-        --ckpt-path .runs/kappa/exp.kappa.b1024.gpus8.2605262100/checkpoints/ckpt_3000 \\
+        --ckpt-path .runs/kappa/exp.kappa.b1024.gpus8.2605262100/checkpoints/ckpt_1500 \\
+                    .runs/kappa/exp.kappa.b1024.gpus8.2605262100/checkpoints/ckpt_3000 \\
         --data-root resource/dataset/proprietary/real/2026-05-23 \\
         --episode-idx 0 \\
-        --num-windows 4 \\
-        --out-dir .runs/eval/offline_compare/2026-05-23_ep0
+        --out-dir .runs/eval/offline_compare/ep0
 
-Each evaluated window writes a single PNG containing the input image, the
-predicted-vs-GT trajectories for a handful of representative motion dims,
-the predicted-vs-GT hand-binary curves, and a per-dim absolute-error heatmap
-over the prediction horizon. A summary PNG aggregates per-dim mean abs error
-across all windows.
+The script evaluates each checkpoint in order and writes one full-episode PNG
+per checkpoint. Filenames include one run timestamp plus a checkpoint label.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import glob
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -324,88 +324,68 @@ def _pick_dims(n: int, k: int) -> list[int]:
     return [int(round(i * (n - 1) / (k - 1))) for i in range(k)]
 
 
-def _plot_window(
-    out_path: Path,
-    image_np: np.ndarray,
-    prompt: str,
-    ep_idx: int,
-    t: int,
-    pred: np.ndarray,    # (T_action, sonic_dim)
-    gt: np.ndarray,      # (T_eff, sonic_dim) — T_eff may be < T_action if tail-clipped
+def _pick_top_error_motion_dims(
+    per_window_err: list[np.ndarray],
     motion_dim: int,
-    hand_dim: int,
-    motion_dims_to_show: list[int],
-) -> None:
-    T_action = pred.shape[0]
-    T_eff = gt.shape[0]
-    horizon = np.arange(T_action)
+    k: int,
+) -> list[int]:
+    """Motion dims with the largest mean absolute error across all windows."""
+    k = max(1, min(int(k), motion_dim))
+    if not per_window_err:
+        return _pick_dims(motion_dim, k)
+    flat = np.concatenate([e[:, :motion_dim] for e in per_window_err], axis=0)
+    per_dim = flat.mean(axis=0)
+    return np.argsort(per_dim)[-k:][::-1].astype(int).tolist()
 
-    # Figure layout: 1 image row + dim plots + hand row + heatmap.
-    n_motion = len(motion_dims_to_show)
-    n_rows = 1 + n_motion + (1 if hand_dim > 0 else 0) + 1
-    fig = plt.figure(figsize=(11, 1.6 * n_rows + 1.5), constrained_layout=True)
-    gs = fig.add_gridspec(n_rows, 2, height_ratios=[2.2] + [1.0] * (n_rows - 1))
 
-    # --- input image + title
-    ax_img = fig.add_subplot(gs[0, 0])
-    ax_img.imshow(image_np)
-    ax_img.set_title(f"input frame  (ep {ep_idx}, t={t})", fontsize=10)
-    ax_img.axis("off")
-    ax_text = fig.add_subplot(gs[0, 1])
-    ax_text.axis("off")
-    ax_text.text(
-        0.0, 0.95,
-        f"prompt:\n{prompt}\n\nhorizon: {T_action} (GT visible: {T_eff})\n"
-        f"motion_dim: {motion_dim}, hand_dim: {hand_dim}",
-        ha="left", va="top", fontsize=9, family="monospace",
-        transform=ax_text.transAxes,
+def _ckpt_output_label(ckpt_path: str, index: int) -> str:
+    """Stable, filename-safe label for one checkpoint argument."""
+    try:
+        ckpt_file = _resolve_ckpt_file(ckpt_path)
+        ckpt_dir = ckpt_file.parent
+        if ckpt_dir.name.startswith("ckpt_") and ckpt_dir.parent.name == "checkpoints":
+            label = f"{ckpt_dir.parent.parent.name}_{ckpt_dir.name}"
+        else:
+            label = ckpt_dir.name if ckpt_file.name == "model.safetensors" else ckpt_file.stem
+    except Exception:
+        p = Path(ckpt_path)
+        label = p.parent.name if p.name == "model.safetensors" else p.name
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")
+    return label or f"ckpt{index:02d}"
+
+
+def _natural_path_key(path: str) -> tuple[Any, ...]:
+    """Sort paths so ckpt_500 comes before ckpt_1000."""
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", path)
     )
 
-    # --- motion dim line plots
-    for i, d in enumerate(motion_dims_to_show):
-        ax = fig.add_subplot(gs[1 + i, :])
-        ax.plot(horizon, pred[:, d], color="tab:red", lw=1.4, label="pred")
-        ax.plot(np.arange(T_eff), gt[:, d], color="tab:blue", lw=1.4, alpha=0.85, label="gt")
-        ax.set_ylabel(f"dim {d}", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        if i == 0:
-            ax.legend(loc="upper right", fontsize=8)
-        if i < n_motion - 1:
-            ax.set_xticklabels([])
 
-    row_cursor = 1 + n_motion
+def _expand_ckpt_paths(ckpt_paths: tuple[str, ...]) -> list[str]:
+    """Expand glob patterns into concrete checkpoint paths.
 
-    # --- hand-binary (predicted continuous vs GT step)
-    if hand_dim > 0:
-        ax = fig.add_subplot(gs[row_cursor, :])
-        for h in range(hand_dim):
-            d = motion_dim + h
-            label_p = f"pred hand{h}" if h == 0 else None
-            label_g = f"gt hand{h}" if h == 0 else None
-            ax.plot(horizon, pred[:, d], lw=1.4, alpha=0.85,
-                    color=("tab:red" if h == 0 else "tab:orange"), label=label_p)
-            ax.step(np.arange(T_eff), gt[:, d], where="post", lw=1.4, alpha=0.85,
-                    color=("tab:blue" if h == 0 else "tab:cyan"), label=label_g)
-        ax.set_ylabel("hand bits", fontsize=9)
-        ax.set_ylim(-0.1, 1.1)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize=8, ncol=2)
-        row_cursor += 1
-
-    # --- per-dim |error| heatmap (T_eff x sonic_dim)
-    ax = fig.add_subplot(gs[row_cursor, :])
-    err = np.abs(pred[:T_eff] - gt)
-    im = ax.imshow(
-        err.T, aspect="auto", origin="lower", interpolation="nearest",
-        cmap="magma", vmin=0.0, vmax=max(0.05, float(err.max())),
-    )
-    ax.set_xlabel("step in horizon")
-    ax.set_ylabel("sonic dim")
-    ax.set_title("|pred − gt|", fontsize=9)
-    fig.colorbar(im, ax=ax, shrink=0.85)
-
-    fig.savefig(out_path, dpi=110)
-    plt.close(fig)
+    Keeps explicit paths unchanged, expands wildcard patterns in sorted order,
+    and deduplicates the final list while preserving first-seen order.
+    """
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for raw in ckpt_paths:
+        path = os.path.expanduser(raw)
+        matches = (
+            sorted(glob.glob(path, recursive=True), key=_natural_path_key)
+            if glob.has_magic(path) else [path]
+        )
+        if glob.has_magic(path) and not matches:
+            raise FileNotFoundError(f"No checkpoints matched glob pattern: {raw}")
+        for match in matches:
+            ckpt_file = _resolve_ckpt_file(match)
+            resolved = str(ckpt_file.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            expanded.append(match)
+    return expanded
 
 
 def _plot_full_episode(
@@ -497,42 +477,6 @@ def _plot_full_episode(
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
-
-def _plot_summary(
-    out_path: Path,
-    per_window_err: list[np.ndarray],  # each (T_eff_i, sonic_dim)
-    motion_dim: int,
-    hand_dim: int,
-) -> None:
-    sonic_dim = per_window_err[0].shape[1]
-    # Mean abs error per dim, pooling over all windows + horizon steps.
-    flat = np.concatenate(per_window_err, axis=0)  # (sum_T_eff, sonic_dim)
-    per_dim = flat.mean(axis=0)
-    per_step = [w.mean(axis=1) for w in per_window_err]
-
-    fig, axes = plt.subplots(2, 1, figsize=(11, 6.0), constrained_layout=True)
-    ax = axes[0]
-    ax.bar(np.arange(sonic_dim), per_dim, color="tab:purple", alpha=0.85)
-    ax.axvline(motion_dim - 0.5, color="k", lw=0.8, alpha=0.6)
-    ax.set_xlabel("sonic dim (0..motion_dim-1=motion, rest=hand)")
-    ax.set_ylabel("mean |pred − gt|")
-    ax.set_title("per-dim mean error across all windows")
-    ax.grid(True, axis="y", alpha=0.3)
-
-    ax = axes[1]
-    for i, e in enumerate(per_step):
-        ax.plot(np.arange(e.size), e, lw=1.2, alpha=0.8, label=f"win {i}")
-    ax.set_xlabel("step in horizon")
-    ax.set_ylabel("mean |pred − gt| over all dims")
-    ax.set_title("per-step mean error, per window")
-    ax.grid(True, alpha=0.3)
-    if len(per_step) <= 8:
-        ax.legend(loc="upper left", fontsize=8, ncol=2)
-
-    fig.savefig(out_path, dpi=110)
-    plt.close(fig)
-
-
 # =============================================================================
 # CLI
 # =============================================================================
@@ -540,8 +484,11 @@ def _plot_summary(
 
 @dataclass
 class OfflineConfig:
-    ckpt_path: str = ".runs/kappa/exp.kappa.b1024.gpus8.2605262100/checkpoints/ckpt_3000"
-    """``model.safetensors`` file, ``ckpt_*`` directory, or a run directory."""
+    ckpt_path: tuple[str, ...] = (
+        ".runs/kappa/exp.kappa.b1024.gpus8.2605262100/checkpoints/ckpt_3000",
+    )
+    """One or more checkpoints to evaluate. Each item can be a
+    ``model.safetensors`` file, ``ckpt_*`` directory, or a run directory."""
 
     data_root: str = "resource/dataset/proprietary/real/2026-05-23"
     """Root of the proprietary dataset (LeRobot v2.1 layout with sonic_tokens/)."""
@@ -551,11 +498,9 @@ class OfflineConfig:
     episode_idx: int = 0
     """Episode index inside ``data_root``."""
 
-    num_windows: int = 4
-    """How many evenly-spaced windows to evaluate across the episode."""
-
     timesteps: tuple[int, ...] = ()
-    """Explicit list of start indices into the episode. Overrides num_windows."""
+    """Explicit list of start indices into the episode. By default the script
+    tiles the whole episode with non-overlapping action-horizon windows."""
 
     action_horizon: int = 50
     num_inference_steps: int = 4
@@ -575,20 +520,98 @@ class OfflineConfig:
 
     seed: int | None = 0
 
-    motion_dims_to_show: tuple[int, ...] = (0, 8, 16, 24, 32, 40, 48, 56)
-    """Subset of motion-token dims to draw line plots for. Defaults to 8 dims
-    spread across the 64-D motion-token space."""
+    motion_dims_to_show: tuple[int, ...] = ()
+    """Explicit motion-token dims to draw line plots for. By default the script
+    shows the highest-error motion dims after comparing prediction and GT."""
 
-    tile_full: bool = False
-    """Tile the episode end-to-end with non-overlapping ``action_horizon``-sized
-    windows starting at t=0, H, 2H, …. Overrides ``timesteps`` and
-    ``num_windows`` and additionally emits a stitched full-episode PNG."""
+    num_motion_dims_to_show: int = 8
+    """How many highest-error motion-token dims to draw when
+    ``motion_dims_to_show`` is not set."""
 
-    per_window_plots: bool = True
-    """Emit one PNG per window. Off by default when ``tile_full`` is set and
-    there are >8 windows, since the stitched plot becomes the headline."""
+    out_dir: str = ".runs/eval/offline_compare/ep000000"
+    """Directory for full-episode PNG outputs. Filenames are generated as
+    ``<timestamp>_<checkpoint-label>.png``."""
 
-    out_dir: str = ".runs/eval/offline_compare"
+
+def _eval_one_ckpt(
+    cfg: OfflineConfig,
+    episode: _Episode,
+    timesteps: list[int],
+    ckpt_path: str,
+    out_path: Path,
+) -> None:
+    print(f"[offline] ckpt:       {ckpt_path}")
+    print(f"[offline] out_path:   {out_path}")
+    policy = _OfflinePolicy(
+        ckpt_path=ckpt_path,
+        base_vlm_path=cfg.base_vlm_path,
+        device=cfg.device,
+        action_horizon=cfg.action_horizon,
+        num_inference_steps=cfg.num_inference_steps,
+        use_proprio=cfg.use_proprio,
+        proprio_normalize_mode=cfg.proprio_normalize_mode,
+        seed=cfg.seed,
+    )
+
+    per_window_err: list[np.ndarray] = []
+    per_window_preds: list[np.ndarray] = []
+    for t in timesteps:
+        image_np = decode_frame(
+            episode.video_path, frame_idx=t, target_size=(320, 224),
+        )
+        proprio_raw: np.ndarray | None = None
+        if policy.use_proprio and episode.proprio is not None:
+            proprio_raw = np.asarray(episode.proprio[t], dtype=np.float32)
+
+        pred = policy.sample(image_np, episode.task, proprio_raw)  # (T, sonic_dim)
+        if pred.shape[1] != episode.sonic_tokens.shape[1]:
+            raise RuntimeError(
+                f"pred sonic_dim {pred.shape[1]} != gt sonic_dim "
+                f"{episode.sonic_tokens.shape[1]}; checkpoint/dataset mismatch"
+            )
+
+        t_end = min(t + pred.shape[0], episode.n_frames)
+        gt = np.asarray(episode.sonic_tokens[t:t_end], dtype=np.float32)
+
+        per_window_err.append(np.abs(pred[: gt.shape[0]] - gt))
+        per_window_preds.append(pred[: gt.shape[0]])
+        print(
+            f"[offline]   t={t:>5d}  "
+            f"L1/dim={per_window_err[-1].mean():.4f}"
+        )
+
+    manual_dims = [d for d in cfg.motion_dims_to_show if 0 <= d < policy.motion_dim]
+    if manual_dims:
+        motion_dims_to_show = manual_dims
+        print(f"[offline] plotting requested motion dims: {motion_dims_to_show}")
+    else:
+        motion_dims_to_show = _pick_top_error_motion_dims(
+            per_window_err,
+            motion_dim=policy.motion_dim,
+            k=cfg.num_motion_dims_to_show,
+        )
+        print(f"[offline] plotting top-error motion dims: {motion_dims_to_show}")
+
+    if per_window_err:
+        flat = np.concatenate(per_window_err, axis=0)
+        print(
+            f"[offline] overall L1/dim={flat.mean():.4f}, "
+            f"motion={flat[:, :policy.motion_dim].mean():.4f}, "
+            f"hand={flat[:, policy.motion_dim:].mean():.4f}"
+        )
+
+    _plot_full_episode(
+        out_path,
+        timesteps=timesteps,
+        preds=per_window_preds,
+        gt_full=np.asarray(episode.sonic_tokens, dtype=np.float32),
+        motion_dim=policy.motion_dim,
+        hand_dim=policy.hand_dim,
+        motion_dims_to_show=motion_dims_to_show,
+        ep_idx=episode.ep_idx,
+        prompt=episode.task,
+    )
+    print(f"[offline] full-episode → {out_path}")
 
 
 def main(cfg: OfflineConfig) -> None:
@@ -610,117 +633,32 @@ def main(cfg: OfflineConfig) -> None:
         f"task={episode.task!r}"
     )
 
-    if cfg.tile_full:
-        H = cfg.action_horizon
-        timesteps = list(range(0, episode.n_frames, H))
-    elif cfg.timesteps:
+    ckpt_paths = _expand_ckpt_paths(cfg.ckpt_path)
+    print(f"[offline] evaluating {len(ckpt_paths)} checkpoint(s)")
+
+    if cfg.timesteps:
         timesteps = [int(t) for t in cfg.timesteps]
     else:
-        max_t = max(0, episode.n_frames - 1)
-        if cfg.num_windows <= 1:
-            timesteps = [max_t // 2]
-        else:
-            timesteps = [
-                int(round(i * max_t / (cfg.num_windows - 1)))
-                for i in range(cfg.num_windows)
-            ]
+        H = cfg.action_horizon
+        timesteps = list(range(0, episode.n_frames, H))
     timesteps = sorted(set(t for t in timesteps if 0 <= t < episode.n_frames))
-    emit_per_window = cfg.per_window_plots and not (cfg.tile_full and len(timesteps) > 8)
-    print(
-        f"[offline] evaluating {len(timesteps)} timesteps "
-        f"(tile_full={cfg.tile_full}, per_window={emit_per_window})"
-    )
+    print(f"[offline] evaluating {len(timesteps)} timesteps for full-episode plot")
 
-    policy = _OfflinePolicy(
-        ckpt_path=cfg.ckpt_path,
-        base_vlm_path=cfg.base_vlm_path,
-        device=cfg.device,
-        action_horizon=cfg.action_horizon,
-        num_inference_steps=cfg.num_inference_steps,
-        use_proprio=cfg.use_proprio,
-        proprio_normalize_mode=cfg.proprio_normalize_mode,
-        seed=cfg.seed,
-    )
-
-    motion_dims_to_show = [d for d in cfg.motion_dims_to_show if 0 <= d < policy.motion_dim]
-    if not motion_dims_to_show:
-        motion_dims_to_show = _pick_dims(policy.motion_dim, 8)
-
-    per_window_err: list[np.ndarray] = []
-    per_window_preds: list[np.ndarray] = []
-    win_dir = out_dir / "windows" if cfg.tile_full else out_dir
-    win_dir.mkdir(parents=True, exist_ok=True)
-    for t in timesteps:
-        image_np = decode_frame(
-            episode.video_path, frame_idx=t, target_size=(320, 224),
-        )
-        proprio_raw: np.ndarray | None = None
-        if policy.use_proprio and episode.proprio is not None:
-            proprio_raw = np.asarray(episode.proprio[t], dtype=np.float32)
-
-        pred = policy.sample(image_np, episode.task, proprio_raw)  # (T, sonic_dim)
-        if pred.shape[1] != episode.sonic_tokens.shape[1]:
-            raise RuntimeError(
-                f"pred sonic_dim {pred.shape[1]} != gt sonic_dim "
-                f"{episode.sonic_tokens.shape[1]}; checkpoint/dataset mismatch"
-            )
-
-        t_end = min(t + pred.shape[0], episode.n_frames)
-        gt = np.asarray(episode.sonic_tokens[t:t_end], dtype=np.float32)
-
-        win_msg = ""
-        if emit_per_window:
-            win_path = win_dir / f"ep{episode.ep_idx:06d}_t{t:06d}.png"
-            _plot_window(
-                win_path,
-                image_np=image_np,
-                prompt=episode.task,
-                ep_idx=episode.ep_idx,
-                t=t,
-                pred=pred,
-                gt=gt,
-                motion_dim=policy.motion_dim,
-                hand_dim=policy.hand_dim,
-                motion_dims_to_show=motion_dims_to_show,
-            )
-            win_msg = f" → {win_path.name}"
-        per_window_err.append(np.abs(pred[: gt.shape[0]] - gt))
-        per_window_preds.append(pred[: gt.shape[0]])
-        print(
-            f"[offline]   t={t:>5d}{win_msg}  "
-            f"L1/dim={per_window_err[-1].mean():.4f}"
-        )
-
-    if per_window_err:
-        summary_path = out_dir / f"ep{episode.ep_idx:06d}_summary.png"
-        _plot_summary(
-            summary_path,
-            per_window_err=per_window_err,
-            motion_dim=policy.motion_dim,
-            hand_dim=policy.hand_dim,
-        )
-        flat = np.concatenate(per_window_err, axis=0)
-        print(
-            f"[offline] summary → {summary_path.name}  "
-            f"overall L1/dim={flat.mean():.4f}, "
-            f"motion={flat[:, :policy.motion_dim].mean():.4f}, "
-            f"hand={flat[:, policy.motion_dim:].mean():.4f}"
-        )
-
-    if cfg.tile_full:
-        full_path = out_dir / f"ep{episode.ep_idx:06d}_full.png"
-        _plot_full_episode(
-            full_path,
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    used_names: set[str] = set()
+    for i, ckpt_path in enumerate(ckpt_paths, start=1):
+        label = _ckpt_output_label(ckpt_path, i)
+        stem = f"{run_stamp}_{label}"
+        if stem in used_names:
+            stem = f"{stem}_{i:02d}"
+        used_names.add(stem)
+        _eval_one_ckpt(
+            cfg,
+            episode=episode,
             timesteps=timesteps,
-            preds=per_window_preds,
-            gt_full=np.asarray(episode.sonic_tokens, dtype=np.float32),
-            motion_dim=policy.motion_dim,
-            hand_dim=policy.hand_dim,
-            motion_dims_to_show=motion_dims_to_show,
-            ep_idx=episode.ep_idx,
-            prompt=episode.task,
+            ckpt_path=ckpt_path,
+            out_path=out_dir / f"{stem}.png",
         )
-        print(f"[offline] full-episode → {full_path.name}")
 
 
 if __name__ == "__main__":
