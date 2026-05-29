@@ -25,10 +25,10 @@ import os
 import numpy as np
 import polars as pl
 
+from src.data.kappa_modality_configs import KAPPA_MODALITY_CONFIGS
+from src.data.state_normalizer import StateNormalizer
 from src.data.tokenized_video_dataset import (
-    _NOCLIP_MODES,
     TokenizedVideoDataset,
-    _load_normalize_bounds,
     get_token_mmap,
     resolve_writable_cache_root,
 )
@@ -62,10 +62,18 @@ class WBTDataset(TokenizedVideoDataset):
         cache_root: str | None = None,
         subsets: "str | list[str]" = "all",
         emit_proprio: bool = False,
-        proprio_stats: dict | None = None,
-        normalize_mode: str = "bounds",
+        stats: dict | None = None,
+        use_percentiles: bool = True,
+        clip_outliers: bool = True,
     ) -> None:
-        super().__init__(action_chunk_size=action_chunk_size)
+        normalizer: StateNormalizer | None = None
+        if emit_proprio and stats is not None:
+            normalizer = StateNormalizer(
+                KAPPA_MODALITY_CONFIGS, stats,
+                use_percentiles=use_percentiles,
+                clip_outliers=clip_outliers,
+            )
+        super().__init__(action_chunk_size=action_chunk_size, normalizer=normalizer)
         self.data_root = data_root
         self.cache_root = resolve_writable_cache_root(data_root, cache_root)
 
@@ -83,16 +91,13 @@ class WBTDataset(TokenizedVideoDataset):
 
         self._emit_proprio = emit_proprio
         # ``g1_proprio/`` references the G1 *robot's* joint state cache; the
-        # directory name is preserved across the G1-expert removal.
+        # directory name is preserved across the schema swap to
+        # ``unitree_g1_sonic`` (34-D, 8-group).
         self.proprio_root = os.path.join(self.cache_root, "g1_proprio")
         if emit_proprio and not os.path.isdir(self.proprio_root):
             raise FileNotFoundError(
                 f"Missing {self.proprio_root}; re-run calc_wbt_sonic_tokens.py."
             )
-        self._proprio_bounds = _load_normalize_bounds(
-            proprio_stats, "proprio", self.proprio_dim, normalize_mode,
-        )
-        self._proprio_clip = normalize_mode not in _NOCLIP_MODES
 
         meta = pl.read_parquet(meta_path)
         if isinstance(subsets, str):

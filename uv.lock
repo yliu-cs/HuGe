@@ -960,6 +960,7 @@ requires-dist = [
     { name = "easydict" },
     { name = "gr00t", marker = "extra == 'inference'", directory = "/home/kinetra-5090-01/code/liuyang/Kappa/Isaac-GR00T" },
     { name = "hydra-core", marker = "extra == 'training'", specifier = "==1.3.2" },
+    { name = "isaac-gr00t", marker = "extra == 'inference'", git = "https://github.com/NVIDIA/Isaac-GR00T.git" },
     { name = "joblib" },
     { name = "lerobot", marker = "extra == 'data-collection'", git = "https://github.com/huggingface/lerobot.git?rev=a445d9c9da6bea99a8972daa4fe1fdd053d711d2" },
     { name = "loguru" },

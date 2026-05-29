@@ -1,14 +1,18 @@
-"""Compute 13-group proprio stats from the UNION of HE + WBT + PROP episodes.
+"""Compute sonic proprio stats from the UNION of HE + WBT + PROP episodes.
 
 Produces the normalization space for Stage 3 (PROP fine-tune). Union means
-``arms`` / ``quat`` envelopes inherit WBT's wide manipulation workspace while
-``legs`` / ``waist`` envelopes inherit PROP's squat / torso-rotation range,
-so deploy-time poses on the real robot stop landing OOD vs the model's
-learned conditioning.
+``arms`` / ``projected_gravity`` envelopes inherit WBT's wide manipulation
+workspace while ``legs`` / ``waist`` envelopes inherit PROP's squat /
+torso-rotation range, so deploy-time poses on the real robot stop landing
+OOD vs the model's learned conditioning.
 
-Stage 2 (HE+WBT post-train) still uses ``G1_WBT-cache/meta/g1_proprio_stats.json``;
-the union file is written to the PROP dump's ``meta/`` directory because it
-exists to serve fine-tune and downstream deploy / sim / eval.
+Stage 2 (HE+WBT post-train) still uses
+``G1_WBT-cache/meta/g1_proprio_stats_sonic.json``; the union file is written
+to the PROP dump's ``meta/`` directory because it exists to serve fine-tune
+and downstream deploy / sim / eval.
+
+Schema: nested ``{embodiment_tag: {modality: {joint_group: {stat_key: list}}}}``
+matching Isaac-GR00T. Stats emitted: ``min / max / mean / std / q01 / q99``.
 
 Example::
 
@@ -31,10 +35,21 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.data.proprio_layout import (  # noqa: E402
-    G1_PROPRIO_DIM,
-    PROPRIO_GROUPS,
+from src.data.kappa_modality_configs import (  # noqa: E402
+    G1_SONIC_PROPRIO_DIM,
+    SONIC_STATE_LAYOUT,
 )
+
+SONIC_EMBODIMENT_TAG = "unitree_g1_sonic"
+STAT_KEYS: tuple[str, ...] = ("min", "max", "mean", "std", "q01", "q99")
+
+HAND_BINARY_SOURCES: dict[str, str] = {
+    "HE": "binarize_hands(observation.hand_joints)",
+    "WBT": "compute_hand_bits(hand_state, hand_type)",
+    "PROP/real/2026-05-23": "observation.hand_binary_state",
+    "PROP/real/2026-05-16": "binarize_hands(dex3)",
+    "PROP/simple/2026-05-21": "binarize_hands(dex3)",
+}
 
 
 def _iter_proprio_files(root: str) -> List[str]:
@@ -42,6 +57,37 @@ def _iter_proprio_files(root: str) -> List[str]:
         return []
     pattern = os.path.join(root, "**", "episode_*.npy")
     return sorted(glob.glob(pattern, recursive=True))
+
+
+def _per_group_stats(flat: np.ndarray) -> dict[str, dict[str, list[float]]]:
+    out: dict[str, dict[str, list[float]]] = {}
+    print(
+        f"\n{'group':22s}{'dim':>4s}  "
+        f"{'min':>10s} {'max':>10s} {'mean':>10s} {'std':>10s} "
+        f"{'q01':>10s} {'q99':>10s}"
+    )
+    for name, start, end in SONIC_STATE_LAYOUT:
+        sub = flat[:, start:end]
+        qvals = np.quantile(sub, (0.01, 0.99), axis=0)
+        mn = sub.min(axis=0)
+        mx = sub.max(axis=0)
+        mean = sub.mean(axis=0)
+        std = sub.std(axis=0)
+        out[name] = {
+            "min": mn.astype(np.float64).tolist(),
+            "max": mx.astype(np.float64).tolist(),
+            "mean": mean.astype(np.float64).tolist(),
+            "std": std.astype(np.float64).tolist(),
+            "q01": qvals[0].astype(np.float64).tolist(),
+            "q99": qvals[1].astype(np.float64).tolist(),
+        }
+        print(
+            f"{name:22s}{end - start:>4d}  "
+            f"{float(mn.min()):>10.3f} {float(mx.max()):>10.3f} "
+            f"{float(mean.mean()):>10.3f} {float(std.mean()):>10.3f} "
+            f"{float(qvals[0].min()):>10.3f} {float(qvals[1].max()):>10.3f}"
+        )
+    return out
 
 
 def main() -> None:
@@ -69,7 +115,7 @@ def main() -> None:
         "--out",
         default=(
             "resource/dataset/proprietary/real/2026-05-23/meta/"
-            "proprio_stats_union.json"
+            "proprio_stats_union_sonic.json"
         ),
         help=(
             "Output JSON path. Defaults to the PROP dump's meta/ since these "
@@ -95,8 +141,11 @@ def main() -> None:
             except Exception as e:
                 print(f"[!] skip {path}: {e}")
                 continue
-            if arr.ndim != 2 or arr.shape[1] != G1_PROPRIO_DIM:
-                print(f"[!] skip {path}: shape {arr.shape}, expected (T, {G1_PROPRIO_DIM})")
+            if arr.ndim != 2 or arr.shape[1] != G1_SONIC_PROPRIO_DIM:
+                print(
+                    f"[!] skip {path}: shape {arr.shape}, "
+                    f"expected (T, {G1_SONIC_PROPRIO_DIM})"
+                )
                 continue
             bufs.append(np.asarray(arr, dtype=np.float32))
             n_ep += 1
@@ -112,40 +161,24 @@ def main() -> None:
     flat = np.concatenate(bufs, axis=0)
     total_frames = int(flat.shape[0])
 
-    print(f"\nUnion: {total_frames} rows x {G1_PROPRIO_DIM} dims")
+    print(f"\nUnion: {total_frames} rows x {G1_SONIC_PROPRIO_DIM} dims")
     for tag, (ne, nf) in counts.items():
         print(f"  {tag:5s}: {ne:5d} ep / {nf:9d} fr")
 
-    groups_out: dict[str, dict[str, list[float]]] = {}
-    print(f"\n{'group':22s}{'dim':>4s}  {'min':>10s} {'max':>10s} "
-          f"{'q01':>10s} {'q99':>10s}")
-    for name, start, end in PROPRIO_GROUPS:
-        sub = flat[:, start:end]
-        qvals = np.quantile(sub, (0.01, 0.99), axis=0)
-        mn = sub.min(axis=0)
-        mx = sub.max(axis=0)
-        groups_out[name] = {
-            "min": mn.astype(np.float64).tolist(),
-            "max": mx.astype(np.float64).tolist(),
-            "q01": qvals[0].astype(np.float64).tolist(),
-            "q99": qvals[1].astype(np.float64).tolist(),
-        }
-        print(
-            f"{name:22s}{end - start:>4d}  "
-            f"{float(mn.min()):>10.3f} {float(mx.max()):>10.3f} "
-            f"{float(qvals[0].min()):>10.3f} {float(qvals[1].max()):>10.3f}"
-        )
+    groups_out = _per_group_stats(flat)
 
     payload = {
-        "proprio": groups_out,
+        SONIC_EMBODIMENT_TAG: {"state": groups_out},
         "_meta": {
             "sources": {
                 tag: {"n_episodes": ne, "n_frames": nf}
                 for tag, (ne, nf) in counts.items()
             },
             "total_frames": total_frames,
-            "layout": "13-group v1",
-            "g1_proprio_dim": G1_PROPRIO_DIM,
+            "layout": "unitree_g1_sonic v1",
+            "g1_proprio_dim": G1_SONIC_PROPRIO_DIM,
+            "stats_schema": {"keys": list(STAT_KEYS)},
+            "hand_binary_source": HAND_BINARY_SOURCES,
         },
     }
 
@@ -154,7 +187,7 @@ def main() -> None:
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, args.out)
-    print(f"\nWrote union proprio stats -> {args.out}")
+    print(f"\nWrote union sonic proprio stats -> {args.out}")
 
 
 if __name__ == "__main__":

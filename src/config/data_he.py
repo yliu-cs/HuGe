@@ -17,11 +17,14 @@ class HEDataConfig(DataConfig):
     # embodiment, so default to G1. Pass "all" to disable the filter.
     robot_type: str = "g1"
 
-    # Optional 64-D robot proprio prefix. Default off so the EgoDex pretrain
-    # config stays byte-identical.
+    # Optional 34-D ``unitree_g1_sonic`` proprio prefix. Default off so the
+    # EgoDex pretrain config stays byte-identical.
     emit_proprio: bool = False
     proprio_stats_path: str | None = None
-    normalize_mode: str = "bounds"
+    # Per Isaac-GR00T N1.7 defaults (``StateActionProcessor``): clip to ±1
+    # using q01 / q99 envelopes. Override individually for ablations.
+    use_percentiles: bool = True
+    clip_outliers: bool = True
 
     # Restrict the dataset to a fixed list of HE episode indices. ``None``
     # keeps the full split; used by fine-tune configs that overfit a single
@@ -45,8 +48,9 @@ class HEDataConfig(DataConfig):
             cache_root=self.cache_root,
             robot_type=self.robot_type,
             emit_proprio=self.emit_proprio,
-            proprio_stats=self._load_stats(self.proprio_stats_path),
-            normalize_mode=self.normalize_mode,
+            stats=self._load_stats(self.proprio_stats_path),
+            use_percentiles=self.use_percentiles,
+            clip_outliers=self.clip_outliers,
             episode_indices=self.episode_indices,
         )
         return Dataset(raw, self.transform, transform_kwargs=transform_kwargs)

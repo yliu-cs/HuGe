@@ -24,7 +24,8 @@ class KappaCollator:
     ``velocity_target`` only; the CE fallback in the model is unused at train.
 
     When ``use_proprio`` is on, the collator stacks proprio from each instance
-    and adds Gaussian jitter (skipping hand-bit + quat dims).
+    and passes it through unchanged — no train-time jitter or drop (GR00T
+    parity).
     """
 
     def __init__(
@@ -32,33 +33,15 @@ class KappaCollator:
         processor,
         model_max_length: int = 8192,
         use_proprio: bool = False,
-        proprio_noise_std: float = 0.02,
-        proprio_drop_prob: float = 0.1,
-        proprio_dim: int = 64,
     ):
         self.processor = processor
         self.model_max_length = model_max_length
         self.use_proprio = use_proprio
-        self.proprio_noise_std = proprio_noise_std
-        self.proprio_drop_prob = proprio_drop_prob
-        self.proprio_dim = proprio_dim
 
     @staticmethod
     def _logit_normal_t(B: int) -> torch.Tensor:
         # Same logit-normal schedule as pretrain — density peaks at t=0.5.
         return torch.sigmoid(torch.randn(B)) * 0.999 + 0.001
-
-    def _build_proprio_noise_mask(self) -> torch.Tensor:
-        """Hand-bit columns (29:31) and odom_quat (60:64) are categorical /
-        unit-norm; jittering them in normalized space breaks their geometry.
-        Joint position (0:29) and joint velocity (31:60) are smooth scalars
-        so we apply Gaussian noise there.
-        """
-        mask = torch.ones(self.proprio_dim)
-        if self.proprio_dim == 64:
-            mask[29:31] = 0.0
-            mask[60:64] = 0.0
-        return mask
 
     def __call__(self, instances):
         from qwen_vl_utils import process_vision_info
@@ -116,14 +99,7 @@ class KappaCollator:
             result["sonic_mask"] = sonic_mask
 
         if self.use_proprio and "proprio" in instances[0]:
-            proprio = torch.stack([inst["proprio"] for inst in instances])  # (B, D_p)
-            if self.proprio_noise_std > 0:
-                noise_mask = self._build_proprio_noise_mask().to(proprio.dtype)
-                proprio = proprio + torch.randn_like(proprio) * self.proprio_noise_std * noise_mask
-            if self.proprio_drop_prob > 0:
-                drop = (torch.rand(proprio.shape[0]) < self.proprio_drop_prob).to(proprio.dtype)
-                proprio = proprio * (1.0 - drop)[:, None]
-            result["proprio"] = proprio
+            result["proprio"] = torch.stack([inst["proprio"] for inst in instances])
 
         return result
 
@@ -170,7 +146,7 @@ class KappaTrainer(Trainer):
                 sonic_dim=model_cfg.sonic_dim,
                 action_loss_weight=model_cfg.action_loss_weight,
                 use_proprio=getattr(model_cfg, "use_proprio", False),
-                proprio_dim=getattr(model_cfg, "proprio_dim", 64),
+                proprio_dim=getattr(model_cfg, "proprio_dim", 34),
             )
 
         self.model_wrapper = model_wrapper
@@ -205,9 +181,6 @@ class KappaTrainer(Trainer):
             processor=self.vlm_processor,
             model_max_length=model_cfg.model_max_length,
             use_proprio=getattr(model_cfg, "use_proprio", False),
-            proprio_noise_std=getattr(model_cfg, "proprio_noise_std", 0.02),
-            proprio_drop_prob=getattr(model_cfg, "proprio_drop_prob", 0.1),
-            proprio_dim=getattr(model_cfg, "proprio_dim", 64),
         )
 
         g = torch.Generator()

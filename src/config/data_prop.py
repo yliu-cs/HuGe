@@ -39,11 +39,14 @@ class PropDataConfig(DataConfig):
     data_roots: list[str] = Field(default_factory=lambda: [_DEFAULT_DATA_ROOT])
     action_chunk_size: int = 50
 
-    # Optional 64-D robot proprio prefix; default on for fine-tune since the
-    # post-train checkpoint already has the proprio embedder.
+    # Optional 34-D ``unitree_g1_sonic`` proprio prefix; default on for
+    # fine-tune since the post-train checkpoint already has the proprio
+    # embedder. GR00T N1.7 defaults (q01/q99 + clip to ±1) reproduced via
+    # ``use_percentiles`` and ``clip_outliers``.
     emit_proprio: bool = True
     proprio_stats_path: str | None = None
-    normalize_mode: str = "bounds_q99"
+    use_percentiles: bool = True
+    clip_outliers: bool = True
 
     # Restrict to a subset of episode indices for diagnostic runs. Applied
     # identically to every root in ``data_roots`` — episode index spaces are
@@ -80,8 +83,9 @@ class PropDataConfig(DataConfig):
                 split=split,
                 cache_root=None,  # auto-resolved per-root inside PropDataset
                 emit_proprio=self.emit_proprio,
-                proprio_stats=stats,
-                normalize_mode=self.normalize_mode,
+                stats=stats,
+                use_percentiles=self.use_percentiles,
+                clip_outliers=self.clip_outliers,
                 episode_indices=self.episode_indices,
             )
             for root in self.data_roots

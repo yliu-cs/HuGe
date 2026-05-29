@@ -20,12 +20,13 @@ from src.data.transform import (
 )
 
 
-# HE+WBT combined proprio stats, written in the 13-group GR00T-aligned schema
-# by ``scripts/preprocess/calc_g1_proprio_stats.py``. Lives next to the WBT
+# HE+WBT combined proprio stats in the nested ``{"unitree_g1_sonic": {
+# "state": ...}}`` schema, written by
+# ``scripts/preprocess/calc_g1_proprio_stats.py``. Lives next to the WBT
 # cache; the ``g1_`` prefix is kept because the vector describes the G1
 # *robot's* joint state. Trainer.save_checkpoint copies this JSON into each
 # ckpt_<step>/ so deploy / sim / eval can auto-discover it.
-_DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json"
+_DEFAULT_PROPRIO_STATS = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json"
 
 
 class PostTrainHEWBTDataTransform(DataTransform):
@@ -47,14 +48,16 @@ class PostTrainHEWBTDataConfig(HEWBTMixDataConfig):
             robot_type="g1",
             emit_proprio=True,
             proprio_stats_path=_DEFAULT_PROPRIO_STATS,
-            normalize_mode="bounds_q99",
+            use_percentiles=True,
+            clip_outliers=True,
         )
     )
     wbt: WBTDataConfig = Field(
         default_factory=lambda: WBTDataConfig(
             emit_proprio=True,
             proprio_stats_path=_DEFAULT_PROPRIO_STATS,
-            normalize_mode="bounds_q99",
+            use_percentiles=True,
+            clip_outliers=True,
         )
     )
 

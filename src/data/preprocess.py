@@ -92,6 +92,25 @@ WBC_VY_CLIP = 1.0
 WBC_WZ_CLIP = 1.5
 
 
+def projected_gravity_from_quat_wxyz(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Body-frame gravity direction ``R(q).T @ [0, 0, -1]`` for WXYZ quats.
+
+    The 34-D ``unitree_g1_sonic`` proprio's last 3 dims are the unit gravity
+    direction expressed in the robot's base frame. Proprietary dumps ship
+    ``observation.projected_gravity`` directly; HE / WBT only carry the
+    odometry quaternion, so we derive it here. Returns ``(T, 3)`` float32.
+    """
+    q = np.asarray(quat_wxyz, dtype=np.float64)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    out = np.empty((q.shape[0], 3), dtype=np.float32)
+    # (R.T @ [0,0,-1])_i = -R[2, i]; substitute the third row of the
+    # canonical WXYZ-quat rotation matrix and negate component-wise.
+    out[:, 0] = 2.0 * (w * y - x * z)
+    out[:, 1] = -2.0 * (w * x + y * z)
+    out[:, 2] = 2.0 * (x * x + y * y) - 1.0
+    return out
+
+
 def pelvis_roll_pitch(quat_wxyz: np.ndarray) -> np.ndarray:
     """Extract (roll, pitch) from a (T, 4) WXYZ pelvis quaternion array.
 

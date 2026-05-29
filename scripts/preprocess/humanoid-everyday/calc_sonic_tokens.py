@@ -79,6 +79,7 @@ def load_episode_arrays(parquet_path: str):
 # bit-identical (the SONIC token distribution is sensitive to upsampling).
 from src.data.preprocess import (  # noqa: E402
     atomic_save_npy,
+    projected_gravity_from_quat_wxyz as _projected_gravity_from_quat_wxyz,
     resample_linear as _resample_linear,
     resample_quat_wxyz as _resample_quat_wxyz,
 )
@@ -89,26 +90,39 @@ def _dump_proprio(
     oq: "np.ndarray",
     hj: "np.ndarray",
     hand_thresholds: tuple[float, float, float, float],
-    target_fps: float,
     proprio_path: str,
 ) -> None:
-    """Dump the 64-D robot proprio vector
-    (full-body jp + hand_bits + jv + odom_quat_xyzw) on the SONIC timeline.
+    """Dump 34-D ``unitree_g1_sonic`` proprio.
+
+    Layout: ``[left_leg(6) | right_leg(6) | waist(3) | left_arm(7) |
+    right_arm(7) | left_hand(1) | right_hand(1) | projected_gravity(3)]``.
+
+    HE's ``jp`` is already a 29-D G1-ordered vector: ``[legs(12) | waist(3) |
+    left_arm(7) | right_arm(7)]``. Hand open/close bits come from
+    ``binarize_hands(observation.hand_joints)``; projected gravity is the
+    body-frame ``R(odom_quat).T @ [0, 0, -1]`` (HE has no IMU-derived
+    projected_gravity column, only the odometry quaternion).
     """
     import numpy as np
-    from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw, binarize_hands
+    from src.tokenizer.sonic_encoder import binarize_hands
 
-    hand_bits = binarize_hands(hj, hand_thresholds).astype(np.float32)  # (n, 2)
     jp32 = jp.astype(np.float32, copy=False)
+    hand_bits = binarize_hands(hj, hand_thresholds).astype(np.float32, copy=False)  # (n, 2)
+    pg = _projected_gravity_from_quat_wxyz(oq.astype(np.float32, copy=False))         # (n, 3)
 
-    n = jp32.shape[0]
-    jv = np.zeros_like(jp32)
-    if n > 1:
-        jv[1:] = (jp32[1:] - jp32[:-1]) * float(target_fps)
-    quat_xyzw = _quat_wxyz_to_xyzw(oq.astype(np.float32, copy=False)).astype(np.float32)
-    proprio = np.concatenate(
-        [jp32, hand_bits, jv, quat_xyzw], axis=-1
-    ).astype(np.float32)  # (n, 29 + 2 + 29 + 4) = (n, 64)
+    parts = [
+        jp32[:, 0:6],            # left_leg
+        jp32[:, 6:12],           # right_leg
+        jp32[:, 12:15],          # waist
+        jp32[:, 15:22],          # left_arm
+        jp32[:, 22:29],          # right_arm
+        hand_bits[:, 0:1],       # left_hand
+        hand_bits[:, 1:2],       # right_hand
+        pg[:, 0:3],              # projected_gravity
+    ]
+    proprio = np.concatenate(parts, axis=-1).astype(np.float32)
+    if proprio.shape[1] != 34:
+        raise ValueError(f"assembled proprio shape {proprio.shape} != (*, 34) at {proprio_path}")
     atomic_save_npy(proprio, proprio_path)
 
 
@@ -167,7 +181,7 @@ def worker_main(
             proprio_path = os.path.join(proprio_dir, f"episode_{ep_idx:06d}.npy")
             if not os.path.exists(proprio_path):
                 _dump_proprio(
-                    jp, oq, hj, hand_thresholds, target_fps, proprio_path,
+                    jp, oq, hj, hand_thresholds, proprio_path,
                 )
             result_q.put(("ok", ep_idx, token_len))
         except Exception:

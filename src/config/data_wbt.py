@@ -20,7 +20,8 @@ class WBTDataConfig(DataConfig):
 
     emit_proprio: bool = False
     proprio_stats_path: str | None = None
-    normalize_mode: str = "bounds"
+    use_percentiles: bool = True
+    clip_outliers: bool = True
 
     def _load_stats(self, path: str | None) -> dict | None:
         if path is None or not os.path.exists(path):
@@ -38,7 +39,8 @@ class WBTDataConfig(DataConfig):
             cache_root=self.cache_root,
             subsets=self.subsets,
             emit_proprio=self.emit_proprio,
-            proprio_stats=self._load_stats(self.proprio_stats_path),
-            normalize_mode=self.normalize_mode,
+            stats=self._load_stats(self.proprio_stats_path),
+            use_percentiles=self.use_percentiles,
+            clip_outliers=self.clip_outliers,
         )
         return Dataset(raw, self.transform, transform_kwargs=transform_kwargs)

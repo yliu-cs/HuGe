@@ -35,8 +35,9 @@ class HEWBTMixDataConfig(DataConfig):
             cache_root=self.he.cache_root,
             robot_type=self.he.robot_type,
             emit_proprio=self.he.emit_proprio,
-            proprio_stats=self.he._load_stats(self.he.proprio_stats_path),
-            normalize_mode=self.he.normalize_mode,
+            stats=self.he._load_stats(self.he.proprio_stats_path),
+            use_percentiles=self.he.use_percentiles,
+            clip_outliers=self.he.clip_outliers,
         )
         raw_wbt = WBTDataset(
             data_root=self.wbt.data_root,
@@ -44,8 +45,9 @@ class HEWBTMixDataConfig(DataConfig):
             cache_root=self.wbt.cache_root,
             subsets=self.wbt.subsets,
             emit_proprio=self.wbt.emit_proprio,
-            proprio_stats=self.wbt._load_stats(self.wbt.proprio_stats_path),
-            normalize_mode=self.wbt.normalize_mode,
+            stats=self.wbt._load_stats(self.wbt.proprio_stats_path),
+            use_percentiles=self.wbt.use_percentiles,
+            clip_outliers=self.wbt.clip_outliers,
         )
         mix = ConcatMixDataset([raw_he, raw_wbt])
         return Dataset(mix, self.transform, transform_kwargs=transform_kwargs)

@@ -8,8 +8,8 @@ layout when proprio is on:
 When proprio is off: ``[image+text | t_emb_s (1) | sonic (T_s)]``.
 
 Proprio joins the **latent prefix** (Qwen base expert) so its K/V are cached
-once and reused during denoise. The 64-D proprio is projected via the
-top-level ``proprio_embedder`` Linear.
+once and reused during denoise. The 34-D ``unitree_g1_sonic`` proprio is
+projected via the top-level ``proprio_embedder`` Linear.
 """
 from __future__ import annotations
 
@@ -304,8 +304,8 @@ class MoTKappaModel(nn.Module):
     """Kappa MoT model with SONIC flow-matching action expert.
 
     See module docstring for sequence layouts. ``use_proprio`` adds a single
-    64-D proprio token at the end of the latent prefix (between text/image and
-    the SONIC segment).
+    ``proprio_dim``-wide proprio token (default 34 for ``unitree_g1_sonic``)
+    at the end of the latent prefix, between text/image and the SONIC segment.
     """
 
     def __init__(
@@ -314,7 +314,7 @@ class MoTKappaModel(nn.Module):
         sonic_dim: int = 66,
         action_loss_weight: float = 1.0,
         use_proprio: bool = False,
-        proprio_dim: int = 64,
+        proprio_dim: int = 34,
     ):
         super().__init__()
         self.base_model = base_model

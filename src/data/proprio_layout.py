@@ -1,22 +1,22 @@
-"""Canonical 13-group split of the 64-D G1 proprio vector.
+"""Canonical 8-group split of the 34-D ``unitree_g1_sonic`` proprio vector.
 
-Layout (single source of truth, mirroring the G1 actuator order:
-legs(12) + waist(3) + arms(14))::
+Layout (single source of truth, matching Isaac-GR00T's
+``unitree_g1_sonic`` embodiment in
+``gr00t/configs/data/embodiment_configs.py:67-114``)::
 
-    proprio[ 0:29] = jp        (rad)        legs(12) + waist(3) + arms(14)
-    proprio[29:31] = hand_bits (binary)     left/right
-    proprio[31:60] = jv        (rad/s)      same partition as jp
-    proprio[60:64] = quat_xyzw (pelvis)
+    proprio[ 0: 6] = left_leg            (rad)
+    proprio[ 6:12] = right_leg           (rad)
+    proprio[12:15] = waist               (rad)
+    proprio[15:22] = left_arm            (rad)
+    proprio[22:29] = right_arm           (rad)
+    proprio[29:30] = left_hand           (binary open/close)
+    proprio[30:31] = right_hand          (binary open/close)
+    proprio[31:34] = projected_gravity   (unitless, base frame)
 
-The 13 groups below mirror the actuator partition used by Isaac-GR00T's
-``unitree_g1_sonic`` embodiment
-(``gr00t/configs/data/embodiment_configs.py:67-114``), extended to cover the
-extra ``jv`` and ``quat`` segments that Kappa's proprio carries.
-
-The split is structural: it lets per-group normalization schemes be swapped
-in later (sin/cos for ``quat``, mean-std for ``*_vel``, pass-through for
-``*_hand_bit``) without changing the on-disk format. Per-dim ``q01/q99``
-values themselves are bit-identical to a flat 64-D computation.
+The names + ordering are re-exported from
+``src.data.kappa_modality_configs`` so anything still importing
+``PROPRIO_GROUPS`` / ``G1_PROPRIO_DIM`` stays in lockstep with the
+canonical embodiment config.
 """
 from __future__ import annotations
 
@@ -24,52 +24,24 @@ from typing import Mapping
 
 import numpy as np
 
-G1_PROPRIO_DIM = 64
-
-# Ordered (name, start, end) with end exclusive. Concatenating slices in this
-# order MUST reconstruct the full 64-D proprio.
-PROPRIO_GROUPS: tuple[tuple[str, int, int], ...] = (
-    ("left_leg_pos",   0,  6),
-    ("right_leg_pos",  6, 12),
-    ("waist_pos",     12, 15),
-    ("left_arm_pos",  15, 22),
-    ("right_arm_pos", 22, 29),
-    ("left_hand_bit", 29, 30),
-    ("right_hand_bit", 30, 31),
-    ("left_leg_vel",  31, 37),
-    ("right_leg_vel", 37, 43),
-    ("waist_vel",     43, 46),
-    ("left_arm_vel",  46, 53),
-    ("right_arm_vel", 53, 60),
-    ("quat",          60, 64),
+from src.data.kappa_modality_configs import (
+    G1_SONIC_PROPRIO_DIM,
+    SONIC_STATE_LAYOUT,
 )
 
-# Sanity: the table above must tile [0, 64) exactly.
-_check_total = sum(end - start for _, start, end in PROPRIO_GROUPS)
-assert _check_total == G1_PROPRIO_DIM, (
-    f"PROPRIO_GROUPS dims sum to {_check_total}, expected {G1_PROPRIO_DIM}"
-)
-_check_cursor = 0
-for _name, _start, _end in PROPRIO_GROUPS:
-    assert _start == _check_cursor, (
-        f"PROPRIO_GROUPS gap/overlap at group {_name!r}: start={_start}, expected {_check_cursor}"
-    )
-    _check_cursor = _end
-del _check_total, _check_cursor
+
+G1_PROPRIO_DIM = G1_SONIC_PROPRIO_DIM
+PROPRIO_GROUPS: tuple[tuple[str, int, int], ...] = SONIC_STATE_LAYOUT
 
 
 def assemble_flat_from_groups(
     grouped: Mapping[str, Mapping[str, list | np.ndarray]],
     stat_keys: tuple[str, ...] = ("min", "max", "q01", "q99"),
 ) -> dict[str, np.ndarray]:
-    """Concat per-group stats into flat 64-D vectors in layout order.
+    """Concat per-group stats into flat 34-D vectors in layout order.
 
     ``grouped`` maps group name -> {stat_key -> per-dim list/array}, matching
-    the on-disk grouped JSON layout. Returns ``{stat_key: (64,) np.float64}``.
-
-    Raises ``KeyError`` (with the offending group named) if any expected
-    group or stat key is missing, or ``ValueError`` if a per-group array
-    length disagrees with the layout slice width.
+    the on-disk grouped JSON layout. Returns ``{stat_key: (34,) np.float64}``.
     """
     out: dict[str, np.ndarray] = {}
     for stat_key in stat_keys:

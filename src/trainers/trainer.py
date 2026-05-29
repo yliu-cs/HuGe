@@ -371,56 +371,69 @@ class Trainer(ABC):
         return ckpt_dir
 
     def _bundle_proprio_stats(self, ckpt_dir: str) -> None:
-        """Copy the active dataset's proprio stats JSON into ``ckpt_dir`` and
-        write a ``proprio_norm_mode.txt`` sidecar with the matching
-        ``normalize_mode``.
+        """Copy the active dataset's nested ``proprio_stats_sonic.json`` into
+        ``ckpt_dir`` and write a ``proprio_norm_config.json`` sidecar with the
+        matching ``use_percentiles`` / ``clip_outliers`` pair.
 
         Discovery order (first existing source wins): top-level
-        ``data_cfg.{proprio_stats_path,normalize_mode}`` for single-dataset
-        configs (prop / he / wbt), then mix children
-        ``data_cfg.{prop,he,wbt}.{proprio_stats_path,normalize_mode}``. The
-        winning source supplies BOTH the stats path and the normalize mode so
-        deploy / sim / eval auto-pick the matching clip behavior — pinning
-        ``--proprio-normalize-mode`` on the CLI is no longer required.
+        ``data_cfg.{proprio_stats_path,use_percentiles,clip_outliers}`` for
+        single-dataset configs (prop / he / wbt), then mix children
+        ``data_cfg.{prop,he,wbt}.{...}``. The winning source supplies BOTH
+        the stats path and the normalize config so deploy / sim / eval
+        auto-pick the matching dispatch.
         """
-        candidates: list[tuple[str | None, str | None]] = []
+        import json
+
+        candidates: list[tuple[str | None, bool, bool]] = []
         top_path = getattr(self.data_cfg, "proprio_stats_path", None)
-        top_mode = getattr(self.data_cfg, "normalize_mode", None)
         if top_path:
-            candidates.append((top_path, top_mode))
+            candidates.append((
+                top_path,
+                bool(getattr(self.data_cfg, "use_percentiles", True)),
+                bool(getattr(self.data_cfg, "clip_outliers", True)),
+            ))
         for child in ("prop", "he", "wbt"):
             sub = getattr(self.data_cfg, child, None)
             if sub is None:
                 continue
             sub_path = getattr(sub, "proprio_stats_path", None)
-            sub_mode = getattr(sub, "normalize_mode", None)
             if sub_path:
-                candidates.append((sub_path, sub_mode))
+                candidates.append((
+                    sub_path,
+                    bool(getattr(sub, "use_percentiles", True)),
+                    bool(getattr(sub, "clip_outliers", True)),
+                ))
         chosen = next(
-            ((p, m) for p, m in candidates if p and os.path.isfile(p)), None
+            ((p, up, clip) for p, up, clip in candidates if p and os.path.isfile(p)),
+            None,
         )
         if chosen is None:
             overwatch.warning(
                 "no proprio_stats_path resolves to an existing file on data_cfg; "
-                "ckpt will not bundle proprio_stats.json (inference will fall back to legacy default)."
+                "ckpt will not bundle proprio_stats_sonic.json (inference will fall back to legacy default)."
             )
             return
-        src_path, src_mode = chosen
-        dst = os.path.join(ckpt_dir, "proprio_stats.json")
+        src_path, use_percentiles, clip_outliers = chosen
+        dst = os.path.join(ckpt_dir, "proprio_stats_sonic.json")
         try:
             shutil.copyfile(src_path, dst)
         except OSError as e:
-            overwatch.warning(f"failed to bundle proprio_stats.json into {ckpt_dir}: {e}")
+            overwatch.warning(
+                f"failed to bundle proprio_stats_sonic.json into {ckpt_dir}: {e}"
+            )
             return
-        if src_mode:
-            mode_path = os.path.join(ckpt_dir, "proprio_norm_mode.txt")
-            try:
-                with open(mode_path, "w") as f:
-                    f.write(str(src_mode).strip() + "\n")
-            except OSError as e:
-                overwatch.warning(
-                    f"failed to write proprio_norm_mode.txt into {ckpt_dir}: {e}"
+        cfg_path = os.path.join(ckpt_dir, "proprio_norm_config.json")
+        try:
+            with open(cfg_path, "w") as f:
+                json.dump(
+                    {"use_percentiles": use_percentiles, "clip_outliers": clip_outliers},
+                    f,
                 )
+                f.write("\n")
+        except OSError as e:
+            overwatch.warning(
+                f"failed to write proprio_norm_config.json into {ckpt_dir}: {e}"
+            )
 
     def set_train(self):
         self.model.train()

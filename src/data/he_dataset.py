@@ -7,10 +7,10 @@ import os
 import numpy as np
 import polars as pl
 
+from src.data.kappa_modality_configs import KAPPA_MODALITY_CONFIGS
+from src.data.state_normalizer import StateNormalizer
 from src.data.tokenized_video_dataset import (
-    _NOCLIP_MODES,
     TokenizedVideoDataset,
-    _load_normalize_bounds,
     get_token_mmap,
     resolve_writable_cache_root,
 )
@@ -27,11 +27,19 @@ class HEDataset(TokenizedVideoDataset):
         cache_root: str | None = None,
         robot_type: str = "g1",
         emit_proprio: bool = False,
-        proprio_stats: dict | None = None,
-        normalize_mode: str = "bounds",
+        stats: dict | None = None,
+        use_percentiles: bool = True,
+        clip_outliers: bool = True,
         episode_indices: list[int] | None = None,
     ):
-        super().__init__(action_chunk_size=action_chunk_size)
+        normalizer: StateNormalizer | None = None
+        if emit_proprio and stats is not None:
+            normalizer = StateNormalizer(
+                KAPPA_MODALITY_CONFIGS, stats,
+                use_percentiles=use_percentiles,
+                clip_outliers=clip_outliers,
+            )
+        super().__init__(action_chunk_size=action_chunk_size, normalizer=normalizer)
         self.data_root = data_root
         # humanoid-everyday is a G1+H1 mix, but the SONIC token pipeline assumes
         # a single embodiment (29D jp with arm starting at index 15 only matches
@@ -50,17 +58,13 @@ class HEDataset(TokenizedVideoDataset):
             )
 
         self._emit_proprio = emit_proprio
-        # ``g1_proprio/`` references the G1 *robot's* joint state (not the
-        # removed G1 expert), so the cache directory keeps its name.
+        # ``g1_proprio/`` references the G1 *robot's* joint state cache; the
+        # name is preserved across the schema swap to ``unitree_g1_sonic``.
         self.proprio_dir = os.path.join(self.cache_root, "g1_proprio")
         if emit_proprio and not os.path.isdir(self.proprio_dir):
             raise FileNotFoundError(
                 f"Missing {self.proprio_dir}; re-run calc_sonic_tokens.py to dump g1_proprio/."
             )
-        self._proprio_bounds = _load_normalize_bounds(
-            proprio_stats, "proprio", self.proprio_dim, normalize_mode,
-        )
-        self._proprio_clip = normalize_mode not in _NOCLIP_MODES
 
         tasks_path = os.path.join(data_root, "meta", "tasks.jsonl")
         task_map: dict[int, str] = {}

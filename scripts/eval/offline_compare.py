@@ -42,13 +42,15 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.eval.run_kappa_server import (  # noqa: E402
-    _LEGACY_DEFAULT_NORM_MODE,
     _detect_proprio_in_ckpt,
     _detect_sonic_dim_from_ckpt,
-    _maybe_load_proprio_bounds,
-    _normalize_proprio,
+    _maybe_load_proprio_normalizer,
     _resolve_ckpt_file,
-    _resolve_proprio_normalize_mode,
+    _resolve_proprio_norm_config,
+)
+from src.data.kappa_modality_configs import (  # noqa: E402
+    G1_SONIC_PROPRIO_DIM,
+    SONIC_STATE_LAYOUT,
 )
 from src.data.video_reader import decode_frame  # noqa: E402
 
@@ -63,7 +65,7 @@ class _Episode:
     ep_idx: int
     task: str
     sonic_tokens: np.ndarray   # (T, sonic_dim) float32, already normalised
-    proprio: np.ndarray | None  # (T, 64) float32, raw (un-normalised)
+    proprio: np.ndarray | None  # (T, 34) float32, raw (un-normalised)
     video_path: str
     n_frames: int
 
@@ -145,7 +147,8 @@ class _OfflinePolicy:
         action_horizon: int,
         num_inference_steps: int,
         use_proprio: bool,
-        proprio_normalize_mode: str | None,
+        proprio_use_percentiles: bool | None,
+        proprio_clip_outliers: bool | None,
         seed: int | None,
     ):
         self.device = torch.device(device)
@@ -181,7 +184,7 @@ class _OfflinePolicy:
             sonic_dim=sonic_dim,
             action_loss_weight=1.0,
             use_proprio=has_proprio_in_ckpt,
-            proprio_dim=64,
+            proprio_dim=G1_SONIC_PROPRIO_DIM,
         )
         result = wrapper.model.load_state_dict(state_dict, strict=False)
         print(
@@ -200,36 +203,39 @@ class _OfflinePolicy:
         self.motion_dim = 64
         self.hand_dim = max(0, sonic_dim - 64)
 
-        # ``bounds_q99_noclip`` keeps the linear extrapolation beyond ±1;
-        # every other mode saturates. Mirror the training-side decision so the
-        # offline replay matches what the model was actually trained on. When
-        # the CLI doesn't pin the mode, fall back to the sidecar bundled by
-        # ``Trainer._bundle_proprio_stats`` next to the checkpoint.
-        from src.data.tokenized_video_dataset import _NOCLIP_MODES
-        resolved_mode, mode_source = _resolve_proprio_normalize_mode(
-            ckpt_file, proprio_normalize_mode,
+        # Resolve (use_percentiles, clip_outliers) from the sidecar bundled
+        # by ``Trainer._bundle_proprio_stats``, then build a ``StateNormalizer``
+        # off the matching ``proprio_stats_sonic.json``. Mirrors what the
+        # deploy server does so offline replay sees the same per-group
+        # dispatch the trained model conditioned on.
+        use_p, clip_o, src = _resolve_proprio_norm_config(
+            ckpt_file, proprio_use_percentiles, proprio_clip_outliers,
         )
-        self.proprio_normalize_mode = resolved_mode
-        self.proprio_clip = resolved_mode not in _NOCLIP_MODES
+        self.proprio_use_percentiles = use_p
+        self.proprio_clip_outliers = clip_o
         print(
-            f"[offline] proprio_normalize_mode={resolved_mode} "
-            f"(source={mode_source}, clip={self.proprio_clip})"
+            f"[offline] proprio norm: use_percentiles={use_p}, "
+            f"clip_outliers={clip_o} (source={src})"
         )
-        if mode_source == "legacy-default" and self.use_proprio:
+        if src == "default" and self.use_proprio:
             print(
-                "[offline] WARNING: no --proprio-normalize-mode override and "
-                "ckpt has no proprio_norm_mode.txt sidecar; defaulting to "
-                f"'{_LEGACY_DEFAULT_NORM_MODE}'."
+                "[offline] WARNING: no proprio_norm_config.json (or legacy "
+                "proprio_norm_mode.txt) sidecar found next to the checkpoint; "
+                "defaulting to GR00T N1.7 (True, True)."
             )
-        self.proprio_bounds = (
-            _maybe_load_proprio_bounds(ckpt_file, 64, resolved_mode)
-            if self.use_proprio else None
-        )
-        if self.use_proprio and self.proprio_bounds is None:
+        if self.use_proprio:
+            self._normalizer, stats_fname = _maybe_load_proprio_normalizer(
+                ckpt_file, use_p, clip_o,
+            )
+        else:
+            self._normalizer, stats_fname = None, None
+        if self.use_proprio and self._normalizer is None:
             print(
-                "[offline] WARNING: proprio in ckpt but no proprio_stats.json found "
-                "next to model.safetensors — proprio passed raw."
+                "[offline] WARNING: proprio in ckpt but no proprio_stats_sonic.json "
+                "found next to model.safetensors — proprio passed raw."
             )
+        elif stats_fname is not None:
+            print(f"[offline] loaded proprio stats from {stats_fname}")
 
     def _build_vlm_inputs(self, image_np: np.ndarray, prompt: str) -> dict[str, torch.Tensor]:
         from PIL import Image
@@ -281,9 +287,14 @@ class _OfflinePolicy:
 
         proprio_t: torch.Tensor | None = None
         if T_p > 0:
-            proprio_norm = _normalize_proprio(
-                proprio_raw, self.proprio_bounds, clip=self.proprio_clip,
-            )
+            if self._normalizer is not None:
+                proprio_norm = self._normalizer.normalize_flat(
+                    np.asarray(proprio_raw, dtype=np.float32),
+                    "unitree_g1_sonic",
+                    SONIC_STATE_LAYOUT,
+                )
+            else:
+                proprio_norm = np.asarray(proprio_raw, dtype=np.float32)
             proprio_t = torch.from_numpy(
                 np.asarray(proprio_norm, dtype=np.float32).reshape(1, -1)
             ).to(self.device, dtype=torch.bfloat16)
@@ -508,13 +519,16 @@ class OfflineConfig:
     use_proprio: bool = True
     """If False, skip proprio even when the checkpoint was trained with it."""
 
-    proprio_normalize_mode: str | None = None
-    """Match training: ``bounds`` (min/max), ``bounds_q99`` (q01/q99 + clip
-    to ±1), or ``bounds_q99_noclip`` (q01/q99, linear extrapolation beyond
-    ±1 — preserves tail magnitude for samples outside the envelope). When
-    unset (default), reads ``proprio_norm_mode.txt`` next to the checkpoint;
-    Trainer bundles that sidecar so offline replay auto-picks the training
-    value without needing the flag."""
+    proprio_use_percentiles: bool | None = None
+    """Override ``use_percentiles`` (q01/q99 vs min/max) for the offline
+    proprio normalizer. When unset (default), reads
+    ``proprio_norm_config.json`` next to the checkpoint (or the legacy
+    ``proprio_norm_mode.txt`` for pre-sonic ckpts); GR00T N1.7 default is
+    ``True``."""
+
+    proprio_clip_outliers: bool | None = None
+    """Override ``clip_outliers`` (saturate the post-rescale output to
+    ``[-1, +1]``) for the offline proprio normalizer. Default ``True``."""
 
     device: str = "cuda:0"
 
@@ -549,7 +563,8 @@ def _eval_one_ckpt(
         action_horizon=cfg.action_horizon,
         num_inference_steps=cfg.num_inference_steps,
         use_proprio=cfg.use_proprio,
-        proprio_normalize_mode=cfg.proprio_normalize_mode,
+        proprio_use_percentiles=cfg.proprio_use_percentiles,
+        proprio_clip_outliers=cfg.proprio_clip_outliers,
         seed=cfg.seed,
     )
 

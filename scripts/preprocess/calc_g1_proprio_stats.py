@@ -1,17 +1,18 @@
-"""Compute per-group min/max + q01/q99 stats for HE + WBT G1 proprio.
+"""Compute per-group sonic proprio stats for HE + WBT G1 episodes.
 
-Mirrors ``scripts/preprocess/proprietary/calc_proprio_stats.py``: scans every
-``g1_proprio/**/episode_*.npy`` under the HE and WBT cache roots, splits the
-64-D vector into the 13 named body-part groups defined in
-``src.data.proprio_layout``, and writes a grouped-schema JSON.
+Reads every ``g1_proprio/**/episode_*.npy`` under the HE and WBT cache roots
+(each a ``(T, 34)`` float32 array in the canonical
+``src.data.kappa_modality_configs.SONIC_STATE_LAYOUT`` order), splits by
+group, and writes a nested-schema JSON matching Isaac-GR00T's
+``{embodiment_tag: {modality: {joint_group: {stat_key: list}}}}`` shape.
 
-Two outputs are produced so the dataset-side loader (``HEDataset`` /
-``WBTDataset``) can read the same combined stats it has historically used:
+Stats emitted per group: ``min / max / mean / std / q01 / q99`` —
+``StateNormalizer`` only reads min/max + q01/q99 in the current sonic
+config; mean/std are written so an enable-the-keys flip in
+``UNITREE_G1_SONIC_STATE`` is a no-op data-side.
 
-  * ``<wbt-cache-root>/meta/g1_proprio_stats.json`` (default), which is what
-    ``posttrain_he_wbt_kappa_config`` points at for the combined HE+WBT stats.
-
-Override the output via ``--out`` if you only want HE-only or WBT-only stats.
+Default output: ``<wbt-cache-root>/meta/g1_proprio_stats_sonic.json``,
+which is what ``posttrain_he_wbt_kappa_config`` points at.
 
 Example::
 
@@ -35,10 +36,21 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.data.proprio_layout import (  # noqa: E402
-    G1_PROPRIO_DIM,
-    PROPRIO_GROUPS,
+from src.data.kappa_modality_configs import (  # noqa: E402
+    G1_SONIC_PROPRIO_DIM,
+    SONIC_STATE_LAYOUT,
 )
+
+SONIC_EMBODIMENT_TAG = "unitree_g1_sonic"
+STAT_KEYS: tuple[str, ...] = ("min", "max", "mean", "std", "q01", "q99")
+
+# Documented per-dataset source of the 1-D hand open/close bit that lands in
+# the sonic proprio's left_hand/right_hand slots. Written into ``_meta`` so
+# stats files are self-describing.
+HAND_BINARY_SOURCES: dict[str, str] = {
+    "HE": "binarize_hands(observation.hand_joints)",
+    "WBT": "compute_hand_bits(hand_state, hand_type)",
+}
 
 
 def _iter_proprio_files(root: str) -> List[str]:
@@ -46,6 +58,38 @@ def _iter_proprio_files(root: str) -> List[str]:
         return []
     pattern = os.path.join(root, "**", "episode_*.npy")
     return sorted(glob.glob(pattern, recursive=True))
+
+
+def _per_group_stats(flat: np.ndarray) -> dict[str, dict[str, list[float]]]:
+    """Slice ``flat`` by ``SONIC_STATE_LAYOUT`` and compute the six stats."""
+    out: dict[str, dict[str, list[float]]] = {}
+    print(
+        f"\n{'group':22s}{'dim':>4s}  "
+        f"{'min':>10s} {'max':>10s} {'mean':>10s} {'std':>10s} "
+        f"{'q01':>10s} {'q99':>10s}"
+    )
+    for name, start, end in SONIC_STATE_LAYOUT:
+        sub = flat[:, start:end]
+        qvals = np.quantile(sub, (0.01, 0.99), axis=0)
+        mn = sub.min(axis=0)
+        mx = sub.max(axis=0)
+        mean = sub.mean(axis=0)
+        std = sub.std(axis=0)
+        out[name] = {
+            "min": mn.astype(np.float64).tolist(),
+            "max": mx.astype(np.float64).tolist(),
+            "mean": mean.astype(np.float64).tolist(),
+            "std": std.astype(np.float64).tolist(),
+            "q01": qvals[0].astype(np.float64).tolist(),
+            "q99": qvals[1].astype(np.float64).tolist(),
+        }
+        print(
+            f"{name:22s}{end - start:>4d}  "
+            f"{float(mn.min()):>10.3f} {float(mx.max()):>10.3f} "
+            f"{float(mean.mean()):>10.3f} {float(std.mean()):>10.3f} "
+            f"{float(qvals[0].min()):>10.3f} {float(qvals[1].max()):>10.3f}"
+        )
+    return out
 
 
 def main() -> None:
@@ -68,7 +112,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out", default=None,
-        help="Defaults to <wbt-cache-root>/meta/g1_proprio_stats.json",
+        help="Defaults to <wbt-cache-root>/meta/g1_proprio_stats_sonic.json",
     )
     args = parser.parse_args()
 
@@ -88,8 +132,11 @@ def main() -> None:
             except Exception as e:
                 print(f"[!] skip {path}: {e}")
                 continue
-            if arr.ndim != 2 or arr.shape[1] != G1_PROPRIO_DIM:
-                print(f"[!] skip {path}: shape {arr.shape}, expected (T, {G1_PROPRIO_DIM})")
+            if arr.ndim != 2 or arr.shape[1] != G1_SONIC_PROPRIO_DIM:
+                print(
+                    f"[!] skip {path}: shape {arr.shape}, "
+                    f"expected (T, {G1_SONIC_PROPRIO_DIM})"
+                )
                 continue
             bufs.append(np.asarray(arr, dtype=np.float32))
             n_ep += 1
@@ -104,31 +151,17 @@ def main() -> None:
     flat = np.concatenate(bufs, axis=0)
     n_episodes = sum(ne for ne, _ in counts.values())
     n_frames = int(flat.shape[0])
-    print(f"\nStacked {n_episodes} episodes -> {n_frames} rows x {G1_PROPRIO_DIM} dims")
+    print(
+        f"\nStacked {n_episodes} episodes -> {n_frames} rows x "
+        f"{G1_SONIC_PROPRIO_DIM} dims"
+    )
     for tag, (ne, nf) in counts.items():
         print(f"  {tag:5s}: {ne:5d} ep / {nf:9d} fr")
 
-    groups_out: dict[str, dict[str, list[float]]] = {}
-    print(f"\n{'group':22s}{'dim':>4s}  {'min':>10s} {'max':>10s} {'q01':>10s} {'q99':>10s}")
-    for name, start, end in PROPRIO_GROUPS:
-        sub = flat[:, start:end]
-        qvals = np.quantile(sub, (0.01, 0.99), axis=0)
-        mn = sub.min(axis=0)
-        mx = sub.max(axis=0)
-        groups_out[name] = {
-            "min": mn.astype(np.float64).tolist(),
-            "max": mx.astype(np.float64).tolist(),
-            "q01": qvals[0].astype(np.float64).tolist(),
-            "q99": qvals[1].astype(np.float64).tolist(),
-        }
-        print(
-            f"{name:22s}{end - start:>4d}  "
-            f"{float(mn.min()):>10.3f} {float(mx.max()):>10.3f} "
-            f"{float(qvals[0].min()):>10.3f} {float(qvals[1].max()):>10.3f}"
-        )
+    groups_out = _per_group_stats(flat)
 
     payload = {
-        "proprio": groups_out,
+        SONIC_EMBODIMENT_TAG: {"state": groups_out},
         "_meta": {
             "he_cache_root": args.he_cache_root,
             "wbt_source_root": args.wbt_source_root,
@@ -138,20 +171,24 @@ def main() -> None:
             },
             "n_episodes": n_episodes,
             "n_frames": n_frames,
-            "layout": "13-group v1",
-            "g1_proprio_dim": G1_PROPRIO_DIM,
+            "layout": "unitree_g1_sonic v1",
+            "g1_proprio_dim": G1_SONIC_PROPRIO_DIM,
+            "stats_schema": {"keys": list(STAT_KEYS)},
+            "hand_binary_source": HAND_BINARY_SOURCES,
         },
     }
 
     out_path = args.out
     if out_path is None:
-        out_path = os.path.join(args.wbt_cache_root, "meta", "g1_proprio_stats.json")
+        out_path = os.path.join(
+            args.wbt_cache_root, "meta", "g1_proprio_stats_sonic.json"
+        )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp = f"{out_path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, out_path)
-    print(f"\nWrote G1 proprio stats -> {out_path}")
+    print(f"\nWrote G1 sonic proprio stats -> {out_path}")
 
 
 if __name__ == "__main__":

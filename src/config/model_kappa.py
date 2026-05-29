@@ -35,12 +35,10 @@ class KappaModelConfig(ModelConfig):
 
     num_inference_steps: int = 4
 
-    # Optional 64-D robot proprio prefix (kept after G1 expert removal so the
-    # SONIC head can still condition on the current joint state).
+    # Optional 34-D ``unitree_g1_sonic`` robot proprio prefix (layout matches
+    # Isaac-GR00T's embodiment of the same name). Normalization happens inside
+    # the dataset via ``StateNormalizer``; no train-time noise/drop is applied
+    # (GR00T parity).
     use_proprio: bool = False
-    proprio_dim: int = 64
-    proprio_noise_std: float = 0.02
-    # Non-zero default drop avoids the SONIC head collapsing onto proprio and
-    # ignoring the visual conditioning when proprio is enabled.
-    proprio_drop_prob: float = 0.1
+    proprio_dim: int = 34
     proprio_stats_path: str | None = None

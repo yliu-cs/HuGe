@@ -20,6 +20,7 @@ outputs
 resource
 figure
 test
+tests
 Psi0
 humanoid everyday
 FastWAM
@@ -39,3 +40,4 @@ tmp
 G1 deploy doc.pdf
 tools
 upload.sh
+*watch*

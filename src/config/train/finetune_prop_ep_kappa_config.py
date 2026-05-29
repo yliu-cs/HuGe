@@ -65,22 +65,15 @@ _DEFAULT_DATA_ROOT = "resource/dataset/proprietary/real/2026-05-23"
 # range, so deploy poses stop landing OOD vs the model's conditioning --
 # WBT-only would clip squat signals, PROP-only would clip manipulation.
 #
-# File lives under the PROP dump's ``meta/`` (not ``G1_WBT-cache/``) because
-# these stats are a Stage 3 asset: Stage 2 (HE+WBT post-train) still uses
-# ``resource/dataset/G1_WBT-cache/meta/g1_proprio_stats.json``. The
-# Stage 2 -> Stage 3 normalization-space mismatch is covariate shift the
-# embedder re-calibrates over the 5k fine-tune steps; we accept it because
-# "deploy must squat" is a hard requirement and the alternative
-# (Stage 2 re-run with union stats) costs an extra post-train.
-#
-# The 13-group schema matches ``_load_normalize_bounds`` and
-# ``Trainer._bundle_proprio_stats`` copies the file into each ckpt_<step>/
-# for deploy / sim / eval auto-discovery. The stats path stays decoupled
+# The ``_sonic`` suffix marks the nested ``{"unitree_g1_sonic": {"state":
+# ...}}`` schema (replaces the legacy flat 13-group JSON). The file is
+# copied into each ckpt_<step>/ by ``Trainer._bundle_proprio_stats`` so
+# deploy / sim / eval auto-discover it. The stats path stays decoupled
 # from ``--data.data-roots`` so swapping roots does NOT silently change the
 # normalization space; override via ``--data.proprio-stats-path`` only when
 # explicitly A/B-ing a different stats file.
 _DEFAULT_PROPRIO_STATS = (
-    "resource/dataset/proprietary/real/2026-05-23/meta/proprio_stats_union.json"
+    "resource/dataset/proprietary/real/2026-05-23/meta/proprio_stats_union_sonic.json"
 )
 
 
@@ -97,7 +90,8 @@ class FineTunePropDataConfig(PropDataConfig):
     transform: FineTunePropDataTransform = Field(default_factory=FineTunePropDataTransform)
     emit_proprio: bool = True
     proprio_stats_path: str = _DEFAULT_PROPRIO_STATS
-    normalize_mode: str = "bounds_q99"
+    use_percentiles: bool = True
+    clip_outliers: bool = True
     # Default to the most recent real dump so ``./scripts/train/run_kappa.sh``
     # (which forwards args to every stage and can't set per-stage data
     # overrides) lands on a sane post-train -> fine-tune chain. The stats

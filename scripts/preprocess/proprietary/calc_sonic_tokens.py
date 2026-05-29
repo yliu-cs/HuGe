@@ -1,44 +1,36 @@
-"""Materialize SONIC tokens + 64-D proprio for proprietary LeRobot v2.1 dumps.
+"""Materialize SONIC tokens + 34-D ``unitree_g1_sonic`` proprio for
+proprietary LeRobot v2.1 dumps.
 
 The proprietary parquets ship a 64-D ``action.motion_token`` column
 (``planner_sonic.onnx`` output) so we never re-encode anything — the script
-just concatenates 2-D hand bits, builds the 64-D proprio block, and writes
-the two caches downstream PropDataset/PropEpisodeSource consume.
+just concatenates 2-D hand bits onto the SONIC token target and assembles
+the GR00T-aligned 34-D proprio block that PropDataset / Kappa consume.
 
-Real proprietary dumps also ship per-frame open/close labels under
+Real proprietary dumps ship per-frame open/close labels under
 ``action.hand_binary`` (token target, leads observation by ~1 frame) and
-``observation.hand_binary_state`` (proprio reading). Real Dex3 telemetry
-lives in these dedicated columns — ``observation.state[22:29]`` /
-``[36:43]`` are reserved fake-finger placeholders. Sim dumps lack both
-columns and fall back to zero hand_bits.
+``observation.hand_binary_state`` (proprio reading). When the latter is
+missing (real/2026-05-16, simple/2026-05-21) the proprio hand bits are
+derived from the dex3 joint placeholders via ``binarize_hands``.
 
-Supports every dump under ``resource/dataset/proprietary``:
+Variant detection from ``meta/info.json``:
 
-* ``real/2026-05-16``  — 50 Hz, fake fingers (zero hand_bits), real-layout state.
-* ``real/2026-05-23``  — 50 Hz, **real** hand_binary columns honored
-  (obs bits → proprio, action bits → SONIC token target).
-* ``simple/2026-05-21`` — 30 Hz native, sim-layout state (Larm→Rarm→hands),
-  resampled to 50 Hz so the cache matches the post-train timeline.
+* ``fps`` -> source sampling rate (resample to ``--target-fps`` if different).
+* ``observation.state.names`` -> joint ordering. Both layouts share
+  ``[legs(12) | waist(3) | left_arm(7)]`` at the front; the real layout
+  interleaves the 7-DoF left-hand block before ``right_arm`` (lhand@22,
+  rhand@36), the sim layout packs both arms first (lhand@29, rhand@36).
 
-Variant detection is by inspecting ``meta/info.json``:
+Proprio 34-D layout (``unitree_g1_sonic``, matches Isaac-GR00T's embodiment
+of the same name)::
 
-* ``fps`` → source sampling rate (resample to ``--target-fps`` if different).
-* ``observation.state.names`` → joint ordering (Larm always starts at 15;
-  Rarm starts at 22 for sim, 29 for real because real interleaves hand
-  joints between arms).
-* presence of ``action.hand_binary`` / ``observation.hand_binary_state`` in
-  ``features`` → use real hand bits, else zeros.
+    [left_leg(6) | right_leg(6) | waist(3) | left_arm(7) | right_arm(7) |
+     left_hand(1) | right_hand(1) | projected_gravity(3)]
 
-Proprio is assembled into the same 64-D layout HE/WBT use so the existing
-G1_WBT proprio stats apply directly:
-
-
-  [jp(29) | hand_bits(2) | jv(29) | pelvis_quat_xyzw(4)] = 64.
-
-Output (cache_root defaults to ``<data-root>`` if writable, else ``<data-root>-cache``):
+Output (cache_root defaults to ``<data-root>`` if writable, else
+``<data-root>-cache``)::
 
   <cache_root>/sonic_tokens/episode_<NNNNNN>.npy   # (T_target, 66) float32
-  <cache_root>/g1_proprio/episode_<NNNNNN>.npy     # (T_target, 64) float32
+  <cache_root>/g1_proprio/episode_<NNNNNN>.npy     # (T_target, 34) float32
 """
 from __future__ import annotations
 
@@ -51,10 +43,7 @@ import traceback
 os.environ.setdefault("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
 
 
-STATE_LEG_WAIST_END = 15           # state[0:15] -> jp[0:15] (legs + waist, fixed)
-# Per-variant arm slices are resolved at runtime from observation.state.names
-# because the real layout interleaves the 7-DoF hand block between Larm/Rarm
-# while the sim layout packs both arms first.
+STATE_LEG_WAIST_END = 15           # state[0:15] -> legs(12) + waist(3) (fixed)
 
 
 def discover_episodes(data_root: str) -> list[tuple[int, str]]:
@@ -78,7 +67,10 @@ def _detect_variant(data_root: str) -> dict:
     Returns a dict with:
       * ``src_fps``: float source sampling rate.
       * ``larm_start``, ``rarm_start``: int indices into observation.state.
+      * ``lhand_start``, ``rhand_start``: int indices for the dex3 hand
+        placeholders (real: lhand@22 rhand@36; sim: lhand@29 rhand@36).
       * ``has_hand_binary_action``, ``has_hand_binary_state``: bool.
+      * ``has_projected_gravity``: bool.
     """
     info_path = os.path.join(data_root, "meta", "info.json")
     with open(info_path) as fh:
@@ -97,29 +89,43 @@ def _detect_variant(data_root: str) -> dict:
             f"is this a proprietary G1 dump?"
         ) from e
     if larm_start != STATE_LEG_WAIST_END:
-        # Both real (15) and sim (15) layouts share the legs+waist block at
-        # the front; bail loudly if a future dump diverges so we don't silently
-        # drop joints.
         raise ValueError(
             f"{info_path}: left_shoulder_pitch_joint at index {larm_start}, "
             f"expected {STATE_LEG_WAIST_END}. New layout — update this script."
         )
+
+    def _first_joint(prefix: str) -> int:
+        for idx, name in enumerate(state_names):
+            if name.startswith(prefix):
+                return idx
+        raise ValueError(
+            f"{info_path}: no {prefix}* joint found in observation.state.names"
+        )
+
+    lhand_start = _first_joint("left_hand_")
+    rhand_start = _first_joint("right_hand_")
+
     return {
         "src_fps": float(info.get("fps") or 50.0),
         "larm_start": int(larm_start),
         "rarm_start": int(rarm_start),
+        "lhand_start": int(lhand_start),
+        "rhand_start": int(rhand_start),
         "has_hand_binary_action": "action.hand_binary" in feats,
         "has_hand_binary_state": "observation.hand_binary_state" in feats,
+        "has_projected_gravity": "observation.projected_gravity" in feats,
     }
 
 
 def load_episode_arrays(parquet_path: str, variant: dict):
-    """Read parquet -> (motion_64, jp_29, root_quat_wxyz_4, obs_bits|None, act_bits|None).
+    """Read parquet -> (motion_64, state_43, pg_3, obs_bits|None, act_bits|None).
 
     ``action.hand_binary`` is the SONIC token target (leads observation by
     ~1 frame); ``observation.hand_binary_state`` is the proprio reading.
-    Both columns are read only when present in ``features``; missing
-    columns return ``None`` and downstream falls back to zeros.
+    ``observation.projected_gravity`` is required for the sonic proprio's
+    last 3 dims — every proprietary dump under
+    ``resource/dataset/proprietary`` has it (verified against
+    real/2026-05-16, real/2026-05-23, simple/2026-05-21).
     """
     import numpy as np
     import polars as pl
@@ -127,17 +133,22 @@ def load_episode_arrays(parquet_path: str, variant: dict):
     cols = [
         "action.motion_token",
         "observation.state",
-        "observation.root_orientation",
+        "observation.projected_gravity",
     ]
     if variant["has_hand_binary_state"]:
         cols.append("observation.hand_binary_state")
     if variant["has_hand_binary_action"]:
         cols.append("action.hand_binary")
+    if not variant["has_projected_gravity"]:
+        raise ValueError(
+            f"{parquet_path}: missing observation.projected_gravity column "
+            f"(required for the 34-D sonic proprio layout)."
+        )
 
     df = pl.read_parquet(parquet_path, columns=cols)
     motion = np.asarray(df["action.motion_token"].to_list(), dtype=np.float32)
     state = np.asarray(df["observation.state"].to_list(), dtype=np.float64)
-    rq = np.asarray(df["observation.root_orientation"].to_list(), dtype=np.float32)
+    pg = np.asarray(df["observation.projected_gravity"].to_list(), dtype=np.float32)
 
     n = state.shape[0]
     if motion.shape != (n, 64):
@@ -145,13 +156,10 @@ def load_episode_arrays(parquet_path: str, variant: dict):
             f"{parquet_path}: motion_token shape {motion.shape} != ({n}, 64); "
             f"this script assumes action.motion_token is the 64-D SONIC latent."
         )
-
-    larm_start = variant["larm_start"]
-    rarm_start = variant["rarm_start"]
-    jp = np.empty((n, 29), dtype=np.float64)
-    jp[:, :STATE_LEG_WAIST_END] = state[:, :STATE_LEG_WAIST_END]
-    jp[:, 15:22] = state[:, larm_start:larm_start + 7]
-    jp[:, 22:29] = state[:, rarm_start:rarm_start + 7]
+    if pg.shape != (n, 3):
+        raise ValueError(
+            f"{parquet_path}: projected_gravity shape {pg.shape} != ({n}, 3)."
+        )
 
     obs_bits = None
     if variant["has_hand_binary_state"]:
@@ -173,46 +181,40 @@ def load_episode_arrays(parquet_path: str, variant: dict):
                 f"{parquet_path}: action.hand_binary shape {act_bits.shape} "
                 f"!= ({n}, 2)."
             )
-    return motion, jp, rq, obs_bits, act_bits
+    return motion, state, pg, obs_bits, act_bits
 
 
 def _resample_to_target_fps(
     motion: "np.ndarray",
-    jp: "np.ndarray",
-    rq_wxyz: "np.ndarray",
+    state: "np.ndarray",
+    pg: "np.ndarray",
     obs_bits: "np.ndarray | None",
     act_bits: "np.ndarray | None",
     src_fps: float,
     target_fps: float,
 ):
-    """Linear-resample tokens/jp, SLERP root quat, nearest hand bits.
+    """Linear-resample tokens / state / projected_gravity, nearest hand bits.
 
-    Returns ``(motion_r, jp_r, rq_r_wxyz, obs_bits_r|None, act_bits_r|None, target_n)``.
-    The source timeline is ``[0, (T_src-1)/src_fps]``; the target timeline
-    is sampled at ``1/target_fps`` from the same origin, so frame 0 always
-    maps to frame 0 and the deployment-side ``t=k/target_fps`` lookup is
-    valid.
+    Returns ``(motion_r, state_r, pg_r, obs_bits_r|None, act_bits_r|None, n_tgt)``.
+    The source timeline is ``[0, (T_src-1)/src_fps]``; the target is sampled
+    at ``1/target_fps`` from the same origin, so frame 0 maps to frame 0.
     """
     import numpy as np
-    from scipy.spatial.transform import Rotation, Slerp
 
     n_src = motion.shape[0]
     if n_src < 2:
-        # 1-frame episode: nothing to interpolate.
         n_tgt = max(int(round(n_src * target_fps / src_fps)), 1)
         motion_r = np.repeat(motion, n_tgt, axis=0)
-        jp_r = np.repeat(jp, n_tgt, axis=0)
-        rq_r = np.repeat(rq_wxyz, n_tgt, axis=0)
+        state_r = np.repeat(state, n_tgt, axis=0)
+        pg_r = np.repeat(pg, n_tgt, axis=0)
         obs_r = None if obs_bits is None else np.repeat(obs_bits, n_tgt, axis=0)
         act_r = None if act_bits is None else np.repeat(act_bits, n_tgt, axis=0)
-        return motion_r, jp_r, rq_r, obs_r, act_r, n_tgt
+        return motion_r, state_r, pg_r, obs_r, act_r, n_tgt
 
     duration = (n_src - 1) / src_fps
     n_tgt = int(round(duration * target_fps)) + 1
     t_src = np.arange(n_src, dtype=np.float64) / src_fps
     t_tgt = np.arange(n_tgt, dtype=np.float64) / target_fps
-    # Clamp the tail to t_src[-1] so SciPy's Slerp/np.interp stay in-domain
-    # when float rounding pushes t_tgt[-1] a hair past duration.
     t_tgt = np.clip(t_tgt, 0.0, t_src[-1])
 
     def _interp_cols(arr: "np.ndarray") -> "np.ndarray":
@@ -222,19 +224,13 @@ def _resample_to_target_fps(
         return out
 
     motion_r = _interp_cols(motion)
-    jp_r = _interp_cols(jp)
-
-    # SciPy quats are XYZW; convert to/from WXYZ to keep the contract identical
-    # to the existing 2026-05-16 cache.
-    quat_xyzw_src = rq_wxyz[:, [1, 2, 3, 0]].astype(np.float64, copy=False)
-    slerp = Slerp(t_src, Rotation.from_quat(quat_xyzw_src))
-    quat_xyzw_tgt = slerp(t_tgt).as_quat().astype(rq_wxyz.dtype, copy=False)
-    rq_r = quat_xyzw_tgt[:, [3, 0, 1, 2]]
+    state_r = _interp_cols(state)
+    pg_r = _interp_cols(pg)
 
     nn = np.clip(np.round(t_tgt * src_fps).astype(np.int64), 0, n_src - 1)
     obs_r = None if obs_bits is None else obs_bits[nn]
     act_r = None if act_bits is None else act_bits[nn]
-    return motion_r, jp_r, rq_r, obs_r, act_r, n_tgt
+    return motion_r, state_r, pg_r, obs_r, act_r, n_tgt
 
 
 # atomic .npy write reused from the HE/WBT pipeline so an interrupted run
@@ -247,12 +243,7 @@ def _dump_sonic_tokens(
     action_hand_bits: "np.ndarray | None",
     path: str,
 ) -> None:
-    """Concat the 2-D ``action.hand_binary`` target onto the 64-D motion token.
-
-    ``action_hand_bits`` is the real ``action.hand_binary`` array when the
-    parquet has the column; otherwise we fall back to zeros (matches the
-    2026-05-16 / sim fake-fingers contract).
-    """
+    """Concat the 2-D ``action.hand_binary`` target onto the 64-D motion token."""
     import numpy as np
 
     n = motion.shape[0]
@@ -269,36 +260,64 @@ def _dump_sonic_tokens(
 
 
 def _dump_proprio(
-    jp: "np.ndarray",
-    oq_wxyz: "np.ndarray",
+    state: "np.ndarray",
+    pg: "np.ndarray",
+    variant: dict,
     obs_hand_bits: "np.ndarray | None",
-    target_fps: float,
+    hand_thresholds: dict,
     proprio_path: str,
 ) -> None:
-    """Dump 64-D proprio ``[jp | hand_bits | jv | quat_xyzw]`` matching HE/WBT.
+    """Dump 34-D ``unitree_g1_sonic`` proprio.
 
-    ``obs_hand_bits`` is the real ``observation.hand_binary_state`` array
-    when the parquet has the column (2026-05-23 honors it); otherwise
-    hand_bits is zeroed to match HE/WBT/2026-05-16/sim semantics.
+    Layout: ``[left_leg(6) | right_leg(6) | waist(3) | left_arm(7) |
+    right_arm(7) | left_hand(1) | right_hand(1) | projected_gravity(3)]``.
+
+    When ``obs_hand_bits`` is None (2026-05-16 / sim) the per-side 1-D bit
+    is derived from the dex3 joints via ``binarize_hands``.
     """
     import numpy as np
-    from src.tokenizer.sonic_encoder import _quat_wxyz_to_xyzw
+    from src.tokenizer.sonic_encoder import binarize_hands
 
-    jp32 = jp.astype(np.float32, copy=False)
-    n = jp32.shape[0]
+    state32 = state.astype(np.float32, copy=False)
+    pg32 = pg.astype(np.float32, copy=False)
+    n = state32.shape[0]
+
     if obs_hand_bits is None:
-        bits = np.zeros((n, 2), dtype=np.float32)
+        # binarize_hands expects a (n, >=14) array with left dex3 at [4:11] and
+        # right dex3 at [11:18]. Stack the two 7-D slices to satisfy that
+        # contract — the leading 4 cols are unused by binarize_hands so we
+        # zero-pad them.
+        lhand_start = variant["lhand_start"]
+        rhand_start = variant["rhand_start"]
+        left_dex = state32[:, lhand_start:lhand_start + 7]
+        right_dex = state32[:, rhand_start:rhand_start + 7]
+        pad = np.zeros((n, 4), dtype=np.float32)
+        stacked = np.concatenate([pad, left_dex, right_dex], axis=-1)
+        bits = binarize_hands(stacked, hand_thresholds).astype(np.float32, copy=False)
     else:
         bits = obs_hand_bits.astype(np.float32, copy=False)
-        if bits.shape != (n, 2):
-            raise ValueError(
-                f"obs_hand_bits shape {bits.shape} != ({n}, 2) at {proprio_path}"
-            )
-    jv = np.zeros_like(jp32)
-    if n > 1:
-        jv[1:] = (jp32[1:] - jp32[:-1]) * float(target_fps)
-    quat_xyzw = _quat_wxyz_to_xyzw(oq_wxyz.astype(np.float32, copy=False)).astype(np.float32)
-    proprio = np.concatenate([jp32, bits, jv, quat_xyzw], axis=-1).astype(np.float32)
+    if bits.shape != (n, 2):
+        raise ValueError(
+            f"hand bits shape {bits.shape} != ({n}, 2) at {proprio_path}"
+        )
+
+    larm = variant["larm_start"]
+    rarm = variant["rarm_start"]
+    parts = [
+        state32[:, 0:6],                    # left_leg
+        state32[:, 6:12],                   # right_leg
+        state32[:, 12:15],                  # waist
+        state32[:, larm:larm + 7],          # left_arm
+        state32[:, rarm:rarm + 7],          # right_arm
+        bits[:, 0:1],                       # left_hand
+        bits[:, 1:2],                       # right_hand
+        pg32[:, 0:3],                       # projected_gravity
+    ]
+    proprio = np.concatenate(parts, axis=-1).astype(np.float32)
+    if proprio.shape[1] != 34:
+        raise ValueError(
+            f"assembled proprio shape {proprio.shape} != (*, 34) at {proprio_path}"
+        )
     atomic_save_npy(proprio, proprio_path)
 
 
@@ -307,8 +326,10 @@ def _process_root(
     cache_root_override: str | None,
     target_fps: float,
     log_failures: str | None,
+    hand_threshold_path: str,
 ) -> None:
     from tqdm import tqdm
+    from src.tokenizer.sonic_encoder import load_hand_thresholds
 
     cache_root = cache_root_override
     if cache_root is None:
@@ -325,9 +346,18 @@ def _process_root(
     print(
         f"[{data_root}] src_fps={src_fps} target_fps={target_fps} "
         f"layout={layout_label} "
-        f"hand_binary={'real' if variant['has_hand_binary_action'] else 'zero'} "
+        f"hand_binary_state={'real' if variant['has_hand_binary_state'] else 'derive-dex3'} "
+        f"hand_binary_action={'real' if variant['has_hand_binary_action'] else 'zero'} "
         f"resample={'yes' if needs_resample else 'no'}"
     )
+
+    if not os.path.exists(hand_threshold_path):
+        raise FileNotFoundError(
+            f"hand_threshold.json not found at {hand_threshold_path}. "
+            f"Pass --hand-threshold-path or run "
+            f"scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py first."
+        )
+    hand_thresholds = load_hand_thresholds(hand_threshold_path)
 
     out_dir = os.path.join(cache_root, "sonic_tokens")
     proprio_dir = os.path.join(cache_root, "g1_proprio")
@@ -356,10 +386,10 @@ def _process_root(
     errs: list[tuple[int, str]] = []
     for ep_idx, parquet_path, need_sonic, need_proprio in tqdm(pending, unit="ep"):
         try:
-            motion, jp, oq, obs_bits, act_bits = load_episode_arrays(parquet_path, variant)
+            motion, state, pg, obs_bits, act_bits = load_episode_arrays(parquet_path, variant)
             if needs_resample:
-                motion, jp, oq, obs_bits, act_bits, _ = _resample_to_target_fps(
-                    motion, jp, oq, obs_bits, act_bits, src_fps, target_fps,
+                motion, state, pg, obs_bits, act_bits, _ = _resample_to_target_fps(
+                    motion, state, pg, obs_bits, act_bits, src_fps, target_fps,
                 )
             if need_sonic:
                 _dump_sonic_tokens(
@@ -368,7 +398,7 @@ def _process_root(
                 )
             if need_proprio:
                 _dump_proprio(
-                    jp, oq, obs_bits, float(target_fps),
+                    state, pg, variant, obs_bits, hand_thresholds,
                     os.path.join(proprio_dir, f"episode_{ep_idx:06d}.npy"),
                 )
             ok += 1
@@ -411,6 +441,13 @@ def main() -> None:
     )
     parser.add_argument("--target-fps", type=float, default=50.0)
     parser.add_argument("--log-failures", default=None)
+    parser.add_argument(
+        "--hand-threshold-path",
+        default="resource/dataset/humanoid-everyday-cache/meta/hand_threshold.json",
+        help="hand_threshold.json from scripts/preprocess/humanoid-everyday/calc_hand_thresholds.py. "
+             "Reused across proprietary roots since dex3 joint geometry is shared on G1. "
+             "Only consulted on variants without observation.hand_binary_state (2026-05-16, simple/2026-05-21).",
+    )
     args = parser.parse_args()
 
     if args.data_roots:
@@ -430,7 +467,10 @@ def main() -> None:
         cache_overrides = [args.cache_root]
 
     for root, cache_override in zip(roots, cache_overrides):
-        _process_root(root, cache_override, args.target_fps, args.log_failures)
+        _process_root(
+            root, cache_override, args.target_fps, args.log_failures,
+            args.hand_threshold_path,
+        )
 
 
 if __name__ == "__main__":

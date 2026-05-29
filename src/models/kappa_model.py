@@ -93,7 +93,7 @@ class KappaModelWrapper(nn.Module):
         sonic_dim: int = 66,
         action_loss_weight: float = 1.0,
         use_proprio: bool = False,
-        proprio_dim: int = 64,
+        proprio_dim: int = 34,
     ):
         from src.models.mot_kappa import MoTKappaModel
         overwatch.info(f"Converting to MoT (proprio={use_proprio})...")

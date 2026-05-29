@@ -42,26 +42,28 @@ Notes
   (``noisy = t * noise + (1 - t) * clean``; ``v = noise - clean``;
   ``x_{t - dt} = x_t - dt * v``).
 * When the checkpoint was trained with ``use_proprio=True``, the server
-  assembles the full 64-D proprio layout (``jp + hand_bits + jv + quat_xyzw``)
-  from Terminal 3's observation plus an *auxiliary ZMQ tap* on the C++
-  deploy's ``g1_debug`` topic (default ``tcp://localhost:5557``):
+  assembles the 34-D ``unitree_g1_sonic`` proprio layout
+  ``[left_leg(6) | right_leg(6) | waist(3) | left_arm(7) | right_arm(7) |
+  left_hand(1) | right_hand(1) | projected_gravity(3)]`` from Terminal 3's
+  observation plus an optional ZMQ tap on the C++ deploy's ``g1_debug`` topic
+  (default ``tcp://localhost:5557``):
 
-    - ``jp``        — ``state.{left_leg, right_leg, waist, left_arm, right_arm}``
-                      from Terminal 3 (29 dims, MuJoCo body order).
-    - ``hand_bits`` — ``state.hand_binary_state`` from Terminal 3 (2 dims).
-    - ``jv``        — finite-difference of consecutive ``body_q`` frames from
-                      the state-tap, sampled at the C++ control rate (50 Hz
-                      typical), matching training.
-    - ``quat_xyzw`` — ``state.base_quat`` if Terminal 3 forwards it (preferred),
-                      otherwise the state-tap's ``base_quat``. Both arrive in
-                      WXYZ order; the server reorders to XYZW for the proprio
-                      layout.
+    - leg / waist / arm groups — ``state.{left_leg, right_leg, waist,
+      left_arm, right_arm}`` from Terminal 3.
+    - left/right hand (1 dim each) — split from
+      ``state.hand_binary_state`` (2-dim open/close) from Terminal 3.
+    - projected_gravity (3) — ``R(state.base_quat).T @ [0, 0, -1]``. The WXYZ
+      quaternion is preferred from Terminal 3; if missing, the state-tap's
+      ``base_quat`` is used; if neither is available the slot is filled with
+      ``[0, 0, -1]`` (upright fallback).
 
-  If the state-tap can't connect, ``jv`` and ``quat`` degrade to zeros (the
-  proprio_stats normalization then maps them to the middle of the training
-  range). Set ``--no-deploy-proprio`` to bypass the proprio branch entirely
-  even on a proprio-trained checkpoint, or ``--no-state-tap-enable`` to keep
-  proprio on but skip the tap (jp+hand only, jv/quat zeroed).
+  After assembly the raw vector is routed through ``StateNormalizer.normalize_flat``
+  with the GR00T-aligned (``use_percentiles``, ``clip_outliers``) pair —
+  resolved from the ``proprio_norm_config.json`` sidecar bundled at training
+  time, with a legacy ``proprio_norm_mode.txt`` back-compat path. Set
+  ``--no-deploy-proprio`` to bypass the proprio branch entirely even on a
+  proprio-trained checkpoint, or ``--no-state-tap-enable`` to keep proprio on
+  but skip the tap (quat fallback only).
 """
 
 from __future__ import annotations
@@ -90,6 +92,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.data.kappa_modality_configs import (
+    G1_SONIC_PROPRIO_DIM,
+    SONIC_STATE_LAYOUT,
+)
+from src.data.preprocess import projected_gravity_from_quat_wxyz
 from src.data.tokenized_video_dataset import DEFAULT_FRAME_SIZE
 
 
@@ -156,60 +163,94 @@ def _detect_sonic_dim_from_ckpt(state_dict: dict[str, torch.Tensor], fallback: i
     return fallback
 
 
-def _maybe_load_proprio_bounds(
-    ckpt_file: Path, dim: int, mode: str = "bounds_q99",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Look for ``proprio_stats.json`` next to the checkpoint and assemble
-    (lo, hi, ill_mask) for [-1, 1] normalization. Returns ``None`` if absent.
-    Matches the dataset-side ``_load_normalize_bounds`` exactly.
+# Legacy sidecar filename, kept for back-compat with checkpoints bundled
+# before the GR00T-aligned ``proprio_norm_config.json`` schema landed.
+_LEGACY_MODE_MAP: dict[str, tuple[bool, bool]] = {
+    "bounds":             (False, True),
+    "bounds_q99":         (True,  True),
+    "bounds_q99_noclip":  (True,  False),
+}
+
+
+def _resolve_proprio_norm_config(
+    ckpt_file: Path,
+    override_use_percentiles: bool | None,
+    override_clip_outliers: bool | None,
+) -> tuple[bool, bool, str]:
+    """Pick ``(use_percentiles, clip_outliers)`` for deploy normalization.
+
+    Priority:
+      1. CLI overrides (per-field; either may be ``None`` to defer).
+      2. ``proprio_norm_config.json`` next to the checkpoint — written by
+         ``Trainer._bundle_proprio_stats`` for every new run.
+      3. Legacy ``proprio_norm_mode.txt`` (string) for back-compat with
+         pre-sonic checkpoints (``bounds_q99`` → ``(True, True)`` etc).
+      4. GR00T N1.7 defaults ``(True, True)`` as the final fallback.
+
+    Returns ``(use_percentiles, clip_outliers, source)`` so the caller can log
+    where each value was sourced from.
     """
-    stats_path = ckpt_file.parent / "proprio_stats.json"
-    if not stats_path.is_file():
-        return None
-    from src.data.tokenized_video_dataset import _load_normalize_bounds
-    with open(stats_path, "r") as f:
-        stats = json.load(f)
-    return _load_normalize_bounds(stats, "proprio", dim, mode)
+    if override_use_percentiles is not None and override_clip_outliers is not None:
+        return bool(override_use_percentiles), bool(override_clip_outliers), "cli"
 
-
-_LEGACY_DEFAULT_NORM_MODE = "bounds_q99"
-
-
-def _resolve_proprio_normalize_mode(
-    ckpt_file: Path, override: str | None,
-) -> tuple[str, str]:
-    """Pick the proprio normalize mode for deploy.
-
-    Priority: ``override`` (CLI) → ``proprio_norm_mode.txt`` next to the
-    checkpoint (bundled by ``Trainer._bundle_proprio_stats``) → legacy default
-    ``"bounds_q99"`` with a warning. Returns ``(mode, source)`` so the caller
-    can log how the mode was chosen.
-    """
-    if override:
-        return override, "cli"
-    sidecar = ckpt_file.parent / "proprio_norm_mode.txt"
-    if sidecar.is_file():
+    cfg_path = ckpt_file.parent / "proprio_norm_config.json"
+    if cfg_path.is_file():
         try:
-            text = sidecar.read_text().strip()
-            if text:
-                return text, f"sidecar({sidecar.name})"
+            with open(cfg_path, "r") as f:
+                payload = json.load(f)
+            up = bool(payload.get("use_percentiles", True))
+            clip = bool(payload.get("clip_outliers", True))
+            if override_use_percentiles is not None:
+                up = bool(override_use_percentiles)
+            if override_clip_outliers is not None:
+                clip = bool(override_clip_outliers)
+            return up, clip, f"sidecar({cfg_path.name})"
+        except (OSError, ValueError):
+            pass
+
+    legacy_path = ckpt_file.parent / "proprio_norm_mode.txt"
+    if legacy_path.is_file():
+        try:
+            text = legacy_path.read_text().strip()
+            if text in _LEGACY_MODE_MAP:
+                up, clip = _LEGACY_MODE_MAP[text]
+                if override_use_percentiles is not None:
+                    up = bool(override_use_percentiles)
+                if override_clip_outliers is not None:
+                    clip = bool(override_clip_outliers)
+                return up, clip, f"legacy({legacy_path.name}={text})"
         except OSError:
             pass
-    return _LEGACY_DEFAULT_NORM_MODE, "legacy-default"
+
+    up = True if override_use_percentiles is None else bool(override_use_percentiles)
+    clip = True if override_clip_outliers is None else bool(override_clip_outliers)
+    return up, clip, "default"
 
 
-def _normalize_proprio(
-    raw: np.ndarray,
-    bounds: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
-    clip: bool = True,
-) -> np.ndarray:
-    if bounds is None:
-        return raw.astype(np.float32, copy=False)
-    lo, hi, _ = bounds
-    out = (raw - lo) / (hi - lo) * 2.0 - 1.0
-    if clip:
-        out = np.clip(out, -1.0, 1.0)
-    return out.astype(np.float32, copy=False)
+def _maybe_load_proprio_normalizer(
+    ckpt_file: Path, use_percentiles: bool, clip_outliers: bool,
+):
+    """Look for the sonic stats JSON next to the checkpoint and build a
+    ``StateNormalizer``. Returns ``None`` if no stats file is found.
+
+    Search order: ``proprio_stats_sonic.json`` (current) → ``proprio_stats.json``
+    (legacy filename for the same nested schema).
+    """
+    from src.data.kappa_modality_configs import KAPPA_MODALITY_CONFIGS
+    from src.data.state_normalizer import StateNormalizer
+
+    for fname in ("proprio_stats_sonic.json", "proprio_stats.json"):
+        stats_path = ckpt_file.parent / fname
+        if not stats_path.is_file():
+            continue
+        with open(stats_path, "r") as f:
+            stats = json.load(f)
+        return StateNormalizer(
+            KAPPA_MODALITY_CONFIGS, stats,
+            use_percentiles=use_percentiles,
+            clip_outliers=clip_outliers,
+        ), stats_path.name
+    return None, None
 
 
 # =============================================================================
@@ -217,44 +258,26 @@ def _normalize_proprio(
 # =============================================================================
 
 
-def _quat_wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
-    """Reorder a (..., 4) WXYZ quaternion to XYZW.
-
-    Mirrors ``src.tokenizer.sonic_encoder._quat_wxyz_to_xyzw`` but kept local
-    so the server has no extra import dependency.
-    """
-    q = np.asarray(q)
-    out = np.empty_like(q)
-    out[..., 0] = q[..., 1]
-    out[..., 1] = q[..., 2]
-    out[..., 2] = q[..., 3]
-    out[..., 3] = q[..., 0]
-    return out
-
-
 class _G1StateTap:
     """Background ZMQ SUB tap on the ``g1_debug`` topic from gear_sonic_deploy.
 
-    Maintains the last two ``(jp_29, base_quat_wxyz, t_monotonic)`` samples so
-    ``KappaPolicy._assemble_proprio`` can:
-      • compute joint velocities at the *C++ control rate* (instead of the
-        ~2.5 Hz get_action cadence, which would alias jv by ~20×), and
-      • recover the raw pelvis quaternion that Terminal 3 otherwise flattens
-        into projected_gravity (losing yaw).
+    Maintains the latest ``base_quat`` (WXYZ) sample from the C++ publisher
+    so ``KappaPolicy._assemble_proprio`` can recover the raw pelvis quaternion
+    for the 34-D sonic proprio's ``projected_gravity`` slot when Terminal 3's
+    own ``state.base_quat`` is missing. With the 34-D layout there is no
+    longer a ``jv`` slot, so the tap no longer needs to track per-sample
+    timing — last quat wins.
 
     The C++ publisher writes a msgpack-encoded dict prefixed with the topic
     bytes; see ``gear_sonic_deploy/.../zmq_output_handler.hpp:316-324`` for
-    the wire layout. ``body_q`` is a ``double[29]`` in MuJoCo order, which is
-    the exact ordering Kappa's 64-D proprio jp slot uses.
+    the wire layout.
 
     Thread safety: the SUB socket is owned exclusively by the background
-    poller. The consumer reads a single immutable snapshot tuple via the
-    ``self._snapshot`` reference, which Python rebinds atomically under the
-    GIL. No locks required.
+    poller. The consumer reads ``self._latest_quat`` via a single atomic
+    Python reference rebind under the GIL. No locks required.
     """
 
     TOPIC = "g1_debug"
-    JP_DIM = 29
     QUAT_DIM = 4
 
     def __init__(
@@ -265,7 +288,7 @@ class _G1StateTap:
     ):
         self._poll_period = 1.0 / float(poll_hz)
         self._stop = threading.Event()
-        self._snapshot: tuple | None = None
+        self._latest_quat: np.ndarray | None = None
         self._sock_ok = False
 
         self._ctx: zmq.Context | None = None
@@ -299,24 +322,17 @@ class _G1StateTap:
 
     def _run(self) -> None:
         topic_len = len(self.TOPIC)
-        prev_jp: np.ndarray | None = None
-        prev_t: float | None = None
         while not self._stop.is_set():
             advanced = False
             try:
                 raw = self._socket.recv(zmq.NOBLOCK)
                 msg = msgpack.unpackb(raw[topic_len:], raw=False)
-                body_q = msg.get("body_q")
                 base_quat = msg.get("base_quat")
-                if body_q is not None and base_quat is not None:
-                    jp_arr = np.asarray(body_q, dtype=np.float32).reshape(-1)
+                if base_quat is not None:
                     quat_arr = np.asarray(base_quat, dtype=np.float32).reshape(-1)
-                    if jp_arr.size >= self.JP_DIM and quat_arr.size == self.QUAT_DIM:
-                        jp_arr = jp_arr[: self.JP_DIM].copy()
-                        now = time.monotonic()
-                        # Atomic-ish snapshot publish.
-                        self._snapshot = (prev_jp, prev_t, jp_arr, now, quat_arr.copy())
-                        prev_jp, prev_t = jp_arr, now
+                    if quat_arr.size == self.QUAT_DIM:
+                        # Atomic-ish: rebind a single reference under the GIL.
+                        self._latest_quat = quat_arr.copy()
                         advanced = True
             except zmq.error.Again:
                 pass
@@ -327,22 +343,11 @@ class _G1StateTap:
             if not advanced:
                 time.sleep(self._poll_period)
 
-    def latest(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Return ``(jv_29 or None, base_quat_wxyz_4 or None)``.
-
-        ``jv`` is finite-difference of the last two C++ frames at the actual
-        sample dt. ``base_quat`` is the most recent reading.
+    def latest_quat(self) -> np.ndarray | None:
+        """Return the latest ``base_quat`` (WXYZ, float32) or ``None`` if the
+        tap hasn't received a frame yet.
         """
-        snap = self._snapshot
-        if snap is None:
-            return None, None
-        prev_jp, prev_t, cur_jp, cur_t, cur_quat = snap
-        jv: np.ndarray | None = None
-        if prev_jp is not None and prev_t is not None:
-            dt = cur_t - prev_t
-            if dt > 1e-4:
-                jv = ((cur_jp - prev_jp) / dt).astype(np.float32, copy=False)
-        return jv, cur_quat
+        return self._latest_quat
 
     def close(self) -> None:
         self._stop.set()
@@ -515,8 +520,9 @@ class KappaPolicy:
         action_horizon: int = 50,
         num_inference_steps: int = 4,
         deploy_proprio: bool = True,
-        proprio_dim: int = 64,
-        proprio_normalize_mode: str | None = None,
+        proprio_dim: int = G1_SONIC_PROPRIO_DIM,
+        proprio_use_percentiles: bool | None = None,
+        proprio_clip_outliers: bool | None = None,
         seed: int | None = None,
         state_tap: _G1StateTap | None = None,
     ):
@@ -586,39 +592,41 @@ class KappaPolicy:
         self.motion_dim = 64  # first 64 dims are SONIC motion latents
         self.hand_dim = max(0, sonic_dim - self.motion_dim)  # trailing dims are hand_binary
 
-        # Proprio normalize bounds (per-checkpoint when bundled). ``proprio_clip``
-        # mirrors the training-side decision: ``bounds_q99_noclip`` keeps the
-        # linear extrapolation, every other mode saturates outside ``[-1, 1]``.
-        # When the CLI doesn't pin the mode, fall back to the sidecar bundled
-        # by ``Trainer._bundle_proprio_stats``; this keeps deploy in sync with
-        # training without requiring the operator to remember the flag.
-        from src.data.tokenized_video_dataset import _NOCLIP_MODES
-        resolved_mode, mode_source = _resolve_proprio_normalize_mode(
-            ckpt_file, proprio_normalize_mode,
+        # Resolve (use_percentiles, clip_outliers) from the sidecar bundled
+        # by ``Trainer._bundle_proprio_stats``, then build a ``StateNormalizer``
+        # off the matching ``proprio_stats_sonic.json``. Keeps deploy
+        # normalization bit-aligned with the training-side GR00T dispatch
+        # without forcing the operator to remember any flags.
+        use_p, clip_o, src = _resolve_proprio_norm_config(
+            ckpt_file, proprio_use_percentiles, proprio_clip_outliers,
         )
-        self.proprio_normalize_mode = resolved_mode
-        self.proprio_clip = resolved_mode not in _NOCLIP_MODES
+        self.proprio_use_percentiles = use_p
+        self.proprio_clip_outliers = clip_o
         print(
-            f"[Kappa] proprio_normalize_mode={resolved_mode} "
-            f"(source={mode_source}, clip={self.proprio_clip})"
+            f"[Kappa] proprio norm: use_percentiles={use_p}, "
+            f"clip_outliers={clip_o} (source={src})"
         )
-        if mode_source == "legacy-default" and self.use_proprio_inference:
+        if src == "default" and self.use_proprio_inference:
             print(
-                "[Kappa] WARNING: no --proprio-normalize-mode override and "
-                "ckpt has no proprio_norm_mode.txt sidecar; defaulting to "
-                f"'{_LEGACY_DEFAULT_NORM_MODE}'. Verify this matches training "
-                "or pass --proprio-normalize-mode explicitly."
+                "[Kappa] WARNING: no proprio_norm_config.json (or legacy "
+                "proprio_norm_mode.txt) sidecar found next to the checkpoint; "
+                "defaulting to GR00T N1.7 (True, True). Pass "
+                "--proprio-use-percentiles / --proprio-clip-outliers to override."
             )
-        self.proprio_bounds = (
-            _maybe_load_proprio_bounds(ckpt_file, self.proprio_dim, resolved_mode)
-            if self.use_proprio_inference else None
-        )
-        if self.use_proprio_inference and self.proprio_bounds is None:
+        if self.use_proprio_inference:
+            self._normalizer, stats_fname = _maybe_load_proprio_normalizer(
+                ckpt_file, use_p, clip_o,
+            )
+        else:
+            self._normalizer, stats_fname = None, None
+        if self.use_proprio_inference and self._normalizer is None:
             print(
-                "[Kappa] WARNING: ckpt uses proprio but no proprio_stats.json "
+                "[Kappa] WARNING: ckpt uses proprio but no proprio_stats_sonic.json "
                 "found next to model.safetensors — proprio will be passed raw. "
                 "Action quality will likely degrade."
             )
+        elif stats_fname is not None:
+            print(f"[Kappa] loaded proprio stats from {stats_fname}")
 
         # Populated by ``get_action`` for the deploy logger to read out the
         # internals (prompt, pre/post-norm proprio) without re-running the
@@ -677,18 +685,17 @@ class KappaPolicy:
         return "perform the task"
 
     def _assemble_proprio_raw(self, observation: dict[str, Any]) -> np.ndarray | None:
-        """Assemble the 64-D proprio vector *pre-normalization*.
+        """Assemble the 34-D ``unitree_g1_sonic`` proprio vector
+        *pre-normalization* in the canonical ``SONIC_STATE_LAYOUT`` order
+        ``[left_leg(6) | right_leg(6) | waist(3) | left_arm(7) | right_arm(7)
+        | left_hand(1) | right_hand(1) | projected_gravity(3)]``.
 
-        Layout (mirrors ``src.data.proprio_layout``):
-          [ 0:29] jp        = left_leg(6) + right_leg(6) + waist(3) + left_arm(7) + right_arm(7)
-          [29:31] hand_bits = state.hand_binary_state
-          [31:60] jv        = state-tap finite-diff (or 0 if tap unavailable)
-          [60:64] quat_xyzw = state.base_quat (WXYZ → XYZW) → state-tap fallback → 0
-
-        Returns ``None`` if any of the *jp* joint groups are missing in the
-        Terminal 3 observation (we never fabricate jp — that would silently
-        corrupt the body state). ``jv`` and ``quat`` degrade gracefully to
-        zeros if neither the obs nor the C++ state-tap can supply them.
+        Returns ``None`` if any of the leg/waist/arm groups is missing in the
+        Terminal 3 observation (we never fabricate joint state — that would
+        silently corrupt the body pose). ``hand_binary_state`` and
+        ``projected_gravity`` degrade gracefully: hand bits → zeros, gravity →
+        ``[0, 0, -1]`` (upright fallback) when neither obs nor state-tap
+        supplies a quaternion.
         """
         state = observation.get("state", {})
         if not isinstance(state, dict):
@@ -714,34 +721,33 @@ class KappaPolicy:
             if v is None:
                 return None
             parts.append(v)
-        jp = np.concatenate(parts, axis=0)  # (29,)
 
-        hand = _vec("hand_binary_state", 2)
-        if hand is None:
-            hand = np.zeros(2, dtype=np.float32)
+        # left/right hand: split state.hand_binary_state[0:2] into two 1-D slots.
+        hand_bits = _vec("hand_binary_state", 2)
+        if hand_bits is None:
+            hand_bits = np.zeros(2, dtype=np.float32)
+        parts.append(hand_bits[0:1])
+        parts.append(hand_bits[1:2])
 
-        # jv: prefer the C++ control-rate finite-diff from the state-tap.
-        # Obs-level jv would be at ~2.5 Hz which severely under-bandwidths the
-        # signal vs the training-time 50 Hz finite-diff.
-        jv = np.zeros(29, dtype=np.float32)
-        tap_jv: np.ndarray | None = None
-        tap_quat_wxyz: np.ndarray | None = None
-        if self._state_tap is not None:
-            tap_jv, tap_quat_wxyz = self._state_tap.latest()
-        if tap_jv is not None and tap_jv.size == 29:
-            jv = tap_jv.astype(np.float32, copy=False)
-
-        # quat: prefer state.base_quat (WXYZ) from Terminal 3, fall back to
-        # the state-tap reading, then zeros.
-        quat_xyzw = np.zeros(4, dtype=np.float32)
+        # projected_gravity: prefer state.base_quat from Terminal 3 (WXYZ),
+        # fall back to the state-tap reading, then to the upright default
+        # [0, 0, -1] (which is what ``projected_gravity_from_quat_wxyz`` would
+        # output for the identity quaternion anyway).
         obs_quat_wxyz = _vec("base_quat", 4)
-        quat_wxyz_src: np.ndarray | None = obs_quat_wxyz
-        if quat_wxyz_src is None and tap_quat_wxyz is not None and tap_quat_wxyz.size == 4:
-            quat_wxyz_src = tap_quat_wxyz
-        if quat_wxyz_src is not None:
-            quat_xyzw = _quat_wxyz_to_xyzw(quat_wxyz_src.astype(np.float32, copy=False))
+        quat_src: np.ndarray | None = obs_quat_wxyz
+        if quat_src is None and self._state_tap is not None:
+            tap_q = self._state_tap.latest_quat()
+            if tap_q is not None and tap_q.size == 4:
+                quat_src = tap_q.astype(np.float32, copy=False)
+        if quat_src is not None:
+            pg = projected_gravity_from_quat_wxyz(
+                quat_src.reshape(1, 4)
+            )[0].astype(np.float32, copy=False)
+        else:
+            pg = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        parts.append(pg)
 
-        raw = np.concatenate([jp, hand, jv, quat_xyzw], axis=0).astype(np.float32)
+        raw = np.concatenate(parts, axis=0).astype(np.float32)
         if raw.shape[0] != self.proprio_dim:
             return None
         return raw
@@ -750,7 +756,11 @@ class KappaPolicy:
         raw = self._assemble_proprio_raw(observation)
         if raw is None:
             return None
-        return _normalize_proprio(raw, self.proprio_bounds, clip=self.proprio_clip)
+        if self._normalizer is None:
+            return raw
+        return self._normalizer.normalize_flat(
+            raw, "unitree_g1_sonic", SONIC_STATE_LAYOUT,
+        ).astype(np.float32, copy=False)
 
     def _build_vlm_inputs(self, image_np: np.ndarray, prompt: str) -> dict[str, torch.Tensor]:
         """Mirror the training-time chat-template + processor call."""
@@ -872,10 +882,12 @@ class KappaPolicy:
                 # The model still needs a proprio token; fall back to zeros so
                 # the velocity head sees a well-formed but uninformative input.
                 proprio = np.zeros(self.proprio_dim, dtype=np.float32)
+            elif self._normalizer is not None:
+                proprio = self._normalizer.normalize_flat(
+                    proprio_raw, "unitree_g1_sonic", SONIC_STATE_LAYOUT,
+                ).astype(np.float32, copy=False)
             else:
-                proprio = _normalize_proprio(
-                    proprio_raw, self.proprio_bounds, clip=self.proprio_clip,
-                )
+                proprio = proprio_raw.astype(np.float32, copy=False)
 
         tokens = self._sample_sonic(vlm_inputs, proprio)  # (T, sonic_dim) float32
 
@@ -1025,20 +1037,26 @@ class ServerConfig:
     was trained with proprio. The model's velocity head will then receive a
     zero proprio token via the encode_latent T_proprio=0 path."""
 
-    proprio_normalize_mode: str | None = None
-    """Match training: ``bounds`` (min/max), ``bounds_q99`` (q01/q99 + clip
-    to ±1), or ``bounds_q99_noclip`` (q01/q99, linear extrapolation beyond ±1
-    — preserves tail magnitude for samples outside the envelope). When unset
-    (default), reads ``proprio_norm_mode.txt`` next to the checkpoint;
-    Trainer bundles that sidecar so deploy auto-picks the training value
-    without needing the flag."""
+    proprio_use_percentiles: bool | None = None
+    """Override ``use_percentiles`` (q01/q99 vs min/max) for the deploy-side
+    proprio normalizer. When unset (default), reads
+    ``proprio_norm_config.json`` next to the checkpoint (or the legacy
+    ``proprio_norm_mode.txt`` string for pre-sonic ckpts); GR00T N1.7 default
+    is ``True``. Trainer bundles the sidecar so deploy auto-picks the
+    training value without needing the flag."""
+
+    proprio_clip_outliers: bool | None = None
+    """Override ``clip_outliers`` (saturate post-rescale output to ``[-1,
+    +1]``) for the deploy-side proprio normalizer. See
+    ``proprio_use_percentiles`` for the sidecar fallback chain. Default
+    is ``True``."""
 
     state_tap_enable: bool = True
     """Subscribe to the C++ deploy's ``g1_debug`` ZMQ topic to recover the
-    raw pelvis quaternion and a control-rate finite-diff of joint velocities.
-    Required to fill the ``jv`` and ``quat_xyzw`` slots of the 64-D proprio at
-    fidelity matching training. Safe to leave on even when the C++ deploy
-    isn't running — the tap silently degrades to zeros for those slots."""
+    raw pelvis quaternion when Terminal 3's ``state.base_quat`` is missing.
+    Only the projected_gravity slot of the 34-D proprio depends on this;
+    safe to leave on even when the C++ deploy isn't running — the tap
+    silently degrades to the upright-fallback gravity vector."""
 
     state_tap_host: str = "localhost"
     state_tap_port: int = 5557
@@ -1103,7 +1121,8 @@ def main(cfg: ServerConfig) -> None:
         action_horizon=cfg.action_horizon,
         num_inference_steps=cfg.num_inference_steps,
         deploy_proprio=cfg.deploy_proprio,
-        proprio_normalize_mode=cfg.proprio_normalize_mode,
+        proprio_use_percentiles=cfg.proprio_use_percentiles,
+        proprio_clip_outliers=cfg.proprio_clip_outliers,
         seed=cfg.seed,
         state_tap=state_tap,
     )
