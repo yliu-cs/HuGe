@@ -1,1 +1,0 @@
-"""Kappa - Kinematic Trajectory project."""
