@@ -116,14 +116,15 @@ class FineTunePropLaunchConfig(LaunchConfig):
 
     train: TrainConfig = TrainConfig(
         name="kappa",
-        max_training_steps=3000,
+        num_train_epochs=1,
+        # max_training_steps=6000,
         train_batch_size=128,
         gradient_accumulation_steps=1,
         num_workers=8,
         prefetch_factor=2,
         block_shuffle_size=64,
         frame_cache_size=2,
-        checkpointing_steps=500,
+        checkpointing_steps=1000,
         validation_steps=0,
         mixed_precision="bf16",
         learning_rate=2e-5,
