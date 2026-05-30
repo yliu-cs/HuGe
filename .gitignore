@@ -34,13 +34,7 @@ dist/
 !.env.sample
 
 # Data and generated artifacts
-resource/dataset/
-resource/runs/
-resource/output/
-resource/outputs/
-resource/checkpoints/
-resource/logs/
-resource/model/
+resource/
 runs/
 .runs/
 outputs/
