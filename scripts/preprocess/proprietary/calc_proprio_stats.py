@@ -16,7 +16,7 @@ from kappa.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSI
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prop-root", default="resource/dataset/proprietary/real/2026-05-28")
+    parser.add_argument("--prop-root", default="resource/dataset/proprietary/real/cola_merged_cleaned_0530")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     files = sorted(glob.glob(str(Path(args.prop_root) / "g1_proprio" / "**" / "episode_*.npy"), recursive=True))

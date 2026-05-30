@@ -75,11 +75,11 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     # Large, weakly supervised visual-language pretraining. Hand bits are
     # masked, so the hand loss weight is irrelevant but kept small.
     "stage1": StageDefaults(
-        learning_rate=1e-4,
-        batch_size=256,
+        learning_rate=7e-5,
+        batch_size=176,
         epochs=1,
-        sample_stride=1,
-        checkpointing_steps=30000,
+        sample_stride=5,
+        checkpointing_steps=10000,
         lambda_hand=0.0,
         freeze_qwen=True,
         qwen_lora=True,
@@ -91,26 +91,27 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     # hand supervision because 66-D targets are fully available.
     "stage2": StageDefaults(
         learning_rate=5e-5,
-        batch_size=256,
+        batch_size=176,
         epochs=1,
-        sample_stride=1,
+        sample_stride=2,
         checkpointing_steps=1000,
         lambda_hand=0.5,
         freeze_qwen=True,
+        qwen_lora=True,
+        train_qwen_lora=True,
         warmup_ratio=0.01,
         max_text_tokens=48,
     ),
     # Real-robot adaptation. Lower LR, denser sampling, frequent checkpoints.
     "stage3": StageDefaults(
-        learning_rate=3e-5,
-        batch_size=256,
+        learning_rate=2e-5,
+        batch_size=128,
         epochs=10,
         sample_stride=1,
-        checkpointing_steps=1000,
+        checkpointing_steps=2000,
         lambda_hand=1.0,
         weight_decay=0.005,
         freeze_qwen=True,
-        save_epoch_checkpoints=True,
         max_text_tokens=48,
     ),
     "prop_ego": StageDefaults(
@@ -250,17 +251,15 @@ class RunLogTee:
         self.enabled = enabled
         self._stdout = sys.stdout
         self._stderr = sys.stderr
-        self._stdout_file: TextIO | None = None
-        self._stderr_file: TextIO | None = None
+        self._log_file: TextIO | None = None
 
     def __enter__(self) -> "RunLogTee":
         if not self.enabled:
             return self
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._stdout_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
-        self._stderr_file = (self.out_dir / "train.err.log").open("a", encoding="utf-8", buffering=1)
-        sys.stdout = TeeStream(self._stdout, self._stdout_file)  # type: ignore[assignment]
-        sys.stderr = TeeStream(self._stderr, self._stderr_file)  # type: ignore[assignment]
+        self._log_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
+        sys.stdout = TeeStream(self._stdout, self._log_file)  # type: ignore[assignment]
+        sys.stderr = TeeStream(self._stderr, self._log_file)  # type: ignore[assignment]
         return self
 
     def __exit__(
@@ -269,18 +268,16 @@ class RunLogTee:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if exc_type is not None and self._stderr_file is not None:
-            self._stderr_file.write("\n")
-            traceback.print_exception(exc_type, exc, tb, file=self._stderr_file)
-            self._stderr_file.flush()
+        if exc_type is not None and self._log_file is not None:
+            self._log_file.write("\n")
+            traceback.print_exception(exc_type, exc, tb, file=self._log_file)
+            self._log_file.flush()
         sys.stdout.flush()
         sys.stderr.flush()
         sys.stdout = self._stdout
         sys.stderr = self._stderr
-        if self._stdout_file is not None:
-            self._stdout_file.close()
-        if self._stderr_file is not None:
-            self._stderr_file.close()
+        if self._log_file is not None:
+            self._log_file.close()
 
 
 def train_stage(args: argparse.Namespace) -> Path:
@@ -327,7 +324,7 @@ def train_stage(args: argparse.Namespace) -> Path:
     if stats is None and args.stage in {"stage2", "posttrain_he_wbt"}:
         stats = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json"
     if stats is None and args.stage in {"stage3", "finetune_prop"}:
-        stats = "resource/dataset/proprietary/real/2026-05-28/meta/proprio_stats_union_sonic.json"
+        stats = "resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json"
     _log_main(
         accelerator,
         (
@@ -401,14 +398,25 @@ def train_stage(args: argparse.Namespace) -> Path:
     _log_main(
         accelerator,
         (
-            f"[{args.stage}] building model: base_vlm={args.base_vlm_path} use_qwen={args.use_qwen} "
+            f"[{args.stage}] building model: architecture={args.architecture} base_vlm={args.base_vlm_path} use_qwen={args.use_qwen} "
             f"freeze_qwen={args.freeze_qwen} qwen_lora={args.qwen_lora} "
-            f"train_qwen_lora={args.train_qwen_lora} hidden_size={args.hidden_size}"
+            f"train_qwen_lora={args.train_qwen_lora} hidden_size={args.hidden_size} action_hidden_size={args.action_hidden_size} "
+            f"num_action_layers={args.num_action_layers}"
         ),
     )
     config = QwenSonicFMConfig(
+        architecture=args.architecture,
         hidden_size=args.hidden_size,
         vlm_hidden_size=args.vlm_hidden_size,
+        action_hidden_size=args.action_hidden_size,
+        num_action_layers=args.num_action_layers,
+        num_attention_heads=args.num_attention_heads,
+        action_ffn_multiplier=args.action_ffn_multiplier,
+        action_dropout=args.action_dropout,
+        num_future_tokens=args.num_future_tokens,
+        flow_noise_beta_alpha=args.flow_noise_beta_alpha,
+        flow_noise_beta_beta=args.flow_noise_beta_beta,
+        flow_noise_s=args.flow_noise_s,
         action_horizon=args.action_horizon,
         base_vlm_path=args.base_vlm_path,
         use_qwen=args.use_qwen,
@@ -446,6 +454,10 @@ def train_stage(args: argparse.Namespace) -> Path:
             qwen_processor_path=args.base_vlm_path,
             proprio_stats_path=stats,
             action_schema=ActionSchema().to_dict(),
+            architecture=args.architecture,
+            action_hidden_size=args.action_hidden_size,
+            num_action_layers=args.num_action_layers,
+            num_attention_heads=args.num_attention_heads,
             freeze_qwen=args.freeze_qwen,
             qwen_lora=args.qwen_lora,
             train_qwen_lora=args.train_qwen_lora,
@@ -455,13 +467,13 @@ def train_stage(args: argparse.Namespace) -> Path:
             source_git_commit=_git_commit(),
         )
         _log_main(accelerator, f"[{args.stage}] optimizer ready: lr={args.learning_rate:.2e} weight_decay={args.weight_decay}")
-        total_train_steps = args.max_steps if args.max_steps is not None else len(train_loader) * args.epochs
-        warmup_steps = args.warmup_steps if args.warmup_steps and args.warmup_steps > 0 else math.ceil(total_train_steps * (args.warmup_ratio or 0.0))
+        scheduler_total_steps = args.max_steps if args.max_steps is not None else len(train_loader) * args.epochs
+        warmup_steps = args.warmup_steps if args.warmup_steps and args.warmup_steps > 0 else math.ceil(scheduler_total_steps * (args.warmup_ratio or 0.0))
         lr_scheduler = get_scheduler(
             name=args.lr_scheduler_type,
             optimizer=optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=total_train_steps,
+            num_training_steps=scheduler_total_steps,
         )
         if accelerator is not None:
             _log_main(accelerator, f"[{args.stage}] accelerator.prepare starting")
@@ -483,82 +495,91 @@ def train_stage(args: argparse.Namespace) -> Path:
             if prepare_debug:
                 _log_rank(accelerator, f"[{args.stage}] exited accelerator.prepare device={device}")
             _log_main(accelerator, f"[{args.stage}] accelerator.prepare done")
+        total_train_steps = args.max_steps if args.max_steps is not None else len(train_loader) * args.epochs
 
         _log_main(
             accelerator,
             (
                 f"[{args.stage}] scheduler ready: epochs={args.epochs} total_steps={total_train_steps} "
-                f"warmup_steps={warmup_steps} checkpointing_steps={args.checkpointing_steps}"
+                f"scheduler_steps={scheduler_total_steps} warmup_steps={warmup_steps} "
+                f"checkpointing_steps={args.checkpointing_steps}"
             ),
         )
 
         global_step = 0
         train_start = time.time()
-        for epoch in range(args.epochs):
-            model.train()
-            epoch_total = min(len(train_loader), args.max_steps or len(train_loader))
-            _log_main(accelerator, f"[{args.stage}] epoch {epoch + 1}/{args.epochs} start: global_step={global_step} planned_batches={epoch_total}")
-            pbar = tqdm(
-                train_loader,
-                desc=f"{args.stage} epoch {epoch + 1}/{args.epochs}",
-                total=epoch_total,
-                disable=not _is_main_process(accelerator),
-            )
-            for batch in pbar:
+        progress_total = total_train_steps
+        stop_training = False
+        with tqdm(
+            total=progress_total,
+            desc=f"{args.stage} steps",
+            unit="step",
+            disable=not _is_main_process(accelerator),
+        ) as pbar:
+            for epoch in range(args.epochs):
                 if args.max_steps is not None and global_step >= args.max_steps:
                     break
-                batch = move_batch(batch, device)
-                optimizer.zero_grad(set_to_none=True)
-                autocast_enabled = args.mixed_precision == "bf16" and device.type == "cuda" and not args.use_deepspeed
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                    pred = model(
-                        normalized_actions=batch["normalized_actions"],
-                        input_ids=batch["input_ids"],
-                        images=batch["images"],
-                        state=batch["state"],
-                        state_mask=batch["state_mask"],
-                        qwen_inputs=batch.get("qwen_inputs"),
-                    )
-                    losses = qwen_sonicfm_loss(pred, batch["normalized_actions"], sonic_mask=batch["sonic_mask"], lambda_hand=args.lambda_hand)
-                if scaler.is_enabled():
-                    scaler.scale(losses["loss"]).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    if accelerator is not None:
-                        accelerator.backward(losses["loss"])
+                model.train()
+                for batch in train_loader:
+                    if args.max_steps is not None and global_step >= args.max_steps:
+                        stop_training = True
+                        break
+                    batch = move_batch(batch, device)
+                    optimizer.zero_grad(set_to_none=True)
+                    autocast_enabled = args.mixed_precision == "bf16" and device.type == "cuda" and not args.use_deepspeed
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                        pred = model(
+                            normalized_actions=batch["normalized_actions"],
+                            input_ids=batch["input_ids"],
+                            images=batch["images"],
+                            state=batch["state"],
+                            state_mask=batch["state_mask"],
+                            qwen_inputs=batch.get("qwen_inputs"),
+                        )
+                        losses = qwen_sonicfm_loss(pred, batch["normalized_actions"], sonic_mask=batch["sonic_mask"], lambda_hand=args.lambda_hand)
+                    if scaler.is_enabled():
+                        scaler.scale(losses["loss"]).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
                     else:
-                        losses["loss"].backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                lr_scheduler.step()
-                global_step += 1
-                current_loss = float(losses["loss"].detach())
-                current_hand = float(losses["hand_accuracy"].detach())
-                current_lr = lr_scheduler.get_last_lr()[0]
-                pbar.set_postfix(
-                    loss=f"{current_loss:.4f}",
-                    hand=f"{current_hand:.3f}",
-                    lr=f"{current_lr:.2e}",
-                )
-                if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
-                    _log_main(accelerator, f"[{args.stage}] saving checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
-                    _save_model(model, out_dir / f"step_{global_step}", {**metadata, "global_step": global_step, "epoch": epoch}, accelerator, stats)
-                    _log_main(accelerator, f"[{args.stage}] checkpoint saved: step={global_step}")
-            if args.save_epoch_checkpoints:
-                _log_main(accelerator, f"[{args.stage}] saving epoch checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
-                _save_model(
-                    model,
-                    out_dir / f"step_{global_step}",
-                    {**metadata, "global_step": global_step, "epoch": epoch},
-                    accelerator,
-                    stats,
-                )
-                _log_main(accelerator, f"[{args.stage}] epoch checkpoint saved: step={global_step}")
-            if args.max_steps is not None and global_step >= args.max_steps:
-                break
+                        if accelerator is not None:
+                            accelerator.backward(losses["loss"])
+                        else:
+                            losses["loss"].backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                    lr_scheduler.step()
+                    global_step += 1
+                    pbar.update(1)
+                    current_loss = float(losses["loss"].detach())
+                    current_hand = float(losses["hand_accuracy"].detach())
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    pbar.set_postfix(
+                        step=global_step,
+                        loss=f"{current_loss:.4f}",
+                        hand=f"{current_hand:.3f}",
+                        lr=f"{current_lr:.2e}",
+                    )
+                    if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
+                        _log_main(accelerator, f"[{args.stage}] saving checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
+                        _save_model(model, out_dir / f"step_{global_step}", {**metadata, "global_step": global_step, "epoch": epoch}, accelerator, stats)
+                        _log_main(accelerator, f"[{args.stage}] checkpoint saved: step={global_step}")
+                if args.save_epoch_checkpoints:
+                    _log_main(accelerator, f"[{args.stage}] saving epoch checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
+                    _save_model(
+                        model,
+                        out_dir / f"step_{global_step}",
+                        {**metadata, "global_step": global_step, "epoch": epoch},
+                        accelerator,
+                        stats,
+                    )
+                    _log_main(accelerator, f"[{args.stage}] epoch checkpoint saved: step={global_step}")
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    stop_training = True
+                if stop_training:
+                    break
         _log_main(accelerator, f"[{args.stage}] saving final checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
         _save_model(model, out_dir / f"step_{global_step}", {**metadata, "global_step": global_step}, accelerator, stats)
         _log_main(accelerator, f"[{args.stage}] done: output_dir={out_dir} total_time={_format_seconds(time.time() - train_start)}")
@@ -610,6 +631,7 @@ def _load_checkpoint_state(model: QwenSonicFM, checkpoint_path: str | Path, acce
 def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p = StageArgumentParser()
     p.add_argument("--stage", default=canonical_stage(default_stage))
+    p.add_argument("--architecture", default="pi")
     p.add_argument("--output-dir", default=".runs/train")
     p.add_argument("--device", default="auto")
     p.add_argument("--use-accelerate", action=argparse.BooleanOptionalAction, default=True)
@@ -624,6 +646,15 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--qwen-lora-dropout", type=float, default=None)
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--vlm-hidden-size", type=int, default=512)
+    p.add_argument("--action-hidden-size", type=int, default=1024)
+    p.add_argument("--num-action-layers", type=int, default=28)
+    p.add_argument("--num-attention-heads", type=int, default=16)
+    p.add_argument("--action-ffn-multiplier", type=int, default=4)
+    p.add_argument("--action-dropout", type=float, default=0.1)
+    p.add_argument("--num-future-tokens", type=int, default=32)
+    p.add_argument("--flow-noise-beta-alpha", type=float, default=1.5)
+    p.add_argument("--flow-noise-beta-beta", type=float, default=1.0)
+    p.add_argument("--flow-noise-s", type=float, default=0.999)
     p.add_argument("--action-horizon", type=int, default=50)
     p.add_argument("--num-inference-steps", type=int, default=4)
     p.add_argument("--max-text-tokens", type=int, default=None)

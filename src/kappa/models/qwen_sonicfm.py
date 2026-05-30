@@ -10,13 +10,24 @@ import torch
 from torch import nn
 
 from kappa.data.schemas import ACTION_DIM, ACTION_HORIZON, MOTION_TOKEN_DIM, PROPRIO_DIM
+from kappa.models.action_heads.layerwise_cross_dit_fm import LayerwiseCrossDiTFMActionHead
 from kappa.models.action_heads.layerwise_fm import LayerwiseFMActionHead
 
 
 @dataclass
 class QwenSonicFMConfig:
+    architecture: str = "lite"
     hidden_size: int = 512
     vlm_hidden_size: int = 512
+    action_hidden_size: int = 1024
+    num_action_layers: int = 28
+    num_attention_heads: int = 16
+    action_ffn_multiplier: int = 4
+    action_dropout: float = 0.1
+    num_future_tokens: int = 32
+    flow_noise_beta_alpha: float = 1.5
+    flow_noise_beta_beta: float = 1.0
+    flow_noise_s: float = 0.999
     action_horizon: int = ACTION_HORIZON
     state_dim: int = PROPRIO_DIM
     action_dim: int = ACTION_DIM
@@ -40,21 +51,42 @@ class QwenSonicFM(nn.Module):
         super().__init__()
         self.config = config or QwenSonicFMConfig()
         self.qwen = None
-        self.text_embed = nn.Embedding(32768, self.config.vlm_hidden_size)
-        self.image_proj = nn.Linear(3, self.config.vlm_hidden_size)
-        self.state_encoder = nn.Sequential(
-            nn.Linear(self.config.state_dim, self.config.vlm_hidden_size),
-            nn.GELU(),
-            nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size),
-        )
-        self.action_head = LayerwiseFMActionHead(
-            hidden_size=self.config.hidden_size,
-            condition_size=self.config.vlm_hidden_size,
-            action_horizon=self.config.action_horizon,
-        )
-        self.qwen_proj = nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size)
-        if self.config.use_qwen:
-            self._load_qwen()
+        if not self.config.use_qwen:
+            raise ValueError("Kappa now requires use_qwen=True; char-token fallback has been removed")
+        self.vlm_projectors = nn.ModuleList()
+        if self.config.architecture == "pi":
+            self.state_encoder = None
+            self.qwen_proj = None
+            self.action_head = LayerwiseCrossDiTFMActionHead(
+                hidden_size=self.config.action_hidden_size,
+                action_dim=self.config.action_dim,
+                state_dim=self.config.state_dim,
+                action_horizon=self.config.action_horizon,
+                num_layers=self.config.num_action_layers,
+                num_heads=self.config.num_attention_heads,
+                ffn_multiplier=self.config.action_ffn_multiplier,
+                dropout=self.config.action_dropout,
+                num_future_tokens=self.config.num_future_tokens,
+                num_inference_steps=self.config.num_inference_steps,
+                noise_beta_alpha=self.config.flow_noise_beta_alpha,
+                noise_beta_beta=self.config.flow_noise_beta_beta,
+                noise_s=self.config.flow_noise_s,
+            )
+        elif self.config.architecture == "lite":
+            self.state_encoder = nn.Sequential(
+                nn.Linear(self.config.state_dim, self.config.vlm_hidden_size),
+                nn.GELU(),
+                nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size),
+            )
+            self.qwen_proj = nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size)
+            self.action_head = LayerwiseFMActionHead(
+                hidden_size=self.config.hidden_size,
+                condition_size=self.config.vlm_hidden_size,
+                action_horizon=self.config.action_horizon,
+            )
+        else:
+            raise ValueError(f"unknown architecture {self.config.architecture!r}")
+        self._load_qwen()
 
     def _load_qwen(self) -> None:
         from transformers import AutoModelForImageTextToText
@@ -82,7 +114,7 @@ class QwenSonicFM(nn.Module):
             or getattr(text_config, "hidden_size", None)
             or self.config.vlm_hidden_size
         )
-        self.qwen_proj = nn.Linear(hidden, self.config.vlm_hidden_size)
+        self._init_vlm_adapters(hidden)
         if self.config.train_qwen_lora and not self.config.qwen_lora:
             raise ValueError("train_qwen_lora requires qwen_lora")
         if self.config.qwen_lora:
@@ -114,14 +146,25 @@ class QwenSonicFM(nn.Module):
             for p in self.qwen.parameters():
                 p.requires_grad_(False)
 
+    def _init_vlm_adapters(self, qwen_hidden_size: int) -> None:
+        self.qwen_proj = nn.Linear(qwen_hidden_size, self.config.vlm_hidden_size)
+        if self.config.architecture == "pi":
+            self.vlm_projectors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(qwen_hidden_size),
+                        nn.Linear(qwen_hidden_size, self.config.action_hidden_size),
+                    )
+                    for _ in range(self.config.num_action_layers)
+                ]
+            )
+
     def _qwen_grad_enabled(self) -> bool:
         return self.training and (self.config.train_qwen_lora or not self.config.freeze_qwen)
 
     def encode_latent(
         self,
         *,
-        input_ids: torch.Tensor | None = None,
-        images: torch.Tensor | None = None,
         state: torch.Tensor | None = None,
         state_mask: torch.Tensor | None = None,
         qwen_inputs: dict[str, torch.Tensor] | None = None,
@@ -139,19 +182,8 @@ class QwenSonicFM(nn.Module):
             else:
                 pooled = hidden.mean(dim=1)
             pieces.append(self.qwen_proj(pooled.to(self.qwen_proj.weight.dtype)))
-        elif input_ids is not None:
-            pieces.append(self.text_embed(input_ids).mean(dim=1))
-        if images is not None:
-            img = images.float()
-            if img.ndim == 5:
-                img = img[:, -1]
-            if img.shape[-1] == 3:
-                pooled = img.reshape(img.shape[0], -1, 3).mean(dim=1)
-            elif img.shape[1] == 3:
-                pooled = img.flatten(2).mean(dim=-1)
-            else:
-                raise ValueError(f"cannot infer image channel layout from {images.shape}")
-            pieces.append(self.image_proj(pooled.to(self.image_proj.weight.dtype)))
+        else:
+            raise ValueError("qwen_inputs are required; char-token fallback has been removed")
         if state is not None:
             state_feat = self.state_encoder(state.to(self.state_encoder[0].weight.dtype))
             if state_mask is not None:
@@ -160,6 +192,35 @@ class QwenSonicFM(nn.Module):
         if not pieces:
             raise ValueError("encode_latent needs at least one of input_ids, images, or state")
         return torch.stack(pieces, dim=0).sum(dim=0)
+
+    def encode_vlm_layers(
+        self,
+        *,
+        qwen_inputs: dict[str, torch.Tensor] | None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+        if qwen_inputs is None:
+            raise ValueError("PI architecture requires qwen_inputs from the Qwen processor")
+        if self.qwen is None:
+            raise RuntimeError("PI architecture requires a loaded Qwen model")
+        if len(self.vlm_projectors) != self.config.num_action_layers:
+            raise RuntimeError("VLM projectors are not initialized")
+        qwen_inputs = {k: v.to(next(self.qwen.parameters()).device) if torch.is_tensor(v) else v for k, v in qwen_inputs.items()}
+        with torch.set_grad_enabled(self._qwen_grad_enabled()):
+            out = self.qwen(**qwen_inputs, output_hidden_states=True, return_dict=True)
+        hidden_states = list(out.hidden_states)
+        if len(hidden_states) < self.config.num_action_layers:
+            raise ValueError(
+                f"num_action_layers={self.config.num_action_layers} exceeds available hidden states {len(hidden_states)}"
+            )
+        selected = hidden_states[-self.config.num_action_layers:]
+        projected = [
+            projector(hidden.to(next(projector.parameters()).dtype))
+            for projector, hidden in zip(self.vlm_projectors, selected, strict=True)
+        ]
+        attention_mask = qwen_inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, : projected[0].shape[1]]
+        return projected, attention_mask
 
     def denoise_step(
         self,
@@ -181,7 +242,19 @@ class QwenSonicFM(nn.Module):
         noise: torch.Tensor | None = None,
         t: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        condition = self.encode_latent(input_ids=input_ids, images=images, state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
+        del input_ids, images
+        if self.config.architecture == "pi":
+            vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
+            return self.action_head(
+                vl_embs_list=vl_embs_list,
+                actions=normalized_actions.to(vl_embs_list[0].dtype),
+                state=state,
+                state_mask=state_mask,
+                encoder_attention_mask=attention_mask,
+                noise=noise,
+                t=t,
+            )
+        condition = self.encode_latent(state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
         action_dtype = self.action_head.action_embed.weight.dtype
         motion = normalized_actions[..., :MOTION_TOKEN_DIM].to(action_dtype)
         if noise is None:
@@ -210,7 +283,18 @@ class QwenSonicFM(nn.Module):
         horizon: int | None = None,
         num_inference_steps: int | None = None,
     ) -> torch.Tensor:
-        condition = self.encode_latent(input_ids=input_ids, images=images, state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
+        del input_ids, images
+        if self.config.architecture == "pi":
+            vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
+            return self.action_head.predict(
+                vl_embs_list=vl_embs_list,
+                state=state,
+                state_mask=state_mask,
+                encoder_attention_mask=attention_mask,
+                horizon=horizon or self.config.action_horizon,
+                num_inference_steps=num_inference_steps or self.config.num_inference_steps,
+            )
+        condition = self.encode_latent(state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
         return self.action_head.predict(
             condition,
             horizon=horizon or self.config.action_horizon,

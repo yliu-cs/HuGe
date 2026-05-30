@@ -167,7 +167,7 @@ def build_stage_dataset(
             datasets.extend(PropEgoDataset(path, sample_stride=sample_stride, max_episodes=max_episodes) for path in roots)
             return MixtureDataset(datasets)
 
-        roots = prop_roots or [str(data / "proprietary" / "real" / "2026-05-28")]
+        roots = prop_roots or [str(data / "proprietary" / "real" / "cola_merged_cleaned_0530")]
         datasets.extend(
             PropDataset(
                 path,
@@ -186,7 +186,7 @@ def build_stage_dataset(
             )
             replay.dataset_id = "g1_wbt_replay"
             datasets.append(replay)
-        return MixtureDataset(datasets)
+        return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     raise ValueError(f"unknown stage {stage!r}")
 
 

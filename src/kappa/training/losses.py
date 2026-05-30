@@ -31,18 +31,26 @@ def qwen_sonicfm_loss(
     if target_velocity is None:
         raise KeyError("pred missing target_velocity")
     velocity = pred["velocity"]
-    token_mask = None if sonic_mask is None else sonic_mask[..., :MOTION_TOKEN_DIM]
+    velocity_dim = velocity.shape[-1]
+    token_mask = None if sonic_mask is None else sonic_mask[..., :velocity_dim]
     target_velocity = target_velocity.to(velocity.dtype)
+    if target_velocity.shape[-1] != velocity_dim:
+        raise ValueError(f"target_velocity dim {target_velocity.shape[-1]} != velocity dim {velocity_dim}")
     loss_token = _masked_mean((velocity - target_velocity).pow(2), token_mask)
-    hand_logits = pred["hand_logits"]
-    hand_target = target_actions[..., MOTION_TOKEN_DIM:ACTION_DIM].to(hand_logits.dtype)
-    hand_mask = None if sonic_mask is None else sonic_mask[..., MOTION_TOKEN_DIM:ACTION_DIM]
-    loss_hand_raw = F.binary_cross_entropy_with_logits(hand_logits, hand_target, reduction="none")
-    loss_hand = _masked_mean(loss_hand_raw, hand_mask)
-    loss = loss_token + float(lambda_hand) * loss_hand
-    with torch.no_grad():
-        hand_acc = ((torch.sigmoid(hand_logits) >= 0.5) == (hand_target >= 0.5)).float()
-        hand_acc = _masked_mean(hand_acc, hand_mask)
+    hand_logits = pred.get("hand_logits")
+    if hand_logits is None:
+        loss_hand = torch.zeros((), dtype=loss_token.dtype, device=loss_token.device)
+        hand_acc = torch.zeros((), dtype=loss_token.dtype, device=loss_token.device)
+        loss = loss_token
+    else:
+        hand_target = target_actions[..., MOTION_TOKEN_DIM:ACTION_DIM].to(hand_logits.dtype)
+        hand_mask = None if sonic_mask is None else sonic_mask[..., MOTION_TOKEN_DIM:ACTION_DIM]
+        loss_hand_raw = F.binary_cross_entropy_with_logits(hand_logits, hand_target, reduction="none")
+        loss_hand = _masked_mean(loss_hand_raw, hand_mask)
+        loss = loss_token + float(lambda_hand) * loss_hand
+        with torch.no_grad():
+            hand_acc = ((torch.sigmoid(hand_logits) >= 0.5) == (hand_target >= 0.5)).float()
+            hand_acc = _masked_mean(hand_acc, hand_mask)
     return {
         "loss": loss,
         "loss_token": loss_token,

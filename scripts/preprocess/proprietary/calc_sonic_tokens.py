@@ -73,13 +73,13 @@ def _write_episode(parquet: Path, out_root: Path, layout: dict[str, int]) -> Non
     if proprio.shape[1] != PROPRIO_DIM:
         raise ValueError(f"{parquet}: proprio dim {proprio.shape[1]} != {PROPRIO_DIM}")
     ep = int(parquet.stem.removeprefix("episode_"))
-    atomic_save_npy(tokens, str(out_root / "sonic_tokens" / f"episode_{ep:06d}.npy"))
-    atomic_save_npy(proprio, str(out_root / "g1_proprio" / f"episode_{ep:06d}.npy"))
+    atomic_save_npy(str(out_root / "sonic_tokens" / f"episode_{ep:06d}.npy"), tokens)
+    atomic_save_npy(str(out_root / "g1_proprio" / f"episode_{ep:06d}.npy"), proprio)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-roots", nargs="+", default=["resource/dataset/proprietary/real/2026-05-28"])
+    parser.add_argument("--data-roots", nargs="+", default=["resource/dataset/proprietary/real/cola_merged_cleaned_0530"])
     parser.add_argument("--cache-root", default=None)
     args = parser.parse_args()
     for root_str in args.data_roots:

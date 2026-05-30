@@ -45,20 +45,20 @@ qwen_processor_path_exists: `True`
 - hand_stats: `{"frames": 3545, "left_closed_ratio": 1.0, "right_closed_ratio": 0.9997179125528914, "invalid_episode_count": 0}`
 - errors: `[]`
 
-### proprietary_real_2026_05_28
+### proprietary_real_cola_merged_cleaned_0530
 
-- root: `/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/2026-05-28`
+- root: `/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/cola_merged_cleaned_0530`
 - root_exists: `True`
 - root_is_symlink: `False`
-- token_files: `388`
-- proprio_files: `388`
-- first_token_shape: `1252x66`
-- first_proprio_shape: `1252x34`
+- token_files: `578`
+- proprio_files: `578`
+- first_token_shape: `440x66`
+- first_proprio_shape: `440x34`
 - motion_token_finite_sample: `True`
-- hand_stats: `{"frames": 9785, "left_closed_ratio": 0.0, "right_closed_ratio": 0.4347470618293306, "invalid_episode_count": 0}`
+- hand_stats: `{"frames": 10083, "left_closed_ratio": 0.0, "right_closed_ratio": 0.49885946642864226, "invalid_episode_count": 0}`
 - errors: `[]`
 
 ## Proprio Stats
 
 - `/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json`: `{"path": "/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json", "exists": true, "roundtrip_max_abs_error": 3.0616030244345893e-07, "proprio_dim": 34}`
-- `/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/2026-05-28/meta/proprio_stats_union_sonic.json`: `{"path": "/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/2026-05-28/meta/proprio_stats_union_sonic.json", "exists": true, "roundtrip_max_abs_error": 1.0105991776754308e-07, "proprio_dim": 34}`
+- `/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json`: `{"path": "/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Kappa/resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json", "exists": true, "roundtrip_max_abs_error": 1.3514174668216583e-07, "proprio_dim": 34}`

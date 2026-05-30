@@ -60,7 +60,7 @@ def _default_proprio_stats(stage: str, override: str | None) -> str | None:
     if stage in {"stage2", "he_wbt", "posttrain_he_wbt"}:
         return "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json"
     if stage in {"stage3", "prop", "proprietary", "finetune_prop", "prop_ego", "proprietary_ego"}:
-        return "resource/dataset/proprietary/real/2026-05-28/meta/proprio_stats_union_sonic.json"
+        return "resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json"
     return None
 
 
@@ -76,7 +76,13 @@ def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> KappaC
 
 
 @torch.no_grad()
-def _predict_batch(model: QwenSonicFM, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
+def _predict_batch(
+    model: QwenSonicFM,
+    batch: dict[str, Any],
+    device: torch.device,
+    *,
+    num_inference_steps: int | None = None,
+) -> torch.Tensor:
     batch = move_batch(batch, device)
     return model.predict_action(
         input_ids=batch["input_ids"],
@@ -84,6 +90,7 @@ def _predict_batch(model: QwenSonicFM, batch: dict[str, Any], device: torch.devi
         state=batch["state"],
         state_mask=batch["state_mask"],
         qwen_inputs=batch.get("qwen_inputs"),
+        num_inference_steps=num_inference_steps,
     )
 
 
@@ -172,6 +179,7 @@ def _run_visualization(
     timesteps: list[int] | None,
     max_plot_windows: int,
     batch_size: int,
+    num_inference_steps: int | None,
     out_path: Path,
     title_prefix: str,
 ) -> Path:
@@ -184,7 +192,12 @@ def _run_visualization(
         chunk_starts = starts[offset : offset + batch_size]
         items = [dataset[ep_start + local] for local in chunk_starts]
         batch = collator(items)
-        pred = _predict_batch(model, batch, device).detach().cpu().numpy().astype(np.float32)
+        pred = _predict_batch(
+            model,
+            batch,
+            device,
+            num_inference_steps=num_inference_steps,
+        ).detach().cpu().numpy().astype(np.float32)
         target = batch["normalized_actions"].numpy().astype(np.float32)
         mask = batch["sonic_mask"].numpy().astype(np.float32)
 
@@ -223,6 +236,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-idx", type=int, default=0)
     parser.add_argument("--timesteps", nargs="*", type=int, default=None, help="episode-local sample starts for plots")
     parser.add_argument("--max-plot-windows", type=int, default=64, help="<=0 means no limit")
+    parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--use-qwen-processor", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
@@ -262,6 +276,7 @@ def main() -> None:
             timesteps=args.timesteps,
             max_plot_windows=args.max_plot_windows,
             batch_size=args.batch_size,
+            num_inference_steps=args.num_inference_steps,
             out_path=png_path,
             title_prefix=label,
         )

@@ -217,10 +217,10 @@ def build_audit(repo_root: Path, sample_limit: int) -> dict[str, Any]:
             expect_state=True,
         ),
         SourceSpec(
-            "proprietary_real_2026_05_28",
-            dataset / "proprietary" / "real" / "2026-05-28",
-            dataset / "proprietary" / "real" / "2026-05-28" / "sonic_tokens",
-            dataset / "proprietary" / "real" / "2026-05-28" / "g1_proprio",
+            "proprietary_real_cola_merged_cleaned_0530",
+            dataset / "proprietary" / "real" / "cola_merged_cleaned_0530",
+            dataset / "proprietary" / "real" / "cola_merged_cleaned_0530" / "sonic_tokens",
+            dataset / "proprietary" / "real" / "cola_merged_cleaned_0530" / "g1_proprio",
             expect_state=True,
         ),
     ]
@@ -231,7 +231,7 @@ def build_audit(repo_root: Path, sample_limit: int) -> dict[str, Any]:
         "sources": [_audit_source(spec, sample_limit) for spec in specs],
         "proprio_stats": [
             _check_normalizer(dataset / "G1_WBT-cache" / "meta" / "g1_proprio_stats_sonic.json"),
-            _check_normalizer(dataset / "proprietary" / "real" / "2026-05-28" / "meta" / "proprio_stats_union_sonic.json"),
+            _check_normalizer(dataset / "proprietary" / "real" / "cola_merged_cleaned_0530" / "meta" / "proprio_stats_union_sonic.json"),
         ],
     }
 

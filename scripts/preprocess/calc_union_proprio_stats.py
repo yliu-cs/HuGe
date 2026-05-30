@@ -38,8 +38,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--he-cache-root", default="resource/dataset/humanoid-everyday-cache")
     parser.add_argument("--wbt-source-root", default="resource/dataset/G1_WBT")
-    parser.add_argument("--prop-root", default="resource/dataset/proprietary/real/2026-05-28")
-    parser.add_argument("--out", default="resource/dataset/proprietary/real/2026-05-28/meta/proprio_stats_union_sonic.json")
+    parser.add_argument("--prop-root", default="resource/dataset/proprietary/real/cola_merged_cleaned_0530")
+    parser.add_argument("--out", default="resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json")
     args = parser.parse_args()
     roots = {
         "HE": Path(args.he_cache_root) / "g1_proprio",

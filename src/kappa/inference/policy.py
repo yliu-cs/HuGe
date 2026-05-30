@@ -112,10 +112,10 @@ class KappaPolicy:
 
     def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> dict[str, torch.Tensor] | None:
         if self.processor is None:
-            return None
+            raise ValueError("Qwen processor is required; fallback text/image path has been removed")
         arr = self._image_array(observation)
         if arr is None:
-            return None
+            raise ValueError("Qwen processor input requires an image")
         if self.tokenizer is not None:
             prompt = _truncate_with_tokenizer(
                 self.tokenizer,

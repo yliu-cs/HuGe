@@ -13,15 +13,6 @@ from kappa.data.schemas import ACTION_DIM, PROPRIO_DIM
 from kappa.data.video_reader import decode_video_frame, image_to_float_array
 
 
-def _char_tokenize(texts: list[str], max_length: int = 256) -> torch.Tensor:
-    width = min(max(max((len(t) for t in texts), default=1), 1), max_length)
-    out = torch.zeros((len(texts), width), dtype=torch.long)
-    for i, text in enumerate(texts):
-        ids = [min(ord(ch), 32767) for ch in text[:width]] or [0]
-        out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-    return out
-
-
 def _truncate_with_tokenizer(tokenizer: Any, text: str, max_tokens: int | None) -> str:
     if max_tokens is None or max_tokens <= 0:
         return text
@@ -79,8 +70,31 @@ class KappaCollator:
         state_mask = torch.from_numpy(np.stack([np.asarray(x.get("state_mask", np.zeros(1)), dtype=np.float32) for x in items], axis=0)).reshape(len(items), -1)
         if actions.shape[-1] != ACTION_DIM:
             raise ValueError(f"action dim {actions.shape[-1]} != {ACTION_DIM}")
+        if self.processor is None:
+            raise ValueError("Kappa PI/lite training requires use_qwen_processor=True")
+        messages = [
+            [{"role": "user", "content": [{"type": "image", "image": im}, {"type": "text", "text": text}]}]
+            for im, text in zip(images_pil, texts, strict=True)
+        ]
+        rendered = [
+            self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+            for msg in messages
+        ]
+        from qwen_vl_utils import process_vision_info
+
+        image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
+        qwen_inputs = self.processor(
+            text=rendered,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
+            if key in qwen_inputs:
+                qwen_inputs[key] = qwen_inputs[key][:, : self.model_max_length]
         batch: dict[str, Any] = {
-            "input_ids": _char_tokenize(texts, max_length=self.char_max_length),
+            "input_ids": qwen_inputs["input_ids"],
             "images": images,
             "state": state,
             "state_mask": state_mask,
@@ -91,27 +105,5 @@ class KappaCollator:
             "episode_id": [x.get("episode_id") for x in items],
             "frame_idx": [x.get("frame_idx") for x in items],
         }
-        if self.processor is not None:
-            messages = [
-                [{"role": "user", "content": [{"type": "image", "image": im}, {"type": "text", "text": text}]}]
-                for im, text in zip(images_pil, texts, strict=True)
-            ]
-            from qwen_vl_utils import process_vision_info
-
-            rendered = [
-                self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-                for msg in messages
-            ]
-            image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
-            qwen_inputs = self.processor(
-                text=rendered,
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-            for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
-                if key in qwen_inputs:
-                    qwen_inputs[key] = qwen_inputs[key][:, : self.model_max_length]
-            batch["qwen_inputs"] = dict(qwen_inputs)
+        batch["qwen_inputs"] = dict(qwen_inputs)
         return batch
