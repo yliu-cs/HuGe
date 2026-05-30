@@ -147,7 +147,7 @@ Checkpoints are written under `.runs/train/<stage>/<timestamp>/step_<global_step
 as `model.safetensors` plus JSON sidecars.
 
 Training does not run validation. Use the offline evaluation script after saving
-a checkpoint when metrics are needed.
+a checkpoint when visual fit inspection is needed.
 
 ## Stage Defaults
 
@@ -227,20 +227,22 @@ scripts/train/run_kappa.sh stage1 \
 
 ## Offline Evaluation
 
-Run open-loop validation for a checkpoint:
+Generate an offline prediction-vs-ground-truth visualization for one or more
+checkpoints:
 
 ```bash
 uv run python scripts/eval/offline_compare.py \
-  --ckpt .runs/train/stage2/<run>/step_<global_step> \
-  --stage stage2 \
+  --ckpt .runs/train/stage3/20260530_103709/step_* \
+  --stage stage3 \
   --batch-size 8 \
-  --sample-stride 50 \
-  --max-val-samples 256 \
-  --output .runs/eval/stage2_metrics.json
+  --sample-stride 1 \
+  --episode-idx 123 \
+  --out-dir .runs/eval/offline_compare
 ```
 
-The evaluator reports SONIC token L2, token cosine similarity, hand accuracy,
-and out-of-bound token ratio.
+The evaluator writes one PNG per checkpoint under `--out-dir`. Each image shows
+predicted vs ground-truth SONIC dimensions (all dimensions) and hand bits. No
+metrics are computed or saved — visualization only.
 
 ## Inference Server
 
