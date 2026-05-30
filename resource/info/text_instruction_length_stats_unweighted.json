@@ -1,0 +1,633 @@
+{
+  "method": "Unweighted by frames: statistics are computed over episode/task instruction occurrences only; repeated task text in different episodes is counted once per episode, not once per sampled frame.",
+  "stage1_egodex": {
+    "count": 334991,
+    "unique_texts": 2038,
+    "chars": {
+      "min": 24,
+      "p50": 86.0,
+      "p90": 119.0,
+      "p95": 131.0,
+      "p99": 172.0,
+      "max": 238
+    },
+    "words": {
+      "min": 2,
+      "p50": 15.0,
+      "p90": 21.0,
+      "p95": 23.0,
+      "p99": 30.0,
+      "max": 45
+    },
+    "qwen_text_tokens": {
+      "min": 3,
+      "p50": 18.0,
+      "p90": 25.0,
+      "p95": 28.0,
+      "p99": 39.0,
+      "max": 57
+    },
+    "top_longest": [
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      },
+      {
+        "tokens": 57,
+        "chars": 238,
+        "words": 45,
+        "text": "Place pan on stove, add oil, crack egg into pan, fry egg, flip with spatula, and serve onto plate placed on round table, or scramble egg in bowl or cup using fork, pour into oiled pan, scramble, and serve onto plate placed on round table."
+      }
+    ]
+  },
+  "stage2_he": {
+    "count": 4064,
+    "unique_texts": 123,
+    "chars": {
+      "min": 35,
+      "p50": 127.0,
+      "p90": 209.0,
+      "p95": 226.0,
+      "p99": 260.0,
+      "max": 306
+    },
+    "words": {
+      "min": 1,
+      "p50": 27.0,
+      "p90": 45.0,
+      "p95": 48.0,
+      "p99": 56.0,
+      "max": 59
+    },
+    "qwen_text_tokens": {
+      "min": 13,
+      "p50": 28.0,
+      "p90": 47.0,
+      "p95": 50.0,
+      "p99": 58.0,
+      "max": 72
+    },
+    "top_longest": [
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      }
+    ]
+  },
+  "stage2_wbt": {
+    "count": 3656,
+    "unique_texts": 10,
+    "chars": {
+      "min": 19,
+      "p50": 43.0,
+      "p90": 59.0,
+      "p95": 63.0,
+      "p99": 63.0,
+      "max": 63
+    },
+    "words": {
+      "min": 4,
+      "p50": 10.0,
+      "p90": 11.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "qwen_text_tokens": {
+      "min": 4,
+      "p50": 10.0,
+      "p90": 11.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "top_longest": [
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      }
+    ]
+  },
+  "stage2_mixture": {
+    "count": 7720,
+    "unique_texts": 133,
+    "chars": {
+      "min": 19,
+      "p50": 72.0,
+      "p90": 184.0,
+      "p95": 210.0,
+      "p99": 259.0,
+      "max": 306
+    },
+    "words": {
+      "min": 1,
+      "p50": 15.0,
+      "p90": 38.0,
+      "p95": 45.0,
+      "p99": 53.0,
+      "max": 59
+    },
+    "qwen_text_tokens": {
+      "min": 4,
+      "p50": 16.0,
+      "p90": 40.0,
+      "p95": 47.0,
+      "p99": 56.0,
+      "max": 72
+    },
+    "top_longest": [
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 72,
+        "chars": 306,
+        "words": 59,
+        "text": "The robot walks towards a pair of stanchion kept in front of it and uses the right hand to grab on the strap of the right stanchion that is being connected to the left stanchion. After removing it from the stanchion on the left, it releases the strap and lets "
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      },
+      {
+        "tokens": 58,
+        "chars": 259,
+        "words": 56,
+        "text": "A toilet paper roll is kept in the middle of the desk infront of the robot. The robot places its left hand on the top of the toilet paper roll to hold it still and uses its right hand to tear off a piece of toilet paper from it and hands the paper to a person"
+      }
+    ]
+  },
+  "stage3_prop": {
+    "count": 388,
+    "unique_texts": 1,
+    "chars": {
+      "min": 56,
+      "p50": 56.0,
+      "p90": 56.0,
+      "p95": 56.0,
+      "p99": 56.0,
+      "max": 56
+    },
+    "words": {
+      "min": 11,
+      "p50": 11.0,
+      "p90": 11.0,
+      "p95": 11.0,
+      "p99": 11.0,
+      "max": 11
+    },
+    "qwen_text_tokens": {
+      "min": 12,
+      "p50": 12.0,
+      "p90": 12.0,
+      "p95": 12.0,
+      "p99": 12.0,
+      "max": 12
+    },
+    "top_longest": [
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      },
+      {
+        "tokens": 12,
+        "chars": 56,
+        "words": 11,
+        "text": "Walk forward, grab the cola and throw into the trash bin"
+      }
+    ]
+  },
+  "stage3_wbt_replay": {
+    "count": 3656,
+    "unique_texts": 10,
+    "chars": {
+      "min": 19,
+      "p50": 43.0,
+      "p90": 59.0,
+      "p95": 63.0,
+      "p99": 63.0,
+      "max": 63
+    },
+    "words": {
+      "min": 4,
+      "p50": 10.0,
+      "p90": 11.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "qwen_text_tokens": {
+      "min": 4,
+      "p50": 10.0,
+      "p90": 11.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "top_longest": [
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      }
+    ]
+  },
+  "stage3_mixture": {
+    "count": 4044,
+    "unique_texts": 11,
+    "chars": {
+      "min": 19,
+      "p50": 43.0,
+      "p90": 59.0,
+      "p95": 63.0,
+      "p99": 63.0,
+      "max": 63
+    },
+    "words": {
+      "min": 4,
+      "p50": 10.0,
+      "p90": 11.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "qwen_text_tokens": {
+      "min": 4,
+      "p50": 11.0,
+      "p90": 12.0,
+      "p95": 13.0,
+      "p99": 13.0,
+      "max": 13
+    },
+    "top_longest": [
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      },
+      {
+        "tokens": 13,
+        "chars": 63,
+        "words": 13,
+        "text": "Pick up the clothes from the bed and place them into the basket"
+      }
+    ]
+  }
+}

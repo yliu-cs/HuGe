@@ -1,0 +1,67 @@
+[project]
+name = "kappa"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    "deepspeed>=0.16.0",
+    "decord>=0.6.0",
+    "einops>=0.8.0",
+    "fastapi>=0.115.0",
+    "msgpack>=1.0",
+    "msgpack-numpy>=0.4.8",
+    "numpy>=1.26,<3",
+    "omegaconf>=2.3.0",
+    "onnxruntime-gpu>=1.25.0",
+    "opencv-python>=4.10.0",
+    "peft>=0.17.0",
+    "pillow>=10.0.0",
+    "polars>=1.40.1",
+    "pydantic>=2.13.3",
+    "pyyaml>=6.0.0",
+    "pyzmq>=26.0",
+    "qwen-vl-utils>=0.0.14",
+    "safetensors>=0.4.5",
+    "scipy>=1.14.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
+    "tqdm>=4.66.0",
+    "transformers>=5.5.4",
+    "tyro>=1.0.13",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=13.0",
+    "gear_sonic",
+    "lerobot==0.3.3",
+    "packaging>=26.2",
+    "psutil>=7.2.2",
+    "ninja>=1.13.0",
+    "flash-attn",
+    "mpi4py>=4.1.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kappa"]
+
+[tool.uv.sources]
+gear_sonic = { path = "GR00T-WholeBodyControl/gear_sonic", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+override-dependencies = [
+    "numpy>=1.26,<3",
+    "scipy>=1.14",
+]
