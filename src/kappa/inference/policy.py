@@ -13,6 +13,7 @@ from kappa.data.schemas import ACTION_DIM, PROPRIO_DIM, split_action_dict
 from kappa.inference.observation import assemble_proprio
 from kappa.models.qwen_sonicfm import QwenSonicFM
 from kappa.data.state_normalizer import StateNormalizer
+from kappa.data.transforms import gr00t_image_transform
 
 
 def _truncate_with_tokenizer(tokenizer: Any, text: str, max_tokens: int | None) -> str:
@@ -45,6 +46,8 @@ class KappaPolicy:
                 local_files_only=True,
             )
             self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            if hasattr(self.tokenizer, "padding_side"):
+                self.tokenizer.padding_side = "left"
 
     def _state_tensor(self, observation: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         arr, mask = assemble_proprio(observation)
@@ -125,8 +128,15 @@ class KappaPolicy:
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
-        if pil.size != (320, 224):
-            pil = pil.resize((320, 224), Image.BILINEAR)
+        target_size = tuple(getattr(self.model.config, "qwen_image_size", (256, 256)) or (256, 256))
+        crop_fraction = float(getattr(self.model.config, "image_crop_fraction", 0.95) or 0.95)
+        pil = gr00t_image_transform(
+            pil,
+            train=False,
+            target_size=target_size,  # type: ignore[arg-type]
+            crop_fraction=crop_fraction,
+            color_jitter=False,
+        )
         conv = [{
             "role": "user",
             "content": [

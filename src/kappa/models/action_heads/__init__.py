@@ -1,7 +1,8 @@
 """Action heads."""
 
 from kappa.models.action_heads.hand_binary_head import HandBinaryHead
-from kappa.models.action_heads.layerwise_cross_dit_fm import LayerwiseCrossDiTFMActionHead
-from kappa.models.action_heads.layerwise_fm import LayerwiseFMActionHead
+from kappa.models.action_heads.starvla_pi_head import StarVLAPIActionHead
 
-__all__ = ["HandBinaryHead", "LayerwiseFMActionHead", "LayerwiseCrossDiTFMActionHead"]
+LayerwiseCrossDiTFMActionHead = StarVLAPIActionHead
+
+__all__ = ["HandBinaryHead", "StarVLAPIActionHead", "LayerwiseCrossDiTFMActionHead"]

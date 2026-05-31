@@ -38,6 +38,7 @@ warnings.filterwarnings(
     module=r"torch\.nn\.modules\.transformer",
 )
 
+DEFAULT_DEEPSPEED_CONFIG = "configs/deepspeed/ds_zero2.json"
 
 @dataclass(frozen=True)
 class StageDefaults:
@@ -46,7 +47,6 @@ class StageDefaults:
     epochs: int
     sample_stride: int
     checkpointing_steps: int
-    lambda_hand: float
     weight_decay: float = 0.01
     num_workers: int = 8
     freeze_qwen: bool = True
@@ -69,61 +69,51 @@ class StageDefaults:
     max_text_tokens: int = 48
     model_max_length: int = 8192
     char_max_length: int = 256
+    action_hidden_size: int = 1024
+    num_action_layers: int = 16
+    num_attention_heads: int = 16
+    state_dropout_prob: float = 0.2
 
 
 STAGE_DEFAULTS: dict[str, StageDefaults] = {
     # Large, weakly supervised visual-language pretraining. Hand bits are
     # masked, so the hand loss weight is irrelevant but kept small.
     "stage1": StageDefaults(
-        learning_rate=7e-5,
-        batch_size=176,
+        learning_rate=1e-4,
+        batch_size=96,
         epochs=1,
         sample_stride=5,
         checkpointing_steps=10000,
-        lambda_hand=0.0,
         freeze_qwen=True,
         qwen_lora=True,
         train_qwen_lora=True,
-        warmup_ratio=0.01,
+        warmup_ratio=0.05,
         max_text_tokens=48,
     ),
     # Main whole-body posttraining on HE + WBT. Denser sampling and stronger
     # hand supervision because 66-D targets are fully available.
     "stage2": StageDefaults(
-        learning_rate=5e-5,
-        batch_size=176,
+        learning_rate=1e-4,
+        batch_size=96,
         epochs=1,
         sample_stride=2,
         checkpointing_steps=1000,
-        lambda_hand=0.5,
         freeze_qwen=True,
         qwen_lora=True,
         train_qwen_lora=True,
-        warmup_ratio=0.01,
+        warmup_ratio=0.05,
         max_text_tokens=48,
     ),
     # Real-robot adaptation. Lower LR, denser sampling, frequent checkpoints.
     "stage3": StageDefaults(
         learning_rate=2e-5,
-        batch_size=128,
+        batch_size=32,
         epochs=10,
         sample_stride=1,
-        checkpointing_steps=2000,
-        lambda_hand=1.0,
+        checkpointing_steps=10000,
         weight_decay=0.005,
         freeze_qwen=True,
-        max_text_tokens=48,
-    ),
-    "prop_ego": StageDefaults(
-        learning_rate=3e-5,
-        batch_size=256,
-        epochs=10,
-        sample_stride=1,
-        checkpointing_steps=1000,
-        lambda_hand=0.1,
-        weight_decay=0.005,
-        freeze_qwen=True,
-        save_epoch_checkpoints=True,
+        warmup_ratio=0.1,
         max_text_tokens=48,
     ),
 }
@@ -223,6 +213,10 @@ def _format_seconds(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _format_param_count(n: int) -> str:
+    return f"{n / 1_000_000_000:.3f}B/{n / 1_000_000:.1f}M"
+
+
 class TeeStream:
     def __init__(self, stream: TextIO, log_file: TextIO) -> None:
         self.stream = stream
@@ -251,15 +245,17 @@ class RunLogTee:
         self.enabled = enabled
         self._stdout = sys.stdout
         self._stderr = sys.stderr
-        self._log_file: TextIO | None = None
+        self._stdout_file: TextIO | None = None
+        self._stderr_file: TextIO | None = None
 
     def __enter__(self) -> "RunLogTee":
         if not self.enabled:
             return self
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._log_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
-        sys.stdout = TeeStream(self._stdout, self._log_file)  # type: ignore[assignment]
-        sys.stderr = TeeStream(self._stderr, self._log_file)  # type: ignore[assignment]
+        self._stdout_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
+        self._stderr_file = (self.out_dir / "train.err.log").open("a", encoding="utf-8", buffering=1)
+        sys.stdout = TeeStream(self._stdout, self._stdout_file)  # type: ignore[assignment]
+        sys.stderr = TeeStream(self._stderr, self._stderr_file)  # type: ignore[assignment]
         return self
 
     def __exit__(
@@ -268,16 +264,18 @@ class RunLogTee:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if exc_type is not None and self._log_file is not None:
-            self._log_file.write("\n")
-            traceback.print_exception(exc_type, exc, tb, file=self._log_file)
-            self._log_file.flush()
+        if exc_type is not None and self._stderr_file is not None:
+            self._stderr_file.write("\n")
+            traceback.print_exception(exc_type, exc, tb, file=self._stderr_file)
+            self._stderr_file.flush()
         sys.stdout.flush()
         sys.stderr.flush()
         sys.stdout = self._stdout
         sys.stderr = self._stderr
-        if self._log_file is not None:
-            self._log_file.close()
+        if self._stdout_file is not None:
+            self._stdout_file.close()
+        if self._stderr_file is not None:
+            self._stderr_file.close()
 
 
 def train_stage(args: argparse.Namespace) -> Path:
@@ -298,8 +296,6 @@ def train_stage(args: argparse.Namespace) -> Path:
                     zero_stage=args.zero_stage,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
                     gradient_clipping=args.max_grad_norm or 0.0,
-                    offload_optimizer_device="cpu" if args.offload_optimizer else "none",
-                    offload_param_device="cpu" if args.offload_param else "none",
                     zero3_init_flag=(args.zero_stage == 3),
                     zero3_save_16bit_model=(args.zero_stage == 3),
                 )
@@ -353,6 +349,7 @@ def train_stage(args: argparse.Namespace) -> Path:
     collator = KappaCollator(
         use_qwen_processor=args.use_qwen,
         qwen_processor_path=args.base_vlm_path,
+        image_transform_mode="train",
         max_text_tokens=args.max_text_tokens,
         model_max_length=args.model_max_length,
         char_max_length=args.char_max_length,
@@ -395,25 +392,24 @@ def train_stage(args: argparse.Namespace) -> Path:
             f"[{args.stage}] train loader has 0 batches. "
             "Reduce --batch-size, increase --max-episodes/--max-train-samples, or keep --no-drop-last."
         )
+    state_dropout_prob = 0.2 if args.state_dropout_prob is None else args.state_dropout_prob
     _log_main(
         accelerator,
         (
-            f"[{args.stage}] building model: architecture={args.architecture} base_vlm={args.base_vlm_path} use_qwen={args.use_qwen} "
+            f"[{args.stage}] building model: base_vlm={args.base_vlm_path} use_qwen={args.use_qwen} "
             f"freeze_qwen={args.freeze_qwen} qwen_lora={args.qwen_lora} "
-            f"train_qwen_lora={args.train_qwen_lora} hidden_size={args.hidden_size} action_hidden_size={args.action_hidden_size} "
-            f"num_action_layers={args.num_action_layers}"
+            f"train_qwen_lora={args.train_qwen_lora} action_hidden_size={args.action_hidden_size} "
+            f"num_action_layers={args.num_action_layers} state_dropout_prob={state_dropout_prob}"
         ),
     )
     config = QwenSonicFMConfig(
-        architecture=args.architecture,
-        hidden_size=args.hidden_size,
-        vlm_hidden_size=args.vlm_hidden_size,
-        action_hidden_size=args.action_hidden_size,
-        num_action_layers=args.num_action_layers,
+        action_hidden_size=args.action_hidden_size or 1024,
+        num_action_layers=args.num_action_layers or 16,
         num_attention_heads=args.num_attention_heads,
         action_ffn_multiplier=args.action_ffn_multiplier,
         action_dropout=args.action_dropout,
         num_future_tokens=args.num_future_tokens,
+        state_dropout_prob=state_dropout_prob,
         flow_noise_beta_alpha=args.flow_noise_beta_alpha,
         flow_noise_beta_beta=args.flow_noise_beta_beta,
         flow_noise_s=args.flow_noise_s,
@@ -434,7 +430,13 @@ def train_stage(args: argparse.Namespace) -> Path:
     model = QwenSonicFM(config).to(device)
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    _log_main(accelerator, f"[{args.stage}] trainable parameters: {trainable_params:,}/{total_params:,}")
+    _log_main(
+        accelerator,
+        (
+            f"[{args.stage}] trainable parameters: "
+            f"{_format_param_count(trainable_params)} / {_format_param_count(total_params)}"
+        ),
+    )
     if args.init_ckpt and str(args.init_ckpt).strip().lower() not in {"", "none", "null"}:
         _log_main(accelerator, f"[{args.stage}] loading init checkpoint: {args.init_ckpt}")
         _load_checkpoint_state(model, args.init_ckpt, accelerator)
@@ -454,10 +456,11 @@ def train_stage(args: argparse.Namespace) -> Path:
             qwen_processor_path=args.base_vlm_path,
             proprio_stats_path=stats,
             action_schema=ActionSchema().to_dict(),
-            architecture=args.architecture,
-            action_hidden_size=args.action_hidden_size,
-            num_action_layers=args.num_action_layers,
-            num_attention_heads=args.num_attention_heads,
+            action_hidden_size=config.action_hidden_size,
+            num_action_layers=config.num_action_layers,
+            num_attention_heads=config.num_attention_heads,
+            state_dropout_prob=state_dropout_prob,
+            image_transform="gr00t_explicit_train_random_eval_center_256",
             freeze_qwen=args.freeze_qwen,
             qwen_lora=args.qwen_lora,
             train_qwen_lora=args.train_qwen_lora,
@@ -536,7 +539,7 @@ def train_stage(args: argparse.Namespace) -> Path:
                             state_mask=batch["state_mask"],
                             qwen_inputs=batch.get("qwen_inputs"),
                         )
-                        losses = qwen_sonicfm_loss(pred, batch["normalized_actions"], sonic_mask=batch["sonic_mask"], lambda_hand=args.lambda_hand)
+                        losses = qwen_sonicfm_loss(pred, batch["normalized_actions"], sonic_mask=batch["sonic_mask"])
                     if scaler.is_enabled():
                         scaler.scale(losses["loss"]).backward()
                         scaler.unscale_(optimizer)
@@ -554,12 +557,10 @@ def train_stage(args: argparse.Namespace) -> Path:
                     global_step += 1
                     pbar.update(1)
                     current_loss = float(losses["loss"].detach())
-                    current_hand = float(losses["hand_accuracy"].detach())
                     current_lr = lr_scheduler.get_last_lr()[0]
                     pbar.set_postfix(
                         step=global_step,
                         loss=f"{current_loss:.4f}",
-                        hand=f"{current_hand:.3f}",
                         lr=f"{current_lr:.2e}",
                     )
                     if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
@@ -631,7 +632,6 @@ def _load_checkpoint_state(model: QwenSonicFM, checkpoint_path: str | Path, acce
 def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p = StageArgumentParser()
     p.add_argument("--stage", default=canonical_stage(default_stage))
-    p.add_argument("--architecture", default="pi")
     p.add_argument("--output-dir", default=".runs/train")
     p.add_argument("--device", default="auto")
     p.add_argument("--use-accelerate", action=argparse.BooleanOptionalAction, default=True)
@@ -646,12 +646,13 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--qwen-lora-dropout", type=float, default=None)
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--vlm-hidden-size", type=int, default=512)
-    p.add_argument("--action-hidden-size", type=int, default=1024)
-    p.add_argument("--num-action-layers", type=int, default=28)
-    p.add_argument("--num-attention-heads", type=int, default=16)
+    p.add_argument("--action-hidden-size", type=int, default=None)
+    p.add_argument("--num-action-layers", type=int, default=None)
+    p.add_argument("--num-attention-heads", type=int, default=None)
     p.add_argument("--action-ffn-multiplier", type=int, default=4)
     p.add_argument("--action-dropout", type=float, default=0.1)
     p.add_argument("--num-future-tokens", type=int, default=32)
+    p.add_argument("--state-dropout-prob", type=float, default=None)
     p.add_argument("--flow-noise-beta-alpha", type=float, default=1.5)
     p.add_argument("--flow-noise-beta-beta", type=float, default=1.0)
     p.add_argument("--flow-noise-s", type=float, default=0.999)
@@ -669,7 +670,6 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--learning-rate", type=float, default=None)
     p.add_argument("--weight-decay", type=float, default=None)
-    p.add_argument("--lambda-hand", type=float, default=None)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--mixed-precision", choices=["no", "bf16", "fp16"], default="bf16")
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -687,10 +687,8 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=None)
     p.add_argument("--use-deepspeed", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--deepspeed-config", default=None)
+    p.add_argument("--deepspeed-config", default=DEFAULT_DEEPSPEED_CONFIG)
     p.add_argument("--zero-stage", type=int, default=None)
-    p.add_argument("--offload-optimizer", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--offload-param", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--log-every-steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=7)
     return p

@@ -14,7 +14,7 @@ def build_checkpoint_metadata(**overrides: Any) -> dict[str, Any]:
         **ActionSchema().to_dict(),
         "proprio_layout": PROPRIO_LAYOUT_VERSION,
         "proprio_dim": PROPRIO_DIM,
-        "image_transform": "resize_short_224_center_crop_224x320",
+        "image_transform": "gr00t_explicit_train_random_eval_center_256",
         "server_protocol": "kappa_policy_server_msgpack_numpy",
     }
     meta.update({k: v for k, v in overrides.items() if v is not None})

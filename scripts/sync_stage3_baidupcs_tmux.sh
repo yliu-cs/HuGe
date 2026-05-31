@@ -4,10 +4,10 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-WATCH_DIR="${WATCH_DIR:-${REPO_ROOT}/.runs/train/stage3/20260530_103709}"
+WATCH_DIR="${WATCH_DIR:-${REPO_ROOT}/.runs/train/stage3/20260531_075320}"
 BAIDUPCS_BIN="${BAIDUPCS_BIN:-/inspire/qb-ilm2/project/robot-body/liujiacheng-240108120088/liuyang/Tools/BaiduPCS/BaiduPCS-Go}"
 REMOTE_DIR="${BAIDU_REMOTE_DIR:-/Kappa/.runs/train/stage3}"
-SESSION="${TMUX_SESSION:-baidu_sync_stage3_20260530_103709}"
+SESSION="${TMUX_SESSION:-baidu_sync_stage3}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/.runs/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/${SESSION}.log}"
 LOCK_FILE="${LOCK_FILE:-${LOG_DIR}/${SESSION}.lock}"
@@ -136,8 +136,8 @@ run_watcher() {
   trap 'rm -f "${current_state}" "${diff_state}"' EXIT
   mkdir -p "$(dirname -- "${STATE_FILE}")"
   if [[ ! -s "${STATE_FILE}" ]]; then
-    file_list >"${STATE_FILE}" || true
-    log "state baseline initialized from existing non-log files"
+    : >"${STATE_FILE}"
+    log "state baseline initialized empty; existing non-log files will upload"
   fi
 
   while true; do

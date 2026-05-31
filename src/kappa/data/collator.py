@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 
 from kappa.data.schemas import ACTION_DIM, PROPRIO_DIM
+from kappa.data.transforms import gr00t_image_transform
 from kappa.data.video_reader import decode_video_frame, image_to_float_array
 
 
@@ -33,12 +34,20 @@ class KappaCollator:
         qwen_processor_path: str | Path = "resource/model/Qwen3-VL-2B-Instruct",
         use_qwen_processor: bool = False,
         image_size: tuple[int, int] = (224, 320),
+        qwen_image_size: tuple[int, int] = (256, 256),
+        image_transform_mode: str = "train",
+        image_crop_fraction: float = 0.95,
+        image_color_jitter: bool = True,
         model_max_length: int = 8192,
         max_text_tokens: int | None = None,
         char_max_length: int = 256,
     ) -> None:
         self.use_qwen_processor = use_qwen_processor
         self.image_size = image_size
+        self.qwen_image_size = qwen_image_size
+        self.image_transform_mode = image_transform_mode
+        self.image_crop_fraction = image_crop_fraction
+        self.image_color_jitter = image_color_jitter
         self.model_max_length = model_max_length
         self.max_text_tokens = max_text_tokens
         self.char_max_length = char_max_length
@@ -49,6 +58,8 @@ class KappaCollator:
 
             self.processor = AutoProcessor.from_pretrained(qwen_processor_path, local_files_only=True)
             self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            if hasattr(self.tokenizer, "padding_side"):
+                self.tokenizer.padding_side = "left"
 
     def _image(self, item: dict[str, Any]) -> Image.Image:
         image = item.get("image")
@@ -58,11 +69,25 @@ class KappaCollator:
             return Image.fromarray(image.astype(np.uint8))
         return decode_video_frame(item.get("video_path"), int(item.get("video_frame_idx") or 0), output_size=self.image_size)
 
+    def _qwen_image(self, image: Image.Image) -> Image.Image:
+        mode = self.image_transform_mode.lower()
+        if mode in {"none", "off", "disabled"}:
+            return image.convert("RGB")
+        if mode not in {"train", "eval"}:
+            raise ValueError(f"unknown image_transform_mode {self.image_transform_mode!r}")
+        return gr00t_image_transform(
+            image,
+            train=mode == "train",
+            target_size=self.qwen_image_size,
+            crop_fraction=self.image_crop_fraction,
+            color_jitter=self.image_color_jitter,
+        )
+
     def __call__(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         texts = [str(x.get("language") or x.get("text") or "perform the task") for x in items]
         if self.tokenizer is not None:
             texts = [_truncate_with_tokenizer(self.tokenizer, text, self.max_text_tokens) for text in texts]
-        images_pil = [self._image(x) for x in items]
+        images_pil = [self._qwen_image(self._image(x)) for x in items]
         images = torch.from_numpy(np.stack([image_to_float_array(im) for im in images_pil], axis=0))
         actions = torch.from_numpy(np.stack([np.asarray(x["normalized_actions"], dtype=np.float32) for x in items], axis=0))
         sonic_mask = torch.from_numpy(np.stack([np.asarray(x["sonic_mask"], dtype=np.float32) for x in items], axis=0))
@@ -71,7 +96,7 @@ class KappaCollator:
         if actions.shape[-1] != ACTION_DIM:
             raise ValueError(f"action dim {actions.shape[-1]} != {ACTION_DIM}")
         if self.processor is None:
-            raise ValueError("Kappa PI/lite training requires use_qwen_processor=True")
+            raise ValueError("Kappa PI training requires use_qwen_processor=True")
         messages = [
             [{"role": "user", "content": [{"type": "image", "image": im}, {"type": "text", "text": text}]}]
             for im, text in zip(images_pil, texts, strict=True)

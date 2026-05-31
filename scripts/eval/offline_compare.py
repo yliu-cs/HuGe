@@ -109,11 +109,11 @@ def _episode_span(dataset: Any, episode_idx: int) -> tuple[int, int]:
     return int(start), int(length)
 
 
-def _plot_starts(length: int, horizon: int, explicit: list[int] | None, max_windows: int) -> list[int]:
+def _plot_starts(length: int, stride: int, explicit: list[int] | None, max_windows: int) -> list[int]:
     if explicit:
         starts = sorted(set(t for t in explicit if 0 <= t < length))
     else:
-        starts = list(range(0, length, horizon))
+        starts = list(range(0, length, stride))
     if max_windows > 0:
         starts = starts[:max_windows]
     if not starts:
@@ -178,13 +178,18 @@ def _run_visualization(
     episode_idx: int,
     timesteps: list[int] | None,
     max_plot_windows: int,
+    chunk_keep_steps: int | None,
     batch_size: int,
     num_inference_steps: int | None,
     out_path: Path,
     title_prefix: str,
 ) -> Path:
     ep_start, ep_len = _episode_span(dataset, episode_idx)
-    starts = _plot_starts(ep_len, model.config.action_horizon, timesteps, max_plot_windows)
+    horizon = int(model.config.action_horizon)
+    keep_steps = horizon if chunk_keep_steps is None else int(chunk_keep_steps)
+    if keep_steps <= 0 or keep_steps > horizon:
+        raise ValueError(f"chunk_keep_steps must be in [1, {horizon}], got {keep_steps}")
+    starts = _plot_starts(ep_len, keep_steps, timesteps, max_plot_windows)
     pred_full = np.full((ep_len, ACTION_DIM), np.nan, dtype=np.float32)
     gt_full = np.full((ep_len, ACTION_DIM), np.nan, dtype=np.float32)
 
@@ -205,7 +210,7 @@ def _run_visualization(
             valid_rows = np.flatnonzero(mask_i.mean(axis=-1) > 0)
             if len(valid_rows) == 0:
                 continue
-            valid = min(int(valid_rows[-1]) + 1, ep_len - local)
+            valid = min(int(valid_rows[-1]) + 1, keep_steps, ep_len - local)
             pred_full[local : local + valid] = pred_i[:valid]
             gt_full[local : local + valid] = target_i[:valid]
 
@@ -216,7 +221,10 @@ def _run_visualization(
         gt_full=gt_full,
         starts=starts,
         motion_dims=dims,
-        title=f"{title_prefix} episode={episode_idx} windows={len(starts)} dims=all({MOTION_TOKEN_DIM})",
+        title=(
+            f"{title_prefix} episode={episode_idx} windows={len(starts)} "
+            f"keep={keep_steps}/{horizon} dims=all({MOTION_TOKEN_DIM})"
+        ),
     )
     return out_path
 
@@ -236,6 +244,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-idx", type=int, default=0)
     parser.add_argument("--timesteps", nargs="*", type=int, default=None, help="episode-local sample starts for plots")
     parser.add_argument("--max-plot-windows", type=int, default=64, help="<=0 means no limit")
+    parser.add_argument(
+        "--chunk-keep-steps",
+        type=int,
+        default=None,
+        help="keep only the first N actions from each predicted chunk when stitching plots; default keeps full horizon",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--use-qwen-processor", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
@@ -275,6 +289,7 @@ def main() -> None:
             episode_idx=args.episode_idx,
             timesteps=args.timesteps,
             max_plot_windows=args.max_plot_windows,
+            chunk_keep_steps=args.chunk_keep_steps,
             batch_size=args.batch_size,
             num_inference_steps=args.num_inference_steps,
             out_path=png_path,

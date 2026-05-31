@@ -2,29 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
-from kappa.data.schemas import ACTION_DIM, ACTION_HORIZON, MOTION_TOKEN_DIM, PROPRIO_DIM
-from kappa.models.action_heads.layerwise_cross_dit_fm import LayerwiseCrossDiTFMActionHead
-from kappa.models.action_heads.layerwise_fm import LayerwiseFMActionHead
+from kappa.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM
+from kappa.models.action_heads.starvla_pi_head import StarVLAPIActionHead
 
 
 @dataclass
 class QwenSonicFMConfig:
-    architecture: str = "lite"
-    hidden_size: int = 512
-    vlm_hidden_size: int = 512
     action_hidden_size: int = 1024
-    num_action_layers: int = 28
-    num_attention_heads: int = 16
+    num_action_layers: int = 16
+    num_attention_heads: int | None = None
     action_ffn_multiplier: int = 4
     action_dropout: float = 0.1
     num_future_tokens: int = 32
+    state_dropout_prob: float = 0.2
+    num_timestep_buckets: int = 1000
     flow_noise_beta_alpha: float = 1.5
     flow_noise_beta_beta: float = 1.0
     flow_noise_s: float = 0.999
@@ -44,6 +42,9 @@ class QwenSonicFMConfig:
     max_text_tokens: int | None = 48
     model_max_length: int = 8192
     char_max_length: int = 256
+    qwen_image_size: tuple[int, int] = (256, 256)
+    image_crop_fraction: float = 0.95
+    image_color_jitter: bool = True
 
 
 class QwenSonicFM(nn.Module):
@@ -53,39 +54,8 @@ class QwenSonicFM(nn.Module):
         self.qwen = None
         if not self.config.use_qwen:
             raise ValueError("Kappa now requires use_qwen=True; char-token fallback has been removed")
-        self.vlm_projectors = nn.ModuleList()
-        if self.config.architecture == "pi":
-            self.state_encoder = None
-            self.qwen_proj = None
-            self.action_head = LayerwiseCrossDiTFMActionHead(
-                hidden_size=self.config.action_hidden_size,
-                action_dim=self.config.action_dim,
-                state_dim=self.config.state_dim,
-                action_horizon=self.config.action_horizon,
-                num_layers=self.config.num_action_layers,
-                num_heads=self.config.num_attention_heads,
-                ffn_multiplier=self.config.action_ffn_multiplier,
-                dropout=self.config.action_dropout,
-                num_future_tokens=self.config.num_future_tokens,
-                num_inference_steps=self.config.num_inference_steps,
-                noise_beta_alpha=self.config.flow_noise_beta_alpha,
-                noise_beta_beta=self.config.flow_noise_beta_beta,
-                noise_s=self.config.flow_noise_s,
-            )
-        elif self.config.architecture == "lite":
-            self.state_encoder = nn.Sequential(
-                nn.Linear(self.config.state_dim, self.config.vlm_hidden_size),
-                nn.GELU(),
-                nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size),
-            )
-            self.qwen_proj = nn.Linear(self.config.vlm_hidden_size, self.config.vlm_hidden_size)
-            self.action_head = LayerwiseFMActionHead(
-                hidden_size=self.config.hidden_size,
-                condition_size=self.config.vlm_hidden_size,
-                action_horizon=self.config.action_horizon,
-            )
-        else:
-            raise ValueError(f"unknown architecture {self.config.architecture!r}")
+        self.action_head: StarVLAPIActionHead | None = None
+        self.vlm_projector = nn.Identity()
         self._load_qwen()
 
     def _load_qwen(self) -> None:
@@ -108,13 +78,15 @@ class QwenSonicFM(nn.Module):
                 last_err = exc
         if self.qwen is None:
             raise RuntimeError("failed to load Qwen3VL with flash-attn/sdpa fallback") from last_err
-        text_config = getattr(self.qwen.config, "text_config", None)
-        hidden = int(
-            getattr(self.qwen.config, "hidden_size", None)
-            or getattr(text_config, "hidden_size", None)
-            or self.config.vlm_hidden_size
-        )
-        self._init_vlm_adapters(hidden)
+        text_config = getattr(self.qwen.config, "text_config", self.qwen.config)
+        hidden = getattr(self.qwen.config, "hidden_size", None) or getattr(text_config, "hidden_size", None)
+        if hidden is None:
+            raise ValueError("loaded Qwen model does not expose hidden_size")
+        hidden = int(hidden)
+        num_vl_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_vl_layers is None:
+            raise ValueError("loaded Qwen model does not expose text_config.num_hidden_layers")
+        self._init_action_structure(hidden, int(num_vl_layers))
         if self.config.train_qwen_lora and not self.config.qwen_lora:
             raise ValueError("train_qwen_lora requires qwen_lora")
         if self.config.qwen_lora:
@@ -146,52 +118,50 @@ class QwenSonicFM(nn.Module):
             for p in self.qwen.parameters():
                 p.requires_grad_(False)
 
-    def _init_vlm_adapters(self, qwen_hidden_size: int) -> None:
-        self.qwen_proj = nn.Linear(qwen_hidden_size, self.config.vlm_hidden_size)
-        if self.config.architecture == "pi":
-            self.vlm_projectors = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.LayerNorm(qwen_hidden_size),
-                        nn.Linear(qwen_hidden_size, self.config.action_hidden_size),
-                    )
-                    for _ in range(self.config.num_action_layers)
-                ]
+    def _init_action_structure(self, qwen_hidden_size: int, num_vl_layers: int) -> None:
+        action_hidden_size = int(self.config.action_hidden_size or 1024)
+        num_action_layers = int(self.config.num_action_layers or 16)
+        if action_hidden_size % 64 != 0:
+            raise ValueError(f"action_hidden_size {action_hidden_size} is not divisible by 64")
+        num_heads = int(self.config.num_attention_heads or (action_hidden_size // 64))
+        if num_action_layers <= 0:
+            raise ValueError(f"num_action_layers must be positive, got {num_action_layers}")
+        if num_action_layers > num_vl_layers:
+            raise ValueError(
+                f"num_action_layers={num_action_layers} exceeds available VLM layers {num_vl_layers}"
             )
+        if action_hidden_size % num_heads != 0:
+            raise ValueError(f"action_hidden_size {action_hidden_size} must be divisible by num_heads {num_heads}")
+        self.config.action_hidden_size = action_hidden_size
+        self.config.num_action_layers = num_action_layers
+        self.config.num_attention_heads = num_heads
+        self.vlm_projector = (
+            nn.Identity()
+            if qwen_hidden_size == action_hidden_size
+            else nn.Sequential(
+                nn.LayerNorm(qwen_hidden_size),
+                nn.Linear(qwen_hidden_size, action_hidden_size),
+            )
+        )
+        self.action_head = StarVLAPIActionHead(
+            hidden_size=action_hidden_size,
+            action_dim=self.config.action_dim,
+            state_dim=self.config.state_dim,
+            action_horizon=self.config.action_horizon,
+            num_layers=num_action_layers,
+            num_heads=num_heads,
+            ffn_multiplier=self.config.action_ffn_multiplier,
+            dropout=self.config.action_dropout,
+            num_timestep_buckets=self.config.num_timestep_buckets,
+            num_inference_steps=self.config.num_inference_steps,
+            noise_beta_alpha=self.config.flow_noise_beta_alpha,
+            noise_beta_beta=self.config.flow_noise_beta_beta,
+            noise_s=self.config.flow_noise_s,
+            state_dropout_prob=self.config.state_dropout_prob,
+        )
 
     def _qwen_grad_enabled(self) -> bool:
         return self.training and (self.config.train_qwen_lora or not self.config.freeze_qwen)
-
-    def encode_latent(
-        self,
-        *,
-        state: torch.Tensor | None = None,
-        state_mask: torch.Tensor | None = None,
-        qwen_inputs: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        pieces: list[torch.Tensor] = []
-        if self.qwen is not None and qwen_inputs is not None:
-            qwen_inputs = {k: v.to(next(self.qwen.parameters()).device) if torch.is_tensor(v) else v for k, v in qwen_inputs.items()}
-            with torch.set_grad_enabled(self._qwen_grad_enabled()):
-                out = self.qwen(**qwen_inputs, output_hidden_states=True, return_dict=True)
-            hidden = out.hidden_states[-1]
-            mask = qwen_inputs.get("attention_mask")
-            if mask is not None:
-                denom = mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
-                pooled = (hidden * mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1) / denom
-            else:
-                pooled = hidden.mean(dim=1)
-            pieces.append(self.qwen_proj(pooled.to(self.qwen_proj.weight.dtype)))
-        else:
-            raise ValueError("qwen_inputs are required; char-token fallback has been removed")
-        if state is not None:
-            state_feat = self.state_encoder(state.to(self.state_encoder[0].weight.dtype))
-            if state_mask is not None:
-                state_feat = state_feat * state_mask.reshape(state_feat.shape[0], -1).to(state_feat.dtype)[:, :1]
-            pieces.append(state_feat)
-        if not pieces:
-            raise ValueError("encode_latent needs at least one of input_ids, images, or state")
-        return torch.stack(pieces, dim=0).sum(dim=0)
 
     def encode_vlm_layers(
         self,
@@ -199,36 +169,29 @@ class QwenSonicFM(nn.Module):
         qwen_inputs: dict[str, torch.Tensor] | None,
     ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
         if qwen_inputs is None:
-            raise ValueError("PI architecture requires qwen_inputs from the Qwen processor")
+            raise ValueError("Kappa PI requires qwen_inputs from the Qwen processor")
         if self.qwen is None:
-            raise RuntimeError("PI architecture requires a loaded Qwen model")
-        if len(self.vlm_projectors) != self.config.num_action_layers:
-            raise RuntimeError("VLM projectors are not initialized")
+            raise RuntimeError("Kappa PI requires a loaded Qwen model")
         qwen_inputs = {k: v.to(next(self.qwen.parameters()).device) if torch.is_tensor(v) else v for k, v in qwen_inputs.items()}
         with torch.set_grad_enabled(self._qwen_grad_enabled()):
             out = self.qwen(**qwen_inputs, output_hidden_states=True, return_dict=True)
         hidden_states = list(out.hidden_states)
-        if len(hidden_states) < self.config.num_action_layers:
+        num_action_layers = int(self.config.num_action_layers or 0)
+        if len(hidden_states) < num_action_layers:
             raise ValueError(
-                f"num_action_layers={self.config.num_action_layers} exceeds available hidden states {len(hidden_states)}"
+                f"num_action_layers={num_action_layers} exceeds available hidden states {len(hidden_states)}"
             )
-        selected = hidden_states[-self.config.num_action_layers:]
-        projected = [
-            projector(hidden.to(next(projector.parameters()).dtype))
-            for projector, hidden in zip(self.vlm_projectors, selected, strict=True)
-        ]
+        selected = hidden_states[-num_action_layers:]
         attention_mask = qwen_inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, : projected[0].shape[1]]
-        return projected, attention_mask
+        if attention_mask is not None and selected:
+            attention_mask = attention_mask[:, : selected[0].shape[1]]
+        return selected, attention_mask
 
-    def denoise_step(
-        self,
-        noisy_action: torch.Tensor,
-        t: torch.Tensor,
-        condition: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.action_head(noisy_action[..., :MOTION_TOKEN_DIM], t, condition)
+    def _project_vlm_layers(self, vl_embs_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        if isinstance(self.vlm_projector, nn.Identity):
+            return vl_embs_list
+        target_dtype = next(self.vlm_projector.parameters()).dtype
+        return [self.vlm_projector(h.to(dtype=target_dtype)) for h in vl_embs_list]
 
     def forward(
         self,
@@ -243,33 +206,19 @@ class QwenSonicFM(nn.Module):
         t: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         del input_ids, images
-        if self.config.architecture == "pi":
-            vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
-            return self.action_head(
-                vl_embs_list=vl_embs_list,
-                actions=normalized_actions.to(vl_embs_list[0].dtype),
-                state=state,
-                state_mask=state_mask,
-                encoder_attention_mask=attention_mask,
-                noise=noise,
-                t=t,
-            )
-        condition = self.encode_latent(state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
-        action_dtype = self.action_head.action_embed.weight.dtype
-        motion = normalized_actions[..., :MOTION_TOKEN_DIM].to(action_dtype)
-        if noise is None:
-            noise = torch.randn_like(motion)
-        else:
-            noise = noise.to(dtype=motion.dtype, device=motion.device)
-        if t is None:
-            t = torch.rand((motion.shape[0],), device=motion.device, dtype=motion.dtype)
-        else:
-            t = t.to(dtype=motion.dtype, device=motion.device)
-        noisy = t.reshape(-1, 1, 1) * noise + (1.0 - t.reshape(-1, 1, 1)) * motion
-        pred = self.denoise_step(noisy, t, condition)
-        pred["target_velocity"] = noise - motion
-        pred["target_hand"] = normalized_actions[..., MOTION_TOKEN_DIM:ACTION_DIM]
-        return pred
+        vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
+        vl_embs_list = self._project_vlm_layers(vl_embs_list)
+        if self.action_head is None:
+            raise RuntimeError("PI action head is not initialized")
+        return self.action_head(
+            vl_embs_list=vl_embs_list,
+            actions=normalized_actions.to(vl_embs_list[0].dtype),
+            state=state,
+            state_mask=state_mask,
+            encoder_attention_mask=attention_mask,
+            noise=noise,
+            t=t,
+        )
 
     @torch.no_grad()
     def predict_action(
@@ -284,19 +233,15 @@ class QwenSonicFM(nn.Module):
         num_inference_steps: int | None = None,
     ) -> torch.Tensor:
         del input_ids, images
-        if self.config.architecture == "pi":
-            vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
-            return self.action_head.predict(
-                vl_embs_list=vl_embs_list,
-                state=state,
-                state_mask=state_mask,
-                encoder_attention_mask=attention_mask,
-                horizon=horizon or self.config.action_horizon,
-                num_inference_steps=num_inference_steps or self.config.num_inference_steps,
-            )
-        condition = self.encode_latent(state=state, state_mask=state_mask, qwen_inputs=qwen_inputs)
+        vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
+        vl_embs_list = self._project_vlm_layers(vl_embs_list)
+        if self.action_head is None:
+            raise RuntimeError("PI action head is not initialized")
         return self.action_head.predict(
-            condition,
+            vl_embs_list=vl_embs_list,
+            state=state,
+            state_mask=state_mask,
+            encoder_attention_mask=attention_mask,
             horizon=horizon or self.config.action_horizon,
             num_inference_steps=num_inference_steps or self.config.num_inference_steps,
         )
@@ -317,7 +262,16 @@ class QwenSonicFM(nn.Module):
         if state_dict is None:
             save_model(self, str(dst / "model.safetensors"))
         else:
-            tensors = {k: v.detach().cpu().contiguous() for k, v in state_dict.items() if torch.is_tensor(v)}
+            tensors: dict[str, torch.Tensor] = {}
+            seen_storage_ptrs: set[int] = set()
+            for k, v in state_dict.items():
+                if not torch.is_tensor(v):
+                    continue
+                storage_ptr = v.untyped_storage().data_ptr()
+                if storage_ptr in seen_storage_ptrs:
+                    continue
+                seen_storage_ptrs.add(storage_ptr)
+                tensors[k] = v.detach().cpu().contiguous()
             save_file(tensors, str(dst / "model.safetensors"))
         (dst / "config.json").write_text(
             json.dumps({"config": asdict(self.config), "metadata": metadata or {}}, indent=2),
@@ -335,7 +289,9 @@ class QwenSonicFM(nn.Module):
             ckpt_path = ckpt_path / "model.safetensors"
         config_path = ckpt_path.parent / "config.json"
         payload = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
-        config = QwenSonicFMConfig(**payload.get("config", {}))
+        config_raw = payload.get("config", {})
+        allowed_keys = {field.name for field in fields(QwenSonicFMConfig)}
+        config = QwenSonicFMConfig(**{k: v for k, v in config_raw.items() if k in allowed_keys})
         model = cls(config)
         load_model(model, str(ckpt_path), strict=False, device=str(map_location))
         return model

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import random
 import tempfile
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from scipy.spatial.transform import Rotation as Rotation
 
 
@@ -95,3 +96,73 @@ def resize_short_center_crop(image: Image.Image, short_side: int = 224, size: tu
     left = max((new_w - width) // 2, 0)
     top = max((new_h - height) // 2, 0)
     return resized.crop((left, top, left + width, top + height))
+
+
+def _pad_to_square(image: Image.Image, fill: int = 0) -> Image.Image:
+    image = image.convert("RGB")
+    w, h = image.size
+    if w == h:
+        return image
+    side = max(w, h)
+    pad_left = (side - w) // 2
+    pad_top = (side - h) // 2
+    pad_right = side - w - pad_left
+    pad_bottom = side - h - pad_top
+    return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
+
+
+def _fractional_crop(image: Image.Image, crop_fraction: float, *, random_crop: bool) -> Image.Image:
+    crop_fraction = float(crop_fraction)
+    if crop_fraction <= 0.0 or crop_fraction >= 1.0:
+        return image
+    w, h = image.size
+    crop_w = max(1, int(round(w * crop_fraction)))
+    crop_h = max(1, int(round(h * crop_fraction)))
+    if random_crop:
+        left = random.randint(0, max(w - crop_w, 0))
+        top = random.randint(0, max(h - crop_h, 0))
+    else:
+        left = max((w - crop_w) // 2, 0)
+        top = max((h - crop_h) // 2, 0)
+    return image.crop((left, top, left + crop_w, top + crop_h))
+
+
+def _jitter_factor(amount: float) -> float:
+    amount = max(float(amount), 0.0)
+    return random.uniform(max(0.0, 1.0 - amount), 1.0 + amount)
+
+
+def _apply_color_jitter(
+    image: Image.Image,
+    *,
+    brightness: float = 0.3,
+    contrast: float = 0.4,
+    saturation: float = 0.5,
+) -> Image.Image:
+    image = ImageEnhance.Brightness(image).enhance(_jitter_factor(brightness))
+    image = ImageEnhance.Contrast(image).enhance(_jitter_factor(contrast))
+    image = ImageEnhance.Color(image).enhance(_jitter_factor(saturation))
+    return image
+
+
+def gr00t_image_transform(
+    image: Image.Image,
+    *,
+    train: bool,
+    target_size: tuple[int, int] = (256, 256),
+    crop_fraction: float = 0.95,
+    color_jitter: bool = True,
+) -> Image.Image:
+    """GR00T-style single-view image preprocessing for Kappa.
+
+    The transform keeps the policy-side contract simple:
+    train uses random fractional crop and color jitter, while eval uses the
+    same geometry with a deterministic center crop and no jitter.
+    """
+    image = _pad_to_square(image)
+    image = image.resize(target_size, Image.Resampling.BICUBIC)
+    image = _fractional_crop(image, crop_fraction, random_crop=train)
+    image = image.resize(target_size, Image.Resampling.BICUBIC)
+    if train and color_jitter:
+        image = _apply_color_jitter(image)
+    return image
