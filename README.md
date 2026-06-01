@@ -215,13 +215,15 @@ Visualize predictions vs ground truth for one or more checkpoints:
 
 ```bash
 uv run python scripts/eval/offline_compare.py \
-  --ckpt .runs/train/stage3/20260531_075320/step_* \
+  --ckpt .runs/train/stage3/20260601_031338/step_* \
   --stage stage3 \
+  --proprio-stats-path .runs/train/stage3/20260601_031338/step_45170/proprio_stats_sonic.json \
+  --prop-roots resource/dataset/proprietary/real/2026-05-28 \
   --num-inference-steps 4 \
   --batch-size 8 \
   --sample-stride 1 \
   --chunk-keep-steps 50 \
-  --episode-idx 123 \
+  --episode-idx 3 \
   --out-dir .runs/eval/offline_compare
 ```
 
@@ -241,15 +243,20 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 uv run python src/kappa/inference/run_kappa_server.py \
-  --ckpt .runs/train/stage2/<run>/step_<global_step> \
+  --ckpt .runs/train/stage3/20260531_075320/step_2000 \
   --host 0.0.0.0 \
   --port 5550 \
   --device cuda \
-  --action-horizon 50
+  --action-horizon 50 \
+  --log-dir .runs/deploy_log/$(date +%Y%m%d_%H%M%S)
 ```
 
-Exposes a ZMQ request/reply endpoint on `tcp://<host>:<port>`. Use
-`--closed-loop-enable` to also publish SONIC actions on `--sonic-pub-bind`.
+The server exposes a ZMQ request/reply endpoint on `tcp://<host>:<port>`. Use
+`--closed-loop-enable` to also publish SONIC actions on `--sonic-pub-bind`
+for closed-loop integration.
+When `--log-dir` is set, each `get_action` call is stored as
+`calls/call_<idx>.msgpack`, with a JSONL manifest for fast filtering and an
+optional JPEG preview for the first image frame.
 
 ## Deployment Notes
 
@@ -261,8 +268,7 @@ and the proprio normalizer copied into each checkpoint directory.
 ```bash
 # Terminal 1: Kappa server
 uv run python src/kappa/inference/run_kappa_server.py \
-  --ckpt .runs/train/stage3/<run>/step_<global_step> \
-  --host 0.0.0.0 \
+  --ckpt .runs/train/stage3/20260530_144739/step_3525 \
   --port 5550 \
   --device cuda
 
@@ -272,13 +278,20 @@ cd GR00T-WholeBodyControl/gear_sonic_deploy
 
 # Terminal 3: VLA inference client
 cd GR00T-WholeBodyControl
+source .venv_inference/bin/activate
 python gear_sonic/scripts/run_vla_inference.py \
   --host localhost \
   --port 5550 \
-  --embodiment-tag NEW_EMBODIMENT \
-  --prompt "Grab the cola, turn left, throw into the trash bin" \
+  --embodiment-tag unitree_g1_sonic \
+  --prompt "Walk forward, grab the cola and throw into the trash bin" \
   --action-publish-rate 50 \
-  --action-horizon 50
+  --action-horizon 50 \
+  --camera-host 192.168.123.164 \
+  --camera-port 5555
+
+# Terminal 4: Keyboard publisher
+cd GR00T-WholeBodyControl
+python keyboard_pub.py
 ```
 
 ## Acknowledgment

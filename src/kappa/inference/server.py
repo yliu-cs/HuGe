@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import threading
 import time
@@ -16,6 +17,7 @@ import zmq
 
 from kappa.data.schemas import ACTION_HORIZON, ACTION_DIM, ActionSchema, combine_action_dict
 from kappa.data.state_normalizer import StateNormalizer
+from kappa.inference.deploy_logger import DeployCallLogger
 from kappa.inference.policy import KappaPolicy
 from kappa.inference.sonic_adapter import SonicAdapter
 from kappa.models.qwen_sonicfm import QwenSonicFM
@@ -167,11 +169,12 @@ class KappaPolicyServer:
         self.port = int(port)
         self._running = False
         self.log_dir = Path(log_dir) if log_dir else None
+        self.logger = DeployCallLogger(self.log_dir) if self.log_dir else None
+        if self.log_dir is not None:
+            print(f"Kappa deploy logger writing to {self.log_dir}")
         self.call_idx = 0
         self.publisher = publisher
         self.state_tap = state_tap
-        if self.log_dir:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         endpoint = request.get("endpoint") or request.get("cmd") or request.get("type")
@@ -188,10 +191,10 @@ class KappaPolicyServer:
             data = request.get("data", {})
             observation = data.get("observation", request.get("observation", request.get("data", {}))) if isinstance(data, dict) else {}
             self._merge_state_tap(observation)
-            action = self.policy.get_action(observation)
+            action, trace = self.policy.get_action_with_trace(observation)
             if self.publisher is not None:
                 self.publisher.set_action_dict(action)
-            self._log_call(observation, action)
+            self._log_call(request, observation, action, trace)
             return (action, {}) if groot_style else {"ok": True, "action": action}
         if endpoint == "kill":
             self._running = False
@@ -205,22 +208,46 @@ class KappaPolicyServer:
         if quat is None:
             return
         state = observation.setdefault("state", {})
-        if isinstance(state, dict) and "base_quat" not in state:
-            state["base_quat"] = quat
-
-    def _log_call(self, observation: dict[str, Any], action: dict[str, Any]) -> None:
-        if self.log_dir is None:
+        if not isinstance(state, dict):
             return
-        row = {
-            "time": time.time(),
-            "call_idx": self.call_idx,
-            "prompt": observation.get("language", observation.get("task")),
-            "action_motion_shape": list(action["action.motion_token"].shape),
-            "action_hand_shape": list(action["action.hand_binary"].shape),
-        }
-        with (self.log_dir / "manifest.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        # The C++ deploy stream is the authoritative base-orientation source, so
+        # write it onto the nested path assemble_proprio actually reads and drop any
+        # client-supplied projected_gravity that would otherwise shadow it.
+        state["base_quat"] = quat
+        state.pop("projected_gravity", None)
+        observation.pop("base_quat", None)
+        observation.pop("state.base_quat", None)
+        observation.pop("state.projected_gravity", None)
+
+    def _log_call(self, request: dict[str, Any], observation: dict[str, Any], action: dict[str, Any], trace: Any) -> None:
+        if self.logger is None:
+            return
+        call_idx = self.call_idx
         self.call_idx += 1
+        try:
+            record = {
+                "time": time.time(),
+                "call_idx": call_idx,
+                "request": copy.deepcopy(request),
+                "observation": copy.deepcopy(observation),
+                "model_inputs": {
+                    "prompt": trace.prompt,
+                    "input_ids": trace.input_ids,
+                    "image": trace.image,
+                    "state_raw": trace.state_raw,
+                    "state": trace.state,
+                    "state_mask": trace.state_mask,
+                    "qwen_inputs": trace.qwen_inputs,
+                    "qwen_text": trace.qwen_text,
+                },
+                "model_output": {
+                    "action": action,
+                    "action_array": trace.action_array,
+                },
+            }
+            self.logger.log(call_idx=call_idx, record=record)
+        except Exception as exc:
+            print(f"Kappa deploy logging failed for call {call_idx}: {exc!r}")
 
     def serve_forever(self) -> None:
         context = zmq.Context.instance()

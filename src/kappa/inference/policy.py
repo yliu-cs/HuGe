@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,19 @@ from kappa.inference.observation import assemble_proprio
 from kappa.models.qwen_sonicfm import QwenSonicFM
 from kappa.data.state_normalizer import StateNormalizer
 from kappa.data.transforms import gr00t_image_transform
+
+
+@dataclass(frozen=True)
+class PolicyTrace:
+    prompt: str
+    input_ids: torch.Tensor
+    image: torch.Tensor | None
+    state_raw: torch.Tensor
+    state: torch.Tensor
+    state_mask: torch.Tensor
+    qwen_inputs: dict[str, torch.Tensor] | None
+    qwen_text: str | None
+    action_array: np.ndarray
 
 
 def _truncate_with_tokenizer(tokenizer: Any, text: str, max_tokens: int | None) -> str:
@@ -49,13 +63,14 @@ class KappaPolicy:
             if hasattr(self.tokenizer, "padding_side"):
                 self.tokenizer.padding_side = "left"
 
-    def _state_tensor(self, observation: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _state_tensor(self, observation: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         arr, mask = assemble_proprio(observation)
         if arr.shape[-1] != PROPRIO_DIM:
             raise ValueError(f"state dim {arr.shape[-1]} != {PROPRIO_DIM}")
+        raw = arr.copy()
         if self.normalizer is not None and bool(mask.max(initial=0.0) > 0.0):
             arr = self.normalizer.normalize_flat(arr)
-        return torch.from_numpy(arr).to(self.device), torch.from_numpy(mask).to(self.device)
+        return torch.from_numpy(raw).to(self.device), torch.from_numpy(arr).to(self.device), torch.from_numpy(mask).to(self.device)
 
     @staticmethod
     def _prompt(observation: dict[str, Any]) -> str:
@@ -113,7 +128,7 @@ class KappaPolicy:
             arr = arr / 255.0
         return torch.from_numpy(arr[None]).to(self.device)
 
-    def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> dict[str, torch.Tensor] | None:
+    def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> tuple[dict[str, torch.Tensor] | None, str | None]:
         if self.processor is None:
             raise ValueError("Qwen processor is required; fallback text/image path has been removed")
         arr = self._image_array(observation)
@@ -163,26 +178,57 @@ class KappaPolicy:
         for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
             if key in out:
                 out[key] = out[key][:, :model_max_length]
-        return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in out.items()}
+        return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in out.items()}, text
+
+    def _prepare_model_inputs(self, observation: dict[str, Any]) -> dict[str, Any]:
+        prompt = self._prompt(observation)
+        state_raw, state, state_mask = self._state_tensor(observation)
+        qwen_inputs, qwen_text = self._qwen_inputs(observation, prompt)
+        return {
+            "prompt": prompt,
+            "input_ids": self._input_ids(prompt),
+            "image": self._image_tensor(observation),
+            "state_raw": state_raw,
+            "state": state,
+            "state_mask": state_mask,
+            "qwen_inputs": qwen_inputs,
+            "qwen_text": qwen_text,
+        }
 
     @torch.no_grad()
     def get_action(self, observation: dict[str, Any]) -> dict[str, np.ndarray]:
-        prompt = self._prompt(observation)
-        state, state_mask = self._state_tensor(observation)
+        action, _ = self.get_action_with_trace(observation)
+        return action
+
+    @torch.no_grad()
+    def get_action_with_trace(self, observation: dict[str, Any]) -> tuple[dict[str, np.ndarray], PolicyTrace]:
+        inputs = self._prepare_model_inputs(observation)
         action = self.model.predict_action(
-            input_ids=self._input_ids(prompt),
-            images=self._image_tensor(observation),
-            state=state,
-            state_mask=state_mask,
-            qwen_inputs=self._qwen_inputs(observation, prompt),
+            input_ids=inputs["input_ids"],
+            images=inputs["image"],
+            state=inputs["state"],
+            state_mask=inputs["state_mask"],
+            qwen_inputs=inputs["qwen_inputs"],
         )
         arr = action.detach().cpu().numpy().astype(np.float32)
         if arr.shape[-1] != ACTION_DIM:
             raise ValueError(f"model returned action dim {arr.shape[-1]} != {ACTION_DIM}")
         parts = split_action_dict(arr)
-        return {
+        action_dict = {
             "action.motion_token": parts["action.motion_token"],
             "action.hand_binary": parts["action.hand_binary"],
             "motion_token": parts["action.motion_token"],
             "hand_binary_action": parts["action.hand_binary"],
         }
+        trace = PolicyTrace(
+            prompt=inputs["prompt"],
+            input_ids=inputs["input_ids"],
+            image=inputs["image"],
+            state_raw=inputs["state_raw"],
+            state=inputs["state"],
+            state_mask=inputs["state_mask"],
+            qwen_inputs=inputs["qwen_inputs"],
+            qwen_text=inputs["qwen_text"],
+            action_array=arr,
+        )
+        return action_dict, trace
