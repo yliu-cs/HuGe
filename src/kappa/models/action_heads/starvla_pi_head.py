@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.distributions import Beta
@@ -45,18 +47,31 @@ class ActionEncoder(nn.Module):
         return self.mix(torch.cat([action_feat, time_feat.to(action_feat.dtype)], dim=-1))
 
 
-class TimestepEncoder(nn.Module):
-    def __init__(self, hidden_size: int, num_buckets: int = 1000) -> None:
+class SinusoidalTimestepEncoder(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        max_period: float = 10000.0,
+        time_scale: float = 1000.0,
+    ) -> None:
         super().__init__()
-        if num_buckets <= 0:
-            raise ValueError(f"num_buckets must be positive, got {num_buckets}")
-        self.num_buckets = num_buckets
-        self.embedding = nn.Embedding(num_buckets, hidden_size)
+        if hidden_size % 2 != 0:
+            raise ValueError(f"hidden_size must be even for sinusoidal embedding, got {hidden_size}")
+        self.hidden_size = hidden_size
+        self.max_period = float(max_period)
+        self.time_scale = float(time_scale)
         self.mlp = MLP(hidden_size, hidden_size, hidden_size)
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        half = hidden_size // 2
+        freqs = torch.exp(-math.log(self.max_period) * torch.arange(half, dtype=torch.float32) / half)
+        self.register_buffer("freqs", freqs, persistent=False)
 
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.embedding(timesteps))
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t = t.reshape(-1).to(torch.float32) * self.time_scale
+        args = t[:, None] * self.freqs[None, :]
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        mlp_dtype = self.mlp.net[0].weight.dtype
+        return self.mlp(emb.to(mlp_dtype))
 
 
 class AdaLayerNorm(nn.Module):
@@ -190,7 +205,6 @@ class StarVLAPIActionHead(nn.Module):
         num_heads: int = 16,
         ffn_multiplier: int = 4,
         dropout: float = 0.1,
-        num_timestep_buckets: int = 1000,
         num_inference_steps: int = 4,
         noise_beta_alpha: float = 1.5,
         noise_beta_beta: float = 1.0,
@@ -207,13 +221,12 @@ class StarVLAPIActionHead(nn.Module):
         self.action_horizon = action_horizon
         self.num_layers = num_layers
         self.num_heads = num_heads
-        self.num_timestep_buckets = num_timestep_buckets
         self.num_inference_steps = num_inference_steps
         self.noise_s = noise_s
         self.state_dropout_prob = float(state_dropout_prob)
 
         self.action_encoder = ActionEncoder(action_dim, hidden_size=self.input_embedding_dim)
-        self.timestep_encoder = TimestepEncoder(hidden_size, num_buckets=num_timestep_buckets)
+        self.timestep_encoder = SinusoidalTimestepEncoder(hidden_size)
         self.state_encoder = MLP(state_dim, hidden_size, hidden_size, dropout=dropout) if state_dim > 0 else None
         self.position_embedding = nn.Embedding(action_horizon, hidden_size)
         self.dit = DiT(
@@ -227,10 +240,6 @@ class StarVLAPIActionHead(nn.Module):
         self.decoder = self.action_decoder
         self.beta_dist = Beta(noise_beta_alpha, noise_beta_beta)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
-
-    def _bucketize_time(self, t: torch.Tensor) -> torch.Tensor:
-        bucket = torch.floor(t.clamp(min=0.0, max=self.noise_s) * self.num_timestep_buckets).to(torch.long)
-        return bucket.clamp(min=0, max=self.num_timestep_buckets - 1)
 
     def sample_time(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         sample = self.beta_dist.sample((batch_size,)).to(device=device, dtype=dtype).clamp(max=self.noise_s)
@@ -318,8 +327,7 @@ class StarVLAPIActionHead(nn.Module):
             t = self.sample_time(batch_size, device=actions.device, dtype=actions.dtype)
         else:
             t = t.to(device=actions.device, dtype=actions.dtype)
-        t_bucket = self._bucketize_time(t)
-        timestep_emb = self.timestep_encoder(t_bucket)
+        timestep_emb = self.timestep_encoder(t)
         t_view = t.reshape(batch_size, 1, 1)
         noisy = (1.0 - t_view) * noise + t_view * actions
         target_velocity = actions - noise
@@ -356,7 +364,7 @@ class StarVLAPIActionHead(nn.Module):
         dt = 1.0 / steps
         for step in range(steps):
             t = torch.full((batch_size,), step / float(steps), device=device, dtype=dtype)
-            timestep_emb = self.timestep_encoder(self._bucketize_time(t))
+            timestep_emb = self.timestep_encoder(t)
             hidden_states = self._build_sequence(actions, timestep_emb, state, state_mask)
             hidden_states = self._run_dit(hidden_states, vl_embs_list, timestep_emb, encoder_attention_mask)
             velocity = self.action_decoder(hidden_states[:, -horizon:])

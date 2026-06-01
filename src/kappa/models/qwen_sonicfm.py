@@ -22,7 +22,6 @@ class QwenSonicFMConfig:
     action_dropout: float = 0.1
     num_future_tokens: int = 32
     state_dropout_prob: float = 0.2
-    num_timestep_buckets: int = 1000
     flow_noise_beta_alpha: float = 1.5
     flow_noise_beta_beta: float = 1.0
     flow_noise_s: float = 0.999
@@ -152,7 +151,6 @@ class QwenSonicFM(nn.Module):
             num_heads=num_heads,
             ffn_multiplier=self.config.action_ffn_multiplier,
             dropout=self.config.action_dropout,
-            num_timestep_buckets=self.config.num_timestep_buckets,
             num_inference_steps=self.config.num_inference_steps,
             noise_beta_alpha=self.config.flow_noise_beta_alpha,
             noise_beta_beta=self.config.flow_noise_beta_beta,

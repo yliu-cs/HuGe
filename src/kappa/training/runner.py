@@ -106,7 +106,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     ),
     # Real-robot adaptation. Lower LR, denser sampling, frequent checkpoints.
     "stage3": StageDefaults(
-        learning_rate=2e-5,
+        learning_rate=3e-5,
         batch_size=32,
         epochs=10,
         sample_stride=1,
