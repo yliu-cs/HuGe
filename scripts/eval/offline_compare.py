@@ -490,7 +490,6 @@ def main() -> None:
         proprio_stats_path=stats_path,
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
-        include_replay=False,
     )
     device = torch.device(args.device)
     out_dir = Path(args.out_dir)

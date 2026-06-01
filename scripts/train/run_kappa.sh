@@ -255,13 +255,13 @@ launch_train() {
 
 case "$stage" in
   stage1|egodex)
-    launch_train src/kappa/training/train_stage1_egodex.py "$@"
+    launch_train src/kappa/training/train_stage.py --stage stage1 "$@"
     ;;
   stage2|he_wbt)
-    launch_train src/kappa/training/train_stage2_posttrain.py "$@"
+    launch_train src/kappa/training/train_stage.py --stage stage2 "$@"
     ;;
   stage3|prop|proprietary)
-    launch_train src/kappa/training/train_stage3_finetune.py "$@"
+    launch_train src/kappa/training/train_stage.py --stage stage3 "$@"
     ;;
   audit)
     uv run python src/kappa/data/audit.py "${train_args[@]}"

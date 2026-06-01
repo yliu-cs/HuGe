@@ -137,7 +137,6 @@ def build_stage_dataset(
     proprio_stats_path: str | Path | None = None,
     prop_roots: list[str] | None = None,
     prop_ego_roots: list[str] | None = None,
-    include_replay: bool = True,
 ) -> Dataset:
     root = Path(repo_root)
     data = root / "resource" / "dataset"
@@ -177,15 +176,6 @@ def build_stage_dataset(
             )
             for path in roots
         )
-        if include_replay:
-            replay = WBTDataset(
-                data / "G1_WBT",
-                sample_stride=max(sample_stride, 10),
-                proprio_normalizer=normalizer,
-                max_episodes=max_episodes,
-            )
-            replay.dataset_id = "g1_wbt_replay"
-            datasets.append(replay)
         return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     raise ValueError(f"unknown stage {stage!r}")
 

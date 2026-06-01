@@ -58,7 +58,6 @@ def _prepare_batch(args: argparse.Namespace, model: QwenSonicFM, device: torch.d
         proprio_stats_path=stats_path,
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
-        include_replay=False,
     )
     if len(dataset) == 0:
         raise ValueError("dataset is empty")

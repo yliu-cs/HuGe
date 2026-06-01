@@ -31,7 +31,7 @@ class QwenSonicFMConfig:
     num_inference_steps: int = 4
     base_vlm_path: str = "resource/model/Qwen3-VL-2B-Instruct"
     use_qwen: bool = True
-    freeze_qwen: bool = True
+    freeze_qwen: bool = False
     qwen_lora: bool = False
     train_qwen_lora: bool = False
     qwen_lora_r: int = 8

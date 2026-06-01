@@ -49,8 +49,8 @@ class StageDefaults:
     checkpointing_steps: int
     weight_decay: float = 0.01
     num_workers: int = 8
-    freeze_qwen: bool = True
-    qwen_lora: bool = True
+    freeze_qwen: bool = False
+    qwen_lora: bool = False
     train_qwen_lora: bool = False
     qwen_lora_r: int = 8
     qwen_lora_alpha: int = 16
@@ -82,11 +82,8 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         learning_rate=1e-4,
         batch_size=96,
         epochs=1,
-        sample_stride=5,
+        sample_stride=10,
         checkpointing_steps=10000,
-        freeze_qwen=True,
-        qwen_lora=True,
-        train_qwen_lora=True,
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
@@ -96,11 +93,8 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         learning_rate=1e-4,
         batch_size=96,
         epochs=1,
-        sample_stride=2,
+        sample_stride=1,
         checkpointing_steps=1000,
-        freeze_qwen=True,
-        qwen_lora=True,
-        train_qwen_lora=True,
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
@@ -112,7 +106,6 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         sample_stride=1,
         checkpointing_steps=10000,
         weight_decay=0.005,
-        freeze_qwen=True,
         warmup_ratio=0.1,
         max_text_tokens=48,
     ),
@@ -214,7 +207,9 @@ def _format_seconds(seconds: float) -> str:
 
 
 def _format_param_count(n: int) -> str:
-    return f"{n / 1_000_000_000:.3f}B/{n / 1_000_000:.1f}M"
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.3f}B"
+    return f"{n / 1_000_000:.1f}M"
 
 
 class TeeStream:
@@ -245,17 +240,15 @@ class RunLogTee:
         self.enabled = enabled
         self._stdout = sys.stdout
         self._stderr = sys.stderr
-        self._stdout_file: TextIO | None = None
-        self._stderr_file: TextIO | None = None
+        self._log_file: TextIO | None = None
 
     def __enter__(self) -> "RunLogTee":
         if not self.enabled:
             return self
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self._stdout_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
-        self._stderr_file = (self.out_dir / "train.err.log").open("a", encoding="utf-8", buffering=1)
-        sys.stdout = TeeStream(self._stdout, self._stdout_file)  # type: ignore[assignment]
-        sys.stderr = TeeStream(self._stderr, self._stderr_file)  # type: ignore[assignment]
+        self._log_file = (self.out_dir / "train.log").open("a", encoding="utf-8", buffering=1)
+        sys.stdout = TeeStream(self._stdout, self._log_file)  # type: ignore[assignment]
+        sys.stderr = TeeStream(self._stderr, self._log_file)  # type: ignore[assignment]
         return self
 
     def __exit__(
@@ -264,18 +257,16 @@ class RunLogTee:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if exc_type is not None and self._stderr_file is not None:
-            self._stderr_file.write("\n")
-            traceback.print_exception(exc_type, exc, tb, file=self._stderr_file)
-            self._stderr_file.flush()
+        if exc_type is not None and self._log_file is not None:
+            self._log_file.write("\n")
+            traceback.print_exception(exc_type, exc, tb, file=self._log_file)
+            self._log_file.flush()
         sys.stdout.flush()
         sys.stderr.flush()
         sys.stdout = self._stdout
         sys.stderr = self._stderr
-        if self._stdout_file is not None:
-            self._stdout_file.close()
-        if self._stderr_file is not None:
-            self._stderr_file.close()
+        if self._log_file is not None:
+            self._log_file.close()
 
 
 def train_stage(args: argparse.Namespace) -> Path:
@@ -638,9 +629,9 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--expected-num-processes", type=int, default=8)
     p.add_argument("--base-vlm-path", default="resource/model/Qwen3-VL-2B-Instruct")
     p.add_argument("--use-qwen", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--freeze-qwen", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--qwen-lora", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--train-qwen-lora", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--freeze-qwen", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--qwen-lora", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--train-qwen-lora", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--qwen-lora-r", type=int, default=None)
     p.add_argument("--qwen-lora-alpha", type=int, default=None)
     p.add_argument("--qwen-lora-dropout", type=float, default=None)
