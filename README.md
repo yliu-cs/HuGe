@@ -215,15 +215,15 @@ Visualize predictions vs ground truth for one or more checkpoints:
 
 ```bash
 uv run python scripts/eval/offline_compare.py \
-  --ckpt .runs/train/stage3/20260601_031338/step_* \
+  --ckpt .runs/train/stage3/20260601_091809/step_* \
   --stage stage3 \
-  --proprio-stats-path .runs/train/stage3/20260601_031338/step_45170/proprio_stats_sonic.json \
-  --prop-roots resource/dataset/proprietary/real/2026-05-28 \
-  --num-inference-steps 4 \
+  --proprio-stats-path .runs/train/stage3/20260601_091809/step_45170/proprio_stats_sonic.json \
+  --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530 \
+  --num-inference-steps 8 \
   --batch-size 8 \
   --sample-stride 1 \
   --chunk-keep-steps 50 \
-  --episode-idx 3 \
+  --episode-idx 123 \
   --out-dir .runs/eval/offline_compare
 ```
 
@@ -243,7 +243,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 uv run python src/kappa/inference/run_kappa_server.py \
-  --ckpt .runs/train/stage3/20260531_075320/step_2000 \
+  --ckpt .runs/train/stage3/20260601_091809/step_45170 \
   --host 0.0.0.0 \
   --port 5550 \
   --device cuda \
@@ -267,10 +267,16 @@ and the proprio normalizer copied into each checkpoint directory.
 
 ```bash
 # Terminal 1: Kappa server
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 uv run python src/kappa/inference/run_kappa_server.py \
-  --ckpt .runs/train/stage3/20260530_144739/step_3525 \
+  --ckpt .runs/train/stage3/20260601_091809/step_30000 \
+  --host 0.0.0.0 \
   --port 5550 \
-  --device cuda
+  --device cuda \
+  --action-horizon 50 \
+  --log-dir .runs/deploy_log/$(date +%Y%m%d_%H%M%S)
 
 # Terminal 2: GR00T WBC deploy stack
 cd GR00T-WholeBodyControl/gear_sonic_deploy
