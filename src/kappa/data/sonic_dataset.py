@@ -54,7 +54,13 @@ def _first_existing(paths: list[Path]) -> Path | None:
     return next((p for p in paths if p.exists()), None)
 
 
-def _candidate_video_paths(cache_root: Path, token_path: Path, token_len: int) -> tuple[Path | None, int | None]:
+def _candidate_video_paths(
+    cache_root: Path,
+    token_path: Path,
+    token_len: int,
+    *,
+    video_len_hint_mode: str = "legacy_30fps",
+) -> tuple[Path | None, int | None]:
     """Best-effort video path resolver for HE/WBT/proprietary cache layouts."""
     stem = token_path.stem
     rel_parts = token_path.relative_to(cache_root).parts
@@ -79,6 +85,10 @@ def _candidate_video_paths(cache_root: Path, token_path: Path, token_len: int) -
     path = _first_existing(candidates)
     if path is None:
         return None, None
+    if video_len_hint_mode == "token_1to1":
+        return path, token_len
+    if video_len_hint_mode != "legacy_30fps":
+        raise ValueError(f"unknown video_len_hint_mode {video_len_hint_mode!r}")
     return path, max(1, int(round(token_len * 30 / 50)))
 
 
@@ -103,6 +113,7 @@ class SonicTokenDataset:
         language: str = "perform the task",
         language_map: dict[str, str] | None = None,
         max_episodes: int | None = None,
+        video_len_hint_mode: str = "legacy_30fps",
     ) -> None:
         self.cache_root = Path(cache_root)
         self.dataset_id = dataset_id
@@ -115,6 +126,7 @@ class SonicTokenDataset:
         self.language = language
         self.language_map = language_map or {}
         self.max_episodes = max_episodes
+        self.video_len_hint_mode = video_len_hint_mode
         self.episodes = self._discover_episodes()
         self._finalize_index()
 
@@ -136,7 +148,12 @@ class SonicTokenDataset:
                     raise ValueError(f"{proprio_path} must be [T, {PROPRIO_DIM}], got {proprio.shape}")
                 if proprio.shape[0] != token.shape[0]:
                     raise ValueError(f"length mismatch {token_path}={token.shape[0]} vs {proprio_path}={proprio.shape[0]}")
-            video_path, video_len_hint = _candidate_video_paths(self.cache_root, token_path, int(token.shape[0]))
+            video_path, video_len_hint = _candidate_video_paths(
+                self.cache_root,
+                token_path,
+                int(token.shape[0]),
+                video_len_hint_mode=self.video_len_hint_mode,
+            )
             records.append(
                 EpisodeRecord(
                     dataset_id=self.dataset_id,

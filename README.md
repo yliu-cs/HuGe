@@ -75,7 +75,7 @@ Run the audit before training:
 ```bash
 uv run python src/kappa/data/audit.py
 # equivalent launcher shortcut:
-scripts/train/run_kappa.sh audit
+scripts/train/train_kappa.sh audit
 ```
 
 It checks source existence, token/proprio shapes, hand-bit validity, and proprio
@@ -90,20 +90,20 @@ uv run python scripts/preprocess/calc_union_proprio_stats.py
 
 ## Training
 
-`scripts/train/run_kappa.sh` drives stage training and the data audit. Pass the
+`scripts/train/train_kappa.sh` drives stage training and the data audit. Pass the
 stage explicitly (default `stage2`). The launcher auto-detects node count and
 visible GPUs from `KAPPA_*`, `PET_*`, `SLURM_*`, `CUDA_VISIBLE_DEVICES`, and
 `nvidia-smi` (8 bf16 processes on one 8-GPU H200 node).
 
 ```bash
 # Stage 1: EgoDex pretraining
-scripts/train/run_kappa.sh stage1
+scripts/train/train_kappa.sh stage1
 
 # Stage 2: HE + WBT posttraining
-scripts/train/run_kappa.sh stage2
+scripts/train/train_kappa.sh stage2
 
 # Stage 3: proprietary real adaptation
-scripts/train/run_kappa.sh stage3
+scripts/train/train_kappa.sh stage3
 ```
 
 `stage2`/`stage3` auto-init from the latest checkpoint of the previous stage
@@ -113,7 +113,7 @@ to intentionally train a later stage from scratch.
 Explicit distributed overrides:
 
 ```bash
-scripts/train/run_kappa.sh stage2 \
+scripts/train/train_kappa.sh stage2 \
   --num_gpus 8 \
   --num_nodes 1 \
   --node_rank 0 \
@@ -161,9 +161,9 @@ jitter, and eval-time center `0.95` crop without jitter.
 Common overrides:
 
 ```bash
-scripts/train/run_kappa.sh stage2 --batch-size 64 --learning-rate 2e-5
-scripts/train/run_kappa.sh stage3 --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530
-scripts/train/run_kappa.sh stage1
+scripts/train/train_kappa.sh stage2 --batch-size 64 --learning-rate 2e-5
+scripts/train/train_kappa.sh stage3 --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530
+scripts/train/train_kappa.sh stage1
 ```
 
 Explicit `--action-hidden-size`, `--num-action-layers`, and
@@ -193,16 +193,16 @@ Full-flow one-step smoke on a training node:
 ```bash
 uv lock
 uv run python src/kappa/data/audit.py
-scripts/train/run_kappa.sh stage1 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/run_kappa.sh stage2 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/run_kappa.sh stage3 --max-steps 1 --max-episodes 1 --batch-size 1
+scripts/train/train_kappa.sh stage1 --max-steps 1 --max-episodes 1 --batch-size 1
+scripts/train/train_kappa.sh stage2 --max-steps 1 --max-episodes 1 --batch-size 1
+scripts/train/train_kappa.sh stage3 --max-steps 1 --max-episodes 1 --batch-size 1
 ```
 
 Local single-GPU smoke:
 
 ```bash
 KAPPA_NUM_PROCESSES=1 KAPPA_EXPECTED_NUM_PROCESSES=1 \
-scripts/train/run_kappa.sh stage1 \
+scripts/train/train_kappa.sh stage1 \
   --max-steps 1 \
   --max-episodes 1 \
   --batch-size 1 \
@@ -215,14 +215,14 @@ Visualize predictions vs ground truth for one or more checkpoints:
 
 ```bash
 uv run python scripts/eval/offline_compare.py \
-  --ckpt .runs/train/stage3/20260601_091809/step_* \
+  --ckpt .runs/train/stage3/20260602_014333/step_* \
   --stage stage3 \
-  --proprio-stats-path .runs/train/stage3/20260601_091809/step_45170/proprio_stats_sonic.json \
+  --proprio-stats-path .runs/train/stage3/20260602_014333/step_5000/proprio_stats_sonic.json \
   --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530 \
   --num-inference-steps 8 \
   --batch-size 8 \
   --sample-stride 1 \
-  --chunk-keep-steps 50 \
+  --chunk-keep-steps 20 \
   --episode-idx 123 \
   --out-dir .runs/eval/offline_compare
 ```

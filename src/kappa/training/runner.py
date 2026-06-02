@@ -104,7 +104,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         batch_size=32,
         epochs=10,
         sample_stride=1,
-        checkpointing_steps=10000,
+        checkpointing_steps=5000,
         weight_decay=0.005,
         warmup_ratio=0.1,
         max_text_tokens=48,
@@ -206,6 +206,31 @@ def _format_seconds(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _sanitize_path_part(value: str) -> str:
+    sanitized = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value.strip())
+    sanitized = sanitized.strip("._-")
+    if not sanitized:
+        raise ValueError(f"invalid empty path component from {value!r}")
+    return sanitized
+
+
+def _broadcast_run_id(run_id: str, accelerator: Any | None) -> str:
+    if accelerator is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return run_id
+    payload: list[str | None] = [run_id if accelerator.is_main_process else None]
+    torch.distributed.broadcast_object_list(payload, src=0)
+    if payload[0] is None:
+        raise RuntimeError("failed to broadcast run id")
+    return str(payload[0])
+
+
+def _run_dir_name(args: argparse.Namespace, accelerator: Any | None) -> str:
+    base = str(args.run_id).strip() if args.run_id else time.strftime("%Y%m%d_%H%M%S")
+    if args.run_name:
+        base = f"{base}_{args.run_name}"
+    return _sanitize_path_part(_broadcast_run_id(base, accelerator))
+
+
 def _format_param_count(n: int) -> str:
     if n >= 1_000_000_000:
         return f"{n / 1_000_000_000:.3f}B"
@@ -272,7 +297,7 @@ class RunLogTee:
 def train_stage(args: argparse.Namespace) -> Path:
     accelerator = None
     if not args.use_accelerate:
-        raise ValueError("training must run with accelerate; use scripts/train/run_kappa.sh")
+        raise ValueError("training must run with accelerate; use scripts/train/train_kappa.sh")
     if args.use_accelerate:
         from accelerate import Accelerator, DeepSpeedPlugin
 
@@ -294,7 +319,7 @@ def train_stage(args: argparse.Namespace) -> Path:
         if accelerator.num_processes != args.expected_num_processes:
             raise ValueError(
                 f"training must run on {args.expected_num_processes} processes; "
-                f"got {accelerator.num_processes}. Use scripts/train/run_kappa.sh."
+                f"got {accelerator.num_processes}. Use scripts/train/train_kappa.sh."
             )
         device = accelerator.device
     else:
@@ -435,8 +460,11 @@ def train_stage(args: argparse.Namespace) -> Path:
     from transformers import get_scheduler
 
     scaler = torch.amp.GradScaler("cuda", enabled=accelerator is None and args.mixed_precision == "fp16" and device.type == "cuda")
-    out_dir = Path(args.output_dir) / args.stage / time.strftime("%Y%m%d_%H%M%S")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir) / args.stage / _run_dir_name(args, accelerator)
+    if _is_main_process(accelerator):
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
     with RunLogTee(out_dir, enabled=_is_main_process(accelerator)):
         _log_main(accelerator, f"[{args.stage}] logging to {out_dir / 'train.log'}")
         if _is_main_process(accelerator):
@@ -624,6 +652,8 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p = StageArgumentParser()
     p.add_argument("--stage", default=canonical_stage(default_stage))
     p.add_argument("--output-dir", default=".runs/train")
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--run-name", default=None)
     p.add_argument("--device", default="auto")
     p.add_argument("--use-accelerate", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--expected-num-processes", type=int, default=8)

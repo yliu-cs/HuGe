@@ -37,6 +37,7 @@ def _language_map(root: Path) -> dict[str, str]:
 class PropDataset(SonicTokenDataset):
     def __init__(self, data_root: str | Path, **kwargs) -> None:
         root = Path(data_root)
+        kwargs["video_len_hint_mode"] = "token_1to1"
         super().__init__(
             root,
             dataset_id="proprietary_real",
