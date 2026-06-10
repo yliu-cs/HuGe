@@ -909,7 +909,6 @@ requires-dist = [
     { name = "requests", marker = "extra == 'camera'" },
     { name = "scipy", specifier = "==1.15.3" },
     { name = "scipy", marker = "extra == 'inference'" },
-    { name = "smpl-sim", marker = "extra == 'training'", git = "https://github.com/ZhengyiLuo/SMPLSim.git" },
     { name = "tensorboard", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.4.0" },
     { name = "tqdm" },

@@ -238,6 +238,7 @@ class KappaPolicyServer:
                     "state": trace.state,
                     "state_mask": trace.state_mask,
                     "qwen_inputs": trace.qwen_inputs,
+                    "action_token_mask": getattr(trace, "action_token_mask", None),
                     "qwen_text": trace.qwen_text,
                 },
                 "model_output": {

@@ -12,6 +12,8 @@ sync*
 .claude/
 .codex/
 .sii/
+AGENTS.md
+skills/
 
 # Python / uv
 .venv/

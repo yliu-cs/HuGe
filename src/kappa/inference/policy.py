@@ -26,6 +26,7 @@ class PolicyTrace:
     state: torch.Tensor
     state_mask: torch.Tensor
     qwen_inputs: dict[str, torch.Tensor] | None
+    action_token_mask: torch.Tensor | None
     qwen_text: str | None
     action_array: np.ndarray
 
@@ -52,6 +53,8 @@ class KappaPolicy:
         self.normalizer = normalizer
         self.processor = None
         self.tokenizer = None
+        self.model_architecture = str(getattr(self.model.config, "model_architecture", "qwenpi_v3") or "qwenpi_v3").lower()
+        self.oft_action_token_id: int | None = None
         if self.model.config.use_qwen:
             from transformers import AutoProcessor
 
@@ -62,6 +65,12 @@ class KappaPolicy:
             self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
             if hasattr(self.tokenizer, "padding_side"):
                 self.tokenizer.padding_side = "left"
+            if self.model_architecture == "qwenoft":
+                token = getattr(self.model.config, "oft_action_token", "\U0001f50d")
+                ids = self.tokenizer(token, add_special_tokens=False).input_ids
+                if len(ids) != 1:
+                    raise ValueError(f"qwenoft action token {token!r} must tokenize to one id, got {ids}")
+                self.oft_action_token_id = int(ids[0])
 
     def _state_tensor(self, observation: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         arr, mask = assemble_proprio(observation)
@@ -128,7 +137,12 @@ class KappaPolicy:
             arr = arr / 255.0
         return torch.from_numpy(arr[None]).to(self.device)
 
-    def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> tuple[dict[str, torch.Tensor] | None, str | None]:
+    def _append_oft_action_tokens(self, prompt: str) -> str:
+        token = getattr(self.model.config, "oft_action_token", "\U0001f50d")
+        horizon = int(getattr(self.model.config, "action_horizon", 50) or 50)
+        return f"{prompt} Please predict the next {horizon} robot actions:{token * horizon}"
+
+    def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> tuple[dict[str, torch.Tensor] | None, torch.Tensor | None, str | None]:
         if self.processor is None:
             raise ValueError("Qwen processor is required; fallback text/image path has been removed")
         arr = self._image_array(observation)
@@ -140,6 +154,8 @@ class KappaPolicy:
                 prompt,
                 getattr(self.model.config, "max_text_tokens", None),
             )
+        if self.model_architecture == "qwenoft":
+            prompt = self._append_oft_action_tokens(prompt)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
@@ -177,13 +193,27 @@ class KappaPolicy:
         out = dict(inputs)
         for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
             if key in out:
-                out[key] = out[key][:, :model_max_length]
-        return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in out.items()}, text
+                out[key] = (
+                    out[key][:, -model_max_length :]
+                    if self.model_architecture == "qwenoft"
+                    else out[key][:, :model_max_length]
+                )
+        action_token_mask = None
+        if self.model_architecture == "qwenoft":
+            if self.oft_action_token_id is None:
+                raise ValueError("qwenoft requires a resolved action token id")
+            action_token_mask = out["input_ids"] == self.oft_action_token_id
+            horizon = int(getattr(self.model.config, "action_horizon", 50) or 50)
+            count = int(action_token_mask.sum().item())
+            if count < horizon:
+                raise ValueError(f"qwenoft prompt has {count} action tokens after truncation, expected at least {horizon}")
+            action_token_mask = action_token_mask.to(self.device)
+        return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in out.items()}, action_token_mask, text
 
     def _prepare_model_inputs(self, observation: dict[str, Any]) -> dict[str, Any]:
         prompt = self._prompt(observation)
         state_raw, state, state_mask = self._state_tensor(observation)
-        qwen_inputs, qwen_text = self._qwen_inputs(observation, prompt)
+        qwen_inputs, action_token_mask, qwen_text = self._qwen_inputs(observation, prompt)
         return {
             "prompt": prompt,
             "input_ids": self._input_ids(prompt),
@@ -192,6 +222,7 @@ class KappaPolicy:
             "state": state,
             "state_mask": state_mask,
             "qwen_inputs": qwen_inputs,
+            "action_token_mask": action_token_mask,
             "qwen_text": qwen_text,
         }
 
@@ -209,6 +240,7 @@ class KappaPolicy:
             state=inputs["state"],
             state_mask=inputs["state_mask"],
             qwen_inputs=inputs["qwen_inputs"],
+            action_token_mask=inputs["action_token_mask"],
         )
         arr = action.detach().cpu().numpy().astype(np.float32)
         if arr.shape[-1] != ACTION_DIM:
@@ -228,6 +260,7 @@ class KappaPolicy:
             state=inputs["state"],
             state_mask=inputs["state_mask"],
             qwen_inputs=inputs["qwen_inputs"],
+            action_token_mask=inputs["action_token_mask"],
             qwen_text=inputs["qwen_text"],
             action_array=arr,
         )

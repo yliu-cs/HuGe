@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sequential experiment runner.
+# Sequential stage3 experiment runner for architecture comparisons.
 #
-# Edit run_all() at the bottom of this file and add one run_exp block per
-# experiment. Each experiment calls train_kappa.sh and writes to:
+# By default this runs stage3 once for each architecture:
+#   1. qwenpi_v3_stage3
+#   2. qwengr00t_stage3
+#   3. qwenoft_stage3
+#
+# Each run starts from scratch with --init-ckpt none.
+#
+# Each stage calls train_kappa.sh and writes to:
 #
 #   ${KAPPA_RUN_ROOT:-.runs}/<experiment_name>/<stage>/<timestamp>/
 #
 # Useful environment variables:
 #   KAPPA_DRY_RUN=1                 print commands without launching training
 #   KAPPA_RUN_ROOT=.runs/xxx        change the root for all experiments
-#   KAPPA_DEFAULT_INIT_CKPT=...     shared init checkpoint for stage3 experiments
+#   KAPPA_LOCK_FILE=...             override the default run flag file
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="$SCRIPT_DIR/train_kappa.sh"
 RUN_ROOT="${KAPPA_RUN_ROOT:-.runs}"
 DRY_RUN="${KAPPA_DRY_RUN:-0}"
-DEFAULT_STAGE="${KAPPA_DEFAULT_STAGE:-stage3}"
-DEFAULT_INIT_CKPT="${KAPPA_DEFAULT_INIT_CKPT:-}"
 RUN_COUNT=0
+LOCK_FILE="${KAPPA_LOCK_FILE:-$RUN_ROOT/run_kappa.flag}"
+LOCK_HOST="$(hostname 2>/dev/null || printf 'unknown')"
+LOCK_TOKEN="$LOCK_HOST:$$:$(date +%s)"
 
 COMMON_ARGS=(
   # Add args shared by every experiment here, for example:
@@ -34,32 +41,45 @@ truthy() {
   esac
 }
 
-has_init_ckpt_arg() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --init-ckpt|--init_ckpt|--init-ckpt=*|--init_ckpt=*) return 0 ;;
-    esac
-  done
-  return 1
+acquire_run_lock() {
+  mkdir -p "$(dirname -- "$LOCK_FILE")"
+
+  if (
+    set -o noclobber
+    {
+      printf 'token=%s\n' "$LOCK_TOKEN"
+      printf 'host=%s\n' "$LOCK_HOST"
+      printf 'pid=%s\n' "$$"
+      printf 'started_at=%s\n' "$(date -Is)"
+    } > "$LOCK_FILE"
+  ) 2>/dev/null; then
+    trap release_run_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    return 0
+  fi
+
+  echo "Flag file already exists, another run_kappa.sh is running: $LOCK_FILE" >&2
+  if [[ -r "$LOCK_FILE" ]]; then
+    echo "Existing flag:" >&2
+    sed 's/^/  /' "$LOCK_FILE" >&2 || true
+  fi
+  exit 0
+}
+
+release_run_lock() {
+  if [[ -f "$LOCK_FILE" ]] && grep -qx "token=$LOCK_TOKEN" "$LOCK_FILE" 2>/dev/null; then
+    rm -f "$LOCK_FILE"
+  fi
 }
 
 run_exp() {
   local name="$1"
-  shift
-
-  local stage="$DEFAULT_STAGE"
-  if [[ $# -gt 0 && "$1" != --* ]]; then
-    stage="$1"
-    shift
-  fi
+  local stage="$2"
+  shift 2
 
   local out_dir="$RUN_ROOT/$name"
   local cmd=("$TRAIN_SCRIPT" "$stage" --output-dir "$out_dir")
-
-  if [[ -n "$DEFAULT_INIT_CKPT" && "$stage" == "stage3" ]] && ! has_init_ckpt_arg "$@"; then
-    cmd+=(--init-ckpt "$DEFAULT_INIT_CKPT")
-  fi
 
   cmd+=("${COMMON_ARGS[@]}" "$@")
 
@@ -77,38 +97,23 @@ run_exp() {
   "${cmd[@]}"
 }
 
-run_all() {
-  # Add/edit experiments below. They run sequentially in the order listed.
-  #
-  # Example:
-  #
-  # run_exp prop_baseline stage3 \
-  #   --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530 \
-  #   --batch-size 32
-  #
-  # run_exp prop_video_1to1 stage3 \
-  #   --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530 \
-  #   --batch-size 32
-  :
+run_stage3_no_init() {
+  local architecture="$1"
+  local name="${architecture}_stage3"
 
-  run_exp full_param_train stage1
-  run_exp full_param_train stage2
-  run_exp full_param_train stage3
-
-  run_exp lora_freeze_train stage1 \
-    --freeze-qwen \
-    --qwen-lora \
-    --train-qwen-lora
-  run_exp lora_freeze_train stage2 \
-    --freeze-qwen \
-    --qwen-lora \
-    --train-qwen-lora
-  run_exp lora_freeze_train stage3 \
-    --freeze-qwen \
-    --qwen-lora \
-    --no-train-qwen-lora
+  run_exp "$name" stage3 --model-architecture "$architecture" --init-ckpt none
 }
 
+run_all() {
+  local architectures=(qwenpi_v3 qwengr00t qwenoft)
+  local architecture
+
+  for architecture in "${architectures[@]}"; do
+    run_stage3_no_init "$architecture"
+  done
+}
+
+acquire_run_lock
 run_all
 
 if [[ "$RUN_COUNT" -eq 0 ]]; then

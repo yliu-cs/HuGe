@@ -102,9 +102,9 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     "stage3": StageDefaults(
         learning_rate=3e-5,
         batch_size=32,
-        epochs=10,
+        epochs=30,
         sample_stride=1,
-        checkpointing_steps=5000,
+        checkpointing_steps=10000,
         weight_decay=0.005,
         warmup_ratio=0.1,
         max_text_tokens=48,
@@ -369,6 +369,9 @@ def train_stage(args: argparse.Namespace) -> Path:
         max_text_tokens=args.max_text_tokens,
         model_max_length=args.model_max_length,
         char_max_length=args.char_max_length,
+        model_architecture=args.model_architecture,
+        action_horizon=args.action_horizon,
+        oft_action_token=args.oft_action_token,
     )
     set_frame_cache_size(args.frame_cache_size)
     generator = torch.Generator()
@@ -413,12 +416,14 @@ def train_stage(args: argparse.Namespace) -> Path:
         accelerator,
         (
             f"[{args.stage}] building model: base_vlm={args.base_vlm_path} use_qwen={args.use_qwen} "
+            f"architecture={args.model_architecture} "
             f"freeze_qwen={args.freeze_qwen} qwen_lora={args.qwen_lora} "
             f"train_qwen_lora={args.train_qwen_lora} action_hidden_size={args.action_hidden_size} "
             f"num_action_layers={args.num_action_layers} state_dropout_prob={state_dropout_prob}"
         ),
     )
     config = QwenSonicFMConfig(
+        model_architecture=args.model_architecture,
         action_hidden_size=args.action_hidden_size or 1024,
         num_action_layers=args.num_action_layers or 16,
         num_attention_heads=args.num_attention_heads,
@@ -439,6 +444,7 @@ def train_stage(args: argparse.Namespace) -> Path:
         qwen_lora_alpha=args.qwen_lora_alpha,
         qwen_lora_dropout=args.qwen_lora_dropout,
         num_inference_steps=args.num_inference_steps,
+        oft_action_token=args.oft_action_token,
         max_text_tokens=args.max_text_tokens,
         model_max_length=args.model_max_length,
         char_max_length=args.char_max_length,
@@ -478,6 +484,7 @@ def train_stage(args: argparse.Namespace) -> Path:
             action_hidden_size=config.action_hidden_size,
             num_action_layers=config.num_action_layers,
             num_attention_heads=config.num_attention_heads,
+            model_architecture=config.model_architecture,
             state_dropout_prob=state_dropout_prob,
             image_transform="gr00t_explicit_train_random_eval_center_256",
             freeze_qwen=args.freeze_qwen,
@@ -557,6 +564,7 @@ def train_stage(args: argparse.Namespace) -> Path:
                             state=batch["state"],
                             state_mask=batch["state_mask"],
                             qwen_inputs=batch.get("qwen_inputs"),
+                            action_token_mask=batch.get("action_token_mask"),
                         )
                         losses = qwen_sonicfm_loss(pred, batch["normalized_actions"], sonic_mask=batch["sonic_mask"])
                     if scaler.is_enabled():
@@ -658,6 +666,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--use-accelerate", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--expected-num-processes", type=int, default=8)
     p.add_argument("--base-vlm-path", default="resource/model/Qwen3-VL-2B-Instruct")
+    p.add_argument("--model-architecture", choices=["qwenpi_v3", "qwengr00t", "qwenoft"], default="qwenpi_v3")
     p.add_argument("--use-qwen", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--freeze-qwen", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--qwen-lora", action=argparse.BooleanOptionalAction, default=False)
@@ -679,6 +688,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--flow-noise-s", type=float, default=0.999)
     p.add_argument("--action-horizon", type=int, default=50)
     p.add_argument("--num-inference-steps", type=int, default=4)
+    p.add_argument("--oft-action-token", default="\U0001f50d")
     p.add_argument("--max-text-tokens", type=int, default=None)
     p.add_argument("--model-max-length", type=int, default=None)
     p.add_argument("--char-max-length", type=int, default=None)

@@ -25,16 +25,28 @@ def qwen_sonicfm_loss(
 ) -> dict[str, torch.Tensor]:
     if target_actions.shape[-1] != ACTION_DIM:
         raise ValueError(f"target action dim {target_actions.shape[-1]} != {ACTION_DIM}")
-    target_velocity = pred.get("target_velocity")
-    if target_velocity is None:
-        raise KeyError("pred missing target_velocity")
-    velocity = pred["velocity"]
-    velocity_dim = velocity.shape[-1]
-    token_mask = None if sonic_mask is None else sonic_mask[..., :velocity_dim]
-    target_velocity = target_velocity.to(velocity.dtype)
-    if target_velocity.shape[-1] != velocity_dim:
-        raise ValueError(f"target_velocity dim {target_velocity.shape[-1]} != velocity dim {velocity_dim}")
-    loss_token = _masked_mean((velocity - target_velocity).pow(2), token_mask)
+    if "velocity" in pred:
+        target_velocity = pred.get("target_velocity")
+        if target_velocity is None:
+            raise KeyError("pred missing target_velocity")
+        velocity = pred["velocity"]
+        velocity_dim = velocity.shape[-1]
+        token_mask = None if sonic_mask is None else sonic_mask[..., :velocity_dim]
+        target_velocity = target_velocity.to(velocity.dtype)
+        if target_velocity.shape[-1] != velocity_dim:
+            raise ValueError(f"target_velocity dim {target_velocity.shape[-1]} != velocity dim {velocity_dim}")
+        loss_token = _masked_mean((velocity - target_velocity).pow(2), token_mask)
+        return {
+            "loss": loss_token,
+            "loss_token": loss_token,
+        }
+    if "pred_actions" not in pred:
+        raise KeyError("pred missing velocity or pred_actions")
+    pred_actions = pred["pred_actions"]
+    target = pred.get("target_actions", target_actions[:, : pred_actions.shape[1]])
+    target = target.to(pred_actions.dtype)
+    token_mask = None if sonic_mask is None else sonic_mask[:, : pred_actions.shape[1], : pred_actions.shape[-1]]
+    loss_token = _masked_mean((pred_actions - target).abs(), token_mask)
     return {
         "loss": loss_token,
         "loss_token": loss_token,

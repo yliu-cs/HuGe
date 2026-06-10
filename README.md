@@ -271,7 +271,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 uv run python src/kappa/inference/run_kappa_server.py \
-  --ckpt .runs/train/stage3/20260601_091809/step_30000 \
+  --ckpt .runs/qwenpi_v3_stage3/stage3/20260608_191002/step_86910 \
   --host 0.0.0.0 \
   --port 5550 \
   --device cuda \

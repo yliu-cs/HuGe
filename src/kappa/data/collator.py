@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from kappa.data.schemas import ACTION_DIM, PROPRIO_DIM
+from kappa.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM
 from kappa.data.transforms import gr00t_image_transform
 from kappa.data.video_reader import decode_video_frame, image_to_float_array
 
@@ -41,6 +41,9 @@ class KappaCollator:
         model_max_length: int = 8192,
         max_text_tokens: int | None = None,
         char_max_length: int = 256,
+        model_architecture: str = "qwenpi_v3",
+        action_horizon: int = ACTION_HORIZON,
+        oft_action_token: str = "\U0001f50d",
     ) -> None:
         self.use_qwen_processor = use_qwen_processor
         self.image_size = image_size
@@ -51,6 +54,10 @@ class KappaCollator:
         self.model_max_length = model_max_length
         self.max_text_tokens = max_text_tokens
         self.char_max_length = char_max_length
+        self.model_architecture = str(model_architecture or "qwenpi_v3").lower()
+        self.action_horizon = int(action_horizon)
+        self.oft_action_token = oft_action_token
+        self.oft_action_token_id: int | None = None
         self.processor = None
         self.tokenizer = None
         if use_qwen_processor:
@@ -60,6 +67,13 @@ class KappaCollator:
             self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
             if hasattr(self.tokenizer, "padding_side"):
                 self.tokenizer.padding_side = "left"
+            if self.model_architecture == "qwenoft":
+                ids = self.tokenizer(self.oft_action_token, add_special_tokens=False).input_ids
+                if len(ids) != 1:
+                    raise ValueError(
+                        f"qwenoft action token {self.oft_action_token!r} must tokenize to one id, got {ids}"
+                    )
+                self.oft_action_token_id = int(ids[0])
 
     def _image(self, item: dict[str, Any]) -> Image.Image:
         image = item.get("image")
@@ -83,10 +97,15 @@ class KappaCollator:
             color_jitter=self.image_color_jitter,
         )
 
+    def _append_oft_action_tokens(self, text: str) -> str:
+        suffix = self.oft_action_token * self.action_horizon
+        return f"{text} Please predict the next {self.action_horizon} robot actions:{suffix}"
+
     def __call__(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         texts = [str(x.get("language") or x.get("text") or "perform the task") for x in items]
         if self.tokenizer is not None:
             texts = [_truncate_with_tokenizer(self.tokenizer, text, self.max_text_tokens) for text in texts]
+        qwen_texts = [self._append_oft_action_tokens(text) for text in texts] if self.model_architecture == "qwenoft" else texts
         images_pil = [self._qwen_image(self._image(x)) for x in items]
         images = torch.from_numpy(np.stack([image_to_float_array(im) for im in images_pil], axis=0))
         actions = torch.from_numpy(np.stack([np.asarray(x["normalized_actions"], dtype=np.float32) for x in items], axis=0))
@@ -96,10 +115,10 @@ class KappaCollator:
         if actions.shape[-1] != ACTION_DIM:
             raise ValueError(f"action dim {actions.shape[-1]} != {ACTION_DIM}")
         if self.processor is None:
-            raise ValueError("Kappa PI training requires use_qwen_processor=True")
+            raise ValueError("Kappa training requires use_qwen_processor=True")
         messages = [
             [{"role": "user", "content": [{"type": "image", "image": im}, {"type": "text", "text": text}]}]
-            for im, text in zip(images_pil, texts, strict=True)
+            for im, text in zip(images_pil, qwen_texts, strict=True)
         ]
         rendered = [
             self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
@@ -117,7 +136,11 @@ class KappaCollator:
         )
         for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
             if key in qwen_inputs:
-                qwen_inputs[key] = qwen_inputs[key][:, : self.model_max_length]
+                qwen_inputs[key] = (
+                    qwen_inputs[key][:, -self.model_max_length :]
+                    if self.model_architecture == "qwenoft"
+                    else qwen_inputs[key][:, : self.model_max_length]
+                )
         batch: dict[str, Any] = {
             "input_ids": qwen_inputs["input_ids"],
             "images": images,
@@ -131,4 +154,15 @@ class KappaCollator:
             "frame_idx": [x.get("frame_idx") for x in items],
         }
         batch["qwen_inputs"] = dict(qwen_inputs)
+        if self.model_architecture == "qwenoft":
+            if self.oft_action_token_id is None:
+                raise ValueError("qwenoft requires a resolved action token id")
+            action_token_mask = qwen_inputs["input_ids"] == self.oft_action_token_id
+            counts = action_token_mask.sum(dim=1)
+            if (counts < self.action_horizon).any():
+                bad = (counts < self.action_horizon).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(
+                    f"qwenoft batch lost action tokens after tokenization/truncation; bad samples={bad} counts={counts.tolist()}"
+                )
+            batch["action_token_mask"] = action_token_mask
         return batch
