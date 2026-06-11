@@ -37,6 +37,9 @@ def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> KappaC
         model_max_length=model.config.model_max_length,
         max_text_tokens=model.config.max_text_tokens,
         char_max_length=model.config.char_max_length,
+        model_architecture=model.config.model_architecture,
+        action_horizon=model.config.action_horizon,
+        oft_action_token=model.config.oft_action_token,
     )
 
 
@@ -79,6 +82,7 @@ def _predict(model: QwenSonicFM, batch: dict[str, Any], steps: int) -> torch.Ten
         state=batch["state"],
         state_mask=batch["state_mask"],
         qwen_inputs=batch.get("qwen_inputs"),
+        action_token_mask=batch.get("action_token_mask"),
         num_inference_steps=steps,
     )
 
