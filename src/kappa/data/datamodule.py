@@ -135,6 +135,7 @@ def build_stage_dataset(
     sample_stride: int = 1,
     max_episodes: int | None = None,
     proprio_stats_path: str | Path | None = None,
+    egodex_root: str | Path | None = None,
     prop_roots: list[str] | None = None,
     prop_ego_roots: list[str] | None = None,
 ) -> Dataset:
@@ -143,7 +144,7 @@ def build_stage_dataset(
     stage = stage.lower()
     normalizer = StateNormalizer.from_json(proprio_stats_path) if proprio_stats_path else None
     if stage in {"stage1", "egodex", "pretrain_egodex"}:
-        return EgoDexDataset(data / "EgoDex" / "egodex_repacked_simple", sample_stride=sample_stride, max_episodes=max_episodes)
+        return EgoDexDataset(egodex_root or data / "EgoDex", sample_stride=sample_stride, max_episodes=max_episodes)
     if stage in {"stage2", "he_wbt", "posttrain_he_wbt"}:
         he = HEDataset(
             data / "humanoid-everyday",

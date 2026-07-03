@@ -83,7 +83,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         batch_size=96,
         epochs=1,
         sample_stride=10,
-        checkpointing_steps=10000,
+        checkpointing_steps=0,
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
@@ -94,7 +94,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         batch_size=96,
         epochs=1,
         sample_stride=1,
-        checkpointing_steps=1000,
+        checkpointing_steps=0,
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
@@ -349,6 +349,7 @@ def train_stage(args: argparse.Namespace) -> Path:
         sample_stride=args.sample_stride,
         max_episodes=args.max_episodes,
         proprio_stats_path=stats,
+        egodex_root=args.egodex_root,
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
     )
@@ -694,6 +695,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--char-max-length", type=int, default=None)
     p.add_argument("--init-ckpt", default=None)
     p.add_argument("--proprio-stats-path", default=None)
+    p.add_argument("--egodex-root", default=None)
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)
     p.add_argument("--epochs", type=int, default=None)
