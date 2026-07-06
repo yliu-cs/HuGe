@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from kappa.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSION
+from huge.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSION
 
 
 def _iter_files(root: str) -> list[str]:

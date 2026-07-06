@@ -8,7 +8,7 @@ the pseudo proprio.
 
 Hard constraints (see handoff doc section 0):
   - never touches any file under GR00T-WholeBodyControl/
-  - Kappa-side steps run under sys.executable (invoke this script itself with
+  - Huge-side steps run under sys.executable (invoke this script itself with
     .venv/bin/python); sim-side steps run under
     GR00T-WholeBodyControl/.venv_sim/bin/python, never bare `python3`
   - single-episode only; this script does not loop over episodes itself

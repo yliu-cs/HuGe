@@ -3,11 +3,11 @@ and lay it out next to the cola 66D tokens so `PropDataset`/`SonicTokenDataset`
 can load it with zero changes.
 
 Field mapping (see resource/info/ego_cola_pseudo_proprio_handoff.md section 5/7):
-  Kappa 34D [0:29]  (leg/leg/waist/arm/arm) <- body_q            (already raw radians,
+  Huge 34D [0:29]  (leg/leg/waist/arm/arm) <- body_q            (already raw radians,
                                                                    MuJoCo joint order == PROPRIO_LAYOUT order)
-  Kappa 34D [29]    (left_hand)             <- left_hand_q  -> dex3 close-binary (then corrected, see below)
-  Kappa 34D [30]    (right_hand)            <- right_hand_q -> dex3 close-binary (then corrected, see below)
-  Kappa 34D [31:34] (projected_gravity)     <- base_quat -> world gravity rotated into body frame
+  Huge 34D [29]    (left_hand)             <- left_hand_q  -> dex3 close-binary (then corrected, see below)
+  Huge 34D [30]    (right_hand)            <- right_hand_q -> dex3 close-binary (then corrected, see below)
+  Huge 34D [31:34] (projected_gravity)     <- base_quat -> world gravity rotated into body frame
 
 The close-binary and projected-gravity formulas mirror
 GR00T-WholeBodyControl/gear_sonic/scripts/run_data_exporter.py's
@@ -43,8 +43,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
-from kappa.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT
-from kappa.data.state_normalizer import StateNormalizer
+from huge.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT
+from huge.data.state_normalizer import StateNormalizer
 
 DEFAULT_STATS = "resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json"
 DEFAULT_OUT_ROOT = "resource/dataset/proprietary/ego/cola_pseudo_proprio"

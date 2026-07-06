@@ -1,4 +1,4 @@
-"""G1-WBT SONIC cache entry point for the new kappa package layout."""
+"""G1-WBT SONIC cache entry point for the new huge package layout."""
 
 from __future__ import annotations
 

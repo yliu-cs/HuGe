@@ -16,7 +16,7 @@
    `scripts/preprocess/proprietary_ego/` 下的外部脚本里，直接调用已编译二进制
    / 现有仓库脚本 + CLI flag。
 2. **Python 环境用 `uv` 管理，调用绑定固定**：
-   - Kappa 侧 Python → `.venv/bin/python`
+   - Huge 侧 Python → `.venv/bin/python`
    - 仿真环境 Python → `GR00T-WholeBodyControl/.venv_sim/bin/python`（必须在
      `GR00T-WholeBodyControl/` 目录下运行）
    - **禁止使用裸 `python3`**（本会话中一次用 `python3` 检查端口被用户当场
@@ -27,14 +27,14 @@
    "先不批量跑，先对一个特定样本做验证"，下次会话若要扩展到批量需重新征求
    确认。）
 
-激活环境：`source /inspire/qb-ilm2/project/robot-dna/liujiacheng-240108120088/liuyang/Kappa/.venv/bin/activate`
+激活环境：`source /inspire/qb-ilm2/project/robot-dna/liujiacheng-240108120088/liuyang/Huge/.venv/bin/activate`
 
 ---
 
 ## 1. 任务背景
 
 用 cola episode 的 SONIC latent token 回放（token → WBC deploy → MuJoCo
-仿真），采集仿真里的机器人状态，重排成 Kappa 34D 伪 proprio，使其能像真机
+仿真），采集仿真里的机器人状态，重排成 Huge 34D 伪 proprio，使其能像真机
 `PropDataset` 一样直接参与训练。整条链路已经过端到端验证（详见第 2 节），
 当前的核心难点是：**仿真采集到的状态帧如何与原始 token 的时间步精确
 对齐**（第 3 节），这也是本次会话的主要工作内容。
@@ -197,7 +197,7 @@ slow-joiner），导致 token 序号 0 那一条真实被机器人执行的消�
 ## 5. 「完全对齐」的硬契约 C1-C6（来自已消失的 pipeline 文档，折叠保留）
 
 要让伪 proprio 和真机走同一条加载路径
-（`SonicTokenDataset._load_state`，`src/kappa/data/sonic_dataset.py:225`），
+（`SonicTokenDataset._load_state`，`src/huge/data/sonic_dataset.py:225`），
 必须逐条满足：
 
 | # | 契约 | 依据 | 违反后果 |
@@ -228,9 +228,9 @@ cola_merged_cleaned_0530/
 
 ### whole_q → raw 34D 组装映射表
 
-**关键发现**：G1 `body_q` 前 29 维与 Kappa 34D 前 29 维同序同长。
+**关键发现**：G1 `body_q` 前 29 维与 Huge 34D 前 29 维同序同长。
 
-| Kappa 34D 维度 | 来源 g1_debug 字段 | 处理 |
+| Huge 34D 维度 | 来源 g1_debug 字段 | 处理 |
 |----------|---------------------|------|
 | 0:29 (leg/leg/waist/arm/arm) | `body_q[:29]` | 直接取（已是弧度 raw） |
 | 29 (left_hand) | `left_hand_q` | `_hand_binary_state(...)[0]`，closed=1 |
@@ -294,10 +294,10 @@ assert (np.abs(norm) >= 0.999).mean() < 0.2   # C6 抽检，阈值待调
 ```bash
 cd GR00T-WholeBodyControl
 # 只驱动 g1_debug 状态流，不发布图像（对齐/组装伪 proprio 只需要这个）
-.venv_sim/bin/python /path/to/Kappa/scripts/preprocess/proprietary_ego/launch_headless_sim.py &
+.venv_sim/bin/python /path/to/Huge/scripts/preprocess/proprietary_ego/launch_headless_sim.py &
 
 # 需要人工肉眼核验渲染视频时，加 --enable-image-publish（需要 MUJOCO_GL=egl）
-MUJOCO_GL=egl .venv_sim/bin/python /path/to/Kappa/scripts/preprocess/proprietary_ego/launch_headless_sim.py \
+MUJOCO_GL=egl .venv_sim/bin/python /path/to/Huge/scripts/preprocess/proprietary_ego/launch_headless_sim.py \
   --enable-image-publish --camera-port 5555 &
 ```
 
@@ -607,7 +607,7 @@ sim2real 数值差异（RMSE 普遍在 0.03-0.13 rad）符合预期的物理差�
   code 1 且无输出，即使用 `|| true`/`|| echo` 包裹也一样（怀疑是本沙箱
   环境对 `pkill` 的特殊处理，非正常 shell 语义问题）。不要用退出码判断
   是否杀成功，改用 `ps aux | grep` 或 socket bind 测试端口。
-- **禁止裸 `python3`**：本环境必须用 `.venv/bin/python`（Kappa 侧）或
+- **禁止裸 `python3`**：本环境必须用 `.venv/bin/python`（Huge 侧）或
   `.venv_sim/bin/python`（sim 侧），哪怕只是做个端口检测这种小事。
 - **`ENABLE_ELASTIC_BAND` 不能在 yaml 里改 `False`**：会导致
   `AttributeError`，必须构造完 `BaseSimulator` 后运行时翻转
@@ -646,9 +646,9 @@ sim2real 数值差异（RMSE 普遍在 0.03-0.13 rad）符合预期的物理差�
 | cola token 样本(已验证) | `resource/dataset/proprietary/ego/cola/0/trackingData_20260612_154443_latent_tokens_64d.npy` (979×64) |
 | cola 数据集根目录 | `resource/dataset/proprietary/ego/cola/`（400 个 episode，`0`~`399`） |
 | Real proprio 数据集（stats 来源） | `resource/dataset/proprietary/.../cola_merged_cleaned_0530/`（`sonic_tokens/`、`g1_proprio/`、`meta/proprio_stats_union_sonic.json`） |
-| 34D 布局定义 | `src/kappa/data/schemas.py`（`PROPRIO_LAYOUT` 附近） |
-| proprio 加载校验逻辑 | `src/kappa/data/sonic_dataset.py:147-150`（形状校验）、`:225`（`_load_state`）、`:230`（归一化） |
-| 归一化实现 | `src/kappa/data/state_normalizer.py`（`clip_outliers=True`，L74） |
+| 34D 布局定义 | `src/huge/data/schemas.py`（`PROPRIO_LAYOUT` 附近） |
+| proprio 加载校验逻辑 | `src/huge/data/sonic_dataset.py:147-150`（形状校验）、`:225`（`_load_state`）、`:230`（归一化） |
+| 归一化实现 | `src/huge/data/state_normalizer.py`（`clip_outliers=True`，L74） |
 | 抓包+对齐工具 | `scripts/preprocess/proprietary_ego/align_sim_replay.py` |
 | 无头仿真启动器 | `scripts/preprocess/proprietary_ego/launch_headless_sim.py` |
 | 组装 34D 伪 proprio 工具 | `scripts/preprocess/proprietary_ego/export_pseudo_proprio.py` |

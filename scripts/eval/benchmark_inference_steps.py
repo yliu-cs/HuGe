@@ -1,4 +1,4 @@
-"""Benchmark Kappa action sampling latency for different inference step counts."""
+"""Benchmark Huge action sampling latency for different inference step counts."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from kappa.data.collator import KappaCollator
-from kappa.data.datamodule import build_stage_dataset
-from kappa.models.qwen_sonicfm import QwenSonicFM
-from kappa.training.runner import move_batch
+from huge.data.collator import HugeCollator
+from huge.data.datamodule import build_stage_dataset
+from huge.models.qwen_sonicfm import QwenSonicFM
+from huge.training.runner import move_batch
 
 
 def _default_proprio_stats(stage: str, override: str | None) -> str | None:
@@ -29,9 +29,9 @@ def _default_proprio_stats(stage: str, override: str | None) -> str | None:
     return None
 
 
-def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> KappaCollator:
+def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> HugeCollator:
     use_qwen = bool(model.config.use_qwen) if use_qwen_processor is None else bool(use_qwen_processor)
-    return KappaCollator(
+    return HugeCollator(
         qwen_processor_path=model.config.base_vlm_path,
         use_qwen_processor=use_qwen,
         model_max_length=model.config.model_max_length,

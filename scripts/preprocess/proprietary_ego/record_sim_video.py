@@ -3,7 +3,7 @@ launch_headless_sim.py --enable-image-publish) and dump frames to an mp4.
 
 Wire format matches GR00T-WholeBodyControl/gear_sonic/utils/mujoco_sim/sensor_server.py's
 SensorServer/ImageMessageSchema (PUB, msgpack, base64-JPEG per camera key) --
-reimplemented here (not imported) to keep this Kappa-side script off the
+reimplemented here (not imported) to keep this Huge-side script off the
 GR00T-WholeBodyControl Python path, matching align_sim_replay.py's precedent.
 """
 

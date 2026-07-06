@@ -1,4 +1,4 @@
-# Kappa
+# Huge
 
 QwenSonicFM vision-language-action training stack for humanoid loco-manipulation,
 targeting the 66-D SONIC action schema and the 34-D `unitree_g1_sonic v1`
@@ -73,9 +73,9 @@ cd resource/model
 Run the audit before training:
 
 ```bash
-uv run python src/kappa/data/audit.py
+uv run python src/huge/data/audit.py
 # equivalent launcher shortcut:
-scripts/train/train_kappa.sh audit
+scripts/train/train_huge.sh audit
 ```
 
 It checks source existence, token/proprio shapes, hand-bit validity, and proprio
@@ -90,20 +90,20 @@ uv run python scripts/preprocess/calc_union_proprio_stats.py
 
 ## Training
 
-`scripts/train/train_kappa.sh` drives stage training and the data audit. Pass the
+`scripts/train/train_huge.sh` drives stage training and the data audit. Pass the
 stage explicitly (default `stage2`). The launcher auto-detects node count and
-visible GPUs from `KAPPA_*`, `PET_*`, `SLURM_*`, `CUDA_VISIBLE_DEVICES`, and
+visible GPUs from `HUGE_*`, `PET_*`, `SLURM_*`, `CUDA_VISIBLE_DEVICES`, and
 `nvidia-smi` (8 bf16 processes on one 8-GPU H200 node).
 
 ```bash
 # Stage 1: EgoDex pretraining
-scripts/train/train_kappa.sh stage1
+scripts/train/train_huge.sh stage1
 
 # Stage 2: HE + WBT posttraining
-scripts/train/train_kappa.sh stage2
+scripts/train/train_huge.sh stage2
 
 # Stage 3: proprietary real adaptation
-scripts/train/train_kappa.sh stage3
+scripts/train/train_huge.sh stage3
 ```
 
 `stage2`/`stage3` auto-init from the latest checkpoint of the previous stage
@@ -113,7 +113,7 @@ to intentionally train a later stage from scratch.
 Explicit distributed overrides:
 
 ```bash
-scripts/train/train_kappa.sh stage2 \
+scripts/train/train_huge.sh stage2 \
   --num_gpus 8 \
   --num_nodes 1 \
   --node_rank 0 \
@@ -122,7 +122,7 @@ scripts/train/train_kappa.sh stage2 \
 ```
 
 For multi-node jobs, set scheduler variables (`PET_NNODES`, `PET_NODE_RANK`,
-`MASTER_ADDR`, `MASTER_PORT`) or the `KAPPA_*` equivalents on each node.
+`MASTER_ADDR`, `MASTER_PORT`) or the `HUGE_*` equivalents on each node.
 
 Checkpoints are written under
 `.runs/train/<stage>/<timestamp>/step_<global_step>` as `model.safetensors` plus
@@ -131,7 +131,7 @@ fit inspection.
 
 ## Stage Defaults
 
-Current code defaults from `src/kappa/training/runner.py`:
+Current code defaults from `src/huge/training/runner.py`:
 
 | Stage | Purpose | Qwen3-VL strategy | LR | Per-process batch | Epochs | Warmup ratio | Weight decay | Sample stride | Max text tokens | Checkpointing |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -161,9 +161,9 @@ jitter, and eval-time center `0.95` crop without jitter.
 Common overrides:
 
 ```bash
-scripts/train/train_kappa.sh stage2 --batch-size 64 --learning-rate 2e-5
-scripts/train/train_kappa.sh stage3 --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530
-scripts/train/train_kappa.sh stage1
+scripts/train/train_huge.sh stage2 --batch-size 64 --learning-rate 2e-5
+scripts/train/train_huge.sh stage3 --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530
+scripts/train/train_huge.sh stage1
 ```
 
 Explicit `--action-hidden-size`, `--num-action-layers`, and
@@ -173,17 +173,17 @@ Qwen layer count.
 
 LoRA targets Qwen attention projections (`q_proj`, `k_proj`, `v_proj`,
 `o_proj`) with `r=8`, `alpha=16`, dropout `0.0`. Stage 1 trains it, Stage 2
-continues it, Stage 3 freezes Qwen and LoRA while training the Kappa PI
+continues it, Stage 3 freezes Qwen and LoRA while training the Huge PI
 projectors, state encoder, and action head. Override with `--qwen-lora-r`,
 `--qwen-lora-alpha`, `--qwen-lora-dropout`.
 
 DeepSpeed is on by default using `configs/deepspeed/ds_zero2.json` unless
-`--deepspeed-config` or `KAPPA_DEEPSPEED_CONFIG` is set. `ds_zero3.json` is
+`--deepspeed-config` or `HUGE_DEEPSPEED_CONFIG` is set. `ds_zero3.json` is
 available for ZeRO-3 runs.
 
 `--max-text-tokens` caps the raw instruction before the chat template;
 `--model-max-length` is a separate full-sequence cap after image and
-chat-template tokens (default `8192`). Kappa training requires Qwen processor
+chat-template tokens (default `8192`). Huge training requires Qwen processor
 inputs.
 
 ## Smoke Checks
@@ -192,17 +192,17 @@ Full-flow one-step smoke on a training node:
 
 ```bash
 uv lock
-uv run python src/kappa/data/audit.py
-scripts/train/train_kappa.sh stage1 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/train_kappa.sh stage2 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/train_kappa.sh stage3 --max-steps 1 --max-episodes 1 --batch-size 1
+uv run python src/huge/data/audit.py
+scripts/train/train_huge.sh stage1 --max-steps 1 --max-episodes 1 --batch-size 1
+scripts/train/train_huge.sh stage2 --max-steps 1 --max-episodes 1 --batch-size 1
+scripts/train/train_huge.sh stage3 --max-steps 1 --max-episodes 1 --batch-size 1
 ```
 
 Local single-GPU smoke:
 
 ```bash
-KAPPA_NUM_PROCESSES=1 KAPPA_EXPECTED_NUM_PROCESSES=1 \
-scripts/train/train_kappa.sh stage1 \
+HUGE_NUM_PROCESSES=1 HUGE_EXPECTED_NUM_PROCESSES=1 \
+scripts/train/train_huge.sh stage1 \
   --max-steps 1 \
   --max-episodes 1 \
   --batch-size 1 \
@@ -242,7 +242,7 @@ trajectory is non-overlapping and gap-free.
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-uv run python src/kappa/inference/run_kappa_server.py \
+uv run python src/huge/inference/run_huge_server.py \
   --ckpt .runs/train/stage3/20260601_091809/step_45170 \
   --host 0.0.0.0 \
   --port 5550 \
@@ -261,16 +261,16 @@ optional JPEG preview for the first image frame.
 ## Deployment Notes
 
 Deployment uses `GR00T-WholeBodyControl` as the robot-side runtime. Keep the
-Kappa server running, then launch the deploy stack and inference client from the
+Huge server running, then launch the deploy stack and inference client from the
 WBC environment. The observation path expects the 34-D G1 SONIC proprio layout
 and the proprio normalizer copied into each checkpoint directory.
 
 ```bash
-# Terminal 1: Kappa server
+# Terminal 1: Huge server
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-uv run python src/kappa/inference/run_kappa_server.py \
+uv run python src/huge/inference/run_huge_server.py \
   --ckpt .runs/qwenpi_v3_stage3/stage3/20260608_191002/step_86910 \
   --host 0.0.0.0 \
   --port 5550 \
@@ -302,5 +302,5 @@ python keyboard_pub.py
 
 ## Acknowledgment
 
-Kappa builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC, and
+Huge builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC, and
 Qwen3-VL.

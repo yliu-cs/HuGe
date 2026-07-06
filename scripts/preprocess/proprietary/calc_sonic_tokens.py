@@ -11,8 +11,8 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from kappa.data.preprocess import atomic_save_npy
-from kappa.data.schemas import ACTION_DIM, PROPRIO_DIM
+from huge.data.preprocess import atomic_save_npy
+from huge.data.schemas import ACTION_DIM, PROPRIO_DIM
 
 
 def _episodes(root: Path) -> list[Path]:

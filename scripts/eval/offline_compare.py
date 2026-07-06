@@ -1,4 +1,4 @@
-"""Offline Kappa evaluation with prediction-vs-ground-truth plots."""
+"""Offline Huge evaluation with prediction-vs-ground-truth plots."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from kappa.data.collator import KappaCollator
-from kappa.data.datamodule import build_stage_dataset
-from kappa.data.schemas import ACTION_DIM, MOTION_TOKEN_DIM
-from kappa.models.qwen_sonicfm import QwenSonicFM
-from kappa.training.runner import move_batch
+from huge.data.collator import HugeCollator
+from huge.data.datamodule import build_stage_dataset
+from huge.data.schemas import ACTION_DIM, MOTION_TOKEN_DIM
+from huge.models.qwen_sonicfm import QwenSonicFM
+from huge.training.runner import move_batch
 
 
 def _natural_path_key(path: str) -> tuple[Any, ...]:
@@ -65,9 +65,9 @@ def _default_proprio_stats(stage: str, override: str | None) -> str | None:
     return None
 
 
-def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> KappaCollator:
+def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> HugeCollator:
     use_qwen = bool(model.config.use_qwen) if use_qwen_processor is None else bool(use_qwen_processor)
-    return KappaCollator(
+    return HugeCollator(
         qwen_processor_path=model.config.base_vlm_path,
         use_qwen_processor=use_qwen,
         model_max_length=model.config.model_max_length,
@@ -147,7 +147,7 @@ def _selected_visual_starts(
     return _plot_starts(ep_len, max(1, int(stride)), explicit, max_windows)
 
 
-def _raw_item_image(collator: KappaCollator, item: dict[str, Any]) -> np.ndarray:
+def _raw_item_image(collator: HugeCollator, item: dict[str, Any]) -> np.ndarray:
     # Reuse the collator's image resolution logic so deploy-frame and dataset-video
     # samples follow the same path before we override the item image.
     return np.asarray(collator._image(item).convert("RGB"), dtype=np.uint8)
@@ -192,7 +192,7 @@ def _run_visual_ablation(
     dataset: Any,
     *,
     device: torch.device,
-    collator: KappaCollator,
+    collator: HugeCollator,
     episode_idx: int,
     timesteps: list[int] | None,
     fallback_timesteps: list[int] | None,
@@ -279,7 +279,7 @@ def _run_same_state_image_swap(
     dataset: Any,
     *,
     device: torch.device,
-    collator: KappaCollator,
+    collator: HugeCollator,
     episode_idx: int,
     timesteps: list[int] | None,
     fallback_timesteps: list[int] | None,
@@ -393,7 +393,7 @@ def _run_visualization(
     dataset: Any,
     *,
     device: torch.device,
-    collator: KappaCollator,
+    collator: HugeCollator,
     episode_idx: int,
     timesteps: list[int] | None,
     max_plot_windows: int,

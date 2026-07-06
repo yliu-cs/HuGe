@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kappa.data.schemas import PROPRIO_LAYOUT
+from huge.data.schemas import PROPRIO_LAYOUT
 
 DEFAULT_REAL_ROOT = "resource/dataset/proprietary/real/cola_merged_cleaned_0530"
 # +-5 (100ms) was too narrow: several dims' true optimum sat at the window edge.
