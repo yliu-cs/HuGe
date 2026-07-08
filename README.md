@@ -1,4 +1,4 @@
-# Huge
+# Huge: Humanoid General Foundation Model
 
 QwenSonicFM vision-language-action training stack for humanoid loco-manipulation,
 targeting the 66-D SONIC action schema and the 34-D `unitree_g1_sonic v1`

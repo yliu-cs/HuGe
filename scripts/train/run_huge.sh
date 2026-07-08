@@ -15,9 +15,15 @@ set -euo pipefail
 # found under HUGE_STAGE2_SOURCE_ROOT. The sim tree is never written to:
 #   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_real_cola}/stride_<stride>/stage3/<ts>/
 #
+# humanoid_arena mode (HUGE_STAGE3_DATA=humanoid_arena) trains stage3 from
+# scratch (--init-ckpt none, no stage1/stage2) on one HumanoidArena task
+# (HUGE_HUMANOID_ARENA_TASK, default ppbox), once per architecture in
+# HUGE_HUMANOID_ARENA_ARCHITECTURES:
+#   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_humanoidarena}/<task>/<arch>/stage3/<ts>/
+#
 # Useful environment variables:
 #   HUGE_DRY_RUN=1                 print commands without launching training
-#   HUGE_STAGE3_DATA=sim|real      stage3 data source (default sim)
+#   HUGE_STAGE3_DATA=sim|real|humanoid_arena   stage3 data source (default sim)
 #   HUGE_RUN_ROOT=.runs/xxx        change the root for all experiments
 #   HUGE_STAGE2_SOURCE_ROOT=...    (real) existing stage1/stage2 runs to init from
 #   HUGE_STAGE1_SAMPLE_STRIDES=... space-separated stride values
@@ -25,7 +31,11 @@ set -euo pipefail
 #   HUGE_SIM_STAGE3_CHECKPOINTING_STEPS=...   sim stage3 ckpt interval (default 500)
 #   HUGE_REAL_STAGE3_EPOCHS=...    real stage3 epochs (default 50)
 #   HUGE_REAL_STAGE3_CHECKPOINTING_STEPS=...  real stage3 ckpt interval (default 20000)
-#   HUGE_MODEL_ARCHITECTURE=...    qwenpi_v3, qwengr00t, or qwenoft
+#   HUGE_HUMANOID_ARENA_TASK=...   HumanoidArena task name (default ppbox; only ppbox exists today)
+#   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenpi_v3 qwengr00t qwenoft")
+#   HUGE_HUMANOID_ARENA_STAGE3_EPOCHS=...      humanoid_arena stage3 epochs (default 50)
+#   HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS=...  humanoid_arena ckpt interval (default 1000)
+#   HUGE_MODEL_ARCHITECTURE=...    qwenpi_v3, qwengr00t, or qwenoft (sim/real modes only)
 #   HUGE_LOCK_FILE=...             override the default run flag file
 #
 # Usage:
@@ -42,7 +52,8 @@ STAGE3_DATA="${HUGE_STAGE3_DATA:-sim}"
 case "$STAGE3_DATA" in
   sim)  DEFAULT_RUN_ROOT="./.runs/stage1_stride_abla" ;;
   real) DEFAULT_RUN_ROOT="./.runs/stage3_real_cola" ;;
-  *) echo "HUGE_STAGE3_DATA must be 'sim' or 'real', got '$STAGE3_DATA'" >&2; exit 2 ;;
+  humanoid_arena) DEFAULT_RUN_ROOT="./.runs/stage3_humanoidarena" ;;
+  *) echo "HUGE_STAGE3_DATA must be 'sim', 'real', or 'humanoid_arena', got '$STAGE3_DATA'" >&2; exit 2 ;;
 esac
 RUN_ROOT="${HUGE_RUN_ROOT:-$DEFAULT_RUN_ROOT}"
 MODEL_ARCHITECTURE="${HUGE_MODEL_ARCHITECTURE:-qwenpi_v3}"
@@ -65,6 +76,14 @@ REAL_STAGE3_CHECKPOINTING_STEPS="${HUGE_REAL_STAGE3_CHECKPOINTING_STEPS:-20000}"
 
 # Existing stage1/stage2 runs used to initialize real stage3 (read-only).
 STAGE2_SOURCE_ROOT="${HUGE_STAGE2_SOURCE_ROOT:-./.runs/stage1_stride_abla}"
+
+# --- humanoid_arena stage3 (from scratch, one run per task x architecture) ---
+HUMANOID_ARENA_TASK="${HUGE_HUMANOID_ARENA_TASK:-ppbox}"
+HUMANOID_ARENA_ROOT="${HUGE_STAGE3_HUMANOID_ARENA_ROOT:-resource/dataset/HumanoidArena/HOI_pp_box}"
+HUMANOID_ARENA_STATS="${HUGE_STAGE3_HUMANOID_ARENA_PROPRIO_STATS:-$HUMANOID_ARENA_ROOT/meta/proprio_stats_union_sonic.json}"
+HUMANOID_ARENA_STAGE3_EPOCHS="${HUGE_HUMANOID_ARENA_STAGE3_EPOCHS:-50}"
+HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS="${HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS:-1000}"
+read -r -a HUMANOID_ARENA_ARCHITECTURES <<< "${HUGE_HUMANOID_ARENA_ARCHITECTURES:-qwenpi_v3 qwengr00t qwenoft}"
 
 read -r -a STAGE1_SAMPLE_STRIDES <<< "${HUGE_STAGE1_SAMPLE_STRIDES:-1 2 5 10 50}"
 SELECTED_STRIDE=""
@@ -114,7 +133,9 @@ if [[ -n "$SELECTED_STRIDE" ]]; then
 fi
 
 LOCK_SCOPE="all"
-if [[ "${#STAGE1_SAMPLE_STRIDES[@]}" -eq 1 ]]; then
+if [[ "$STAGE3_DATA" == "humanoid_arena" ]]; then
+  LOCK_SCOPE="humanoid_arena_${HUMANOID_ARENA_TASK}"
+elif [[ "${#STAGE1_SAMPLE_STRIDES[@]}" -eq 1 ]]; then
   LOCK_SCOPE="stride_${STAGE1_SAMPLE_STRIDES[0]}"
 fi
 LOCK_FILE="${HUGE_LOCK_FILE:-$RUN_ROOT/run_huge_${LOCK_SCOPE}.flag}"
@@ -231,7 +252,28 @@ run_real_stage3() {
     --checkpointing-steps "$REAL_STAGE3_CHECKPOINTING_STEPS"
 }
 
+# From-scratch stage3 on HumanoidArena HOI_pp_box alone (no stage1/stage2 init).
+run_humanoid_arena_stage3() {
+  local architecture="$1"
+  run_exp stage3 \
+    --model-architecture "$architecture" \
+    --init-ckpt none \
+    --prop-roots \
+    --humanoid-arena-roots "$HUMANOID_ARENA_ROOT" \
+    --proprio-stats-path "$HUMANOID_ARENA_STATS" \
+    --epochs "$HUMANOID_ARENA_STAGE3_EPOCHS" \
+    --checkpointing-steps "$HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS"
+}
+
 run_all() {
+  if [[ "$STAGE3_DATA" == "humanoid_arena" ]]; then
+    local architecture
+    for architecture in "${HUMANOID_ARENA_ARCHITECTURES[@]}"; do
+      EXPERIMENT_NAME="$HUMANOID_ARENA_TASK/$architecture"
+      run_humanoid_arena_stage3 "$architecture"
+    done
+    return
+  fi
   local sample_stride
   for sample_stride in "${STAGE1_SAMPLE_STRIDES[@]}"; do
     EXPERIMENT_NAME="stride_${sample_stride}"

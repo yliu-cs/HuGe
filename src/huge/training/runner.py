@@ -352,6 +352,7 @@ def train_stage(args: argparse.Namespace) -> Path:
         egodex_root=args.egodex_root,
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
+        humanoid_arena_roots=args.humanoid_arena_roots,
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -698,6 +699,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--egodex-root", default=None)
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)
+    p.add_argument("--humanoid-arena-roots", nargs="*", default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)

@@ -223,6 +223,13 @@ def build_audit(repo_root: Path, sample_limit: int) -> dict[str, Any]:
             dataset / "proprietary" / "real" / "cola_merged_cleaned_0530" / "g1_proprio",
             expect_state=True,
         ),
+        SourceSpec(
+            "humanoid_arena_hoi_pp_box",
+            dataset / "HumanoidArena" / "HOI_pp_box",
+            dataset / "HumanoidArena" / "HOI_pp_box" / "sonic_tokens",
+            dataset / "HumanoidArena" / "HOI_pp_box" / "g1_proprio",
+            expect_state=True,
+        ),
     ]
     return {
         "repo_root": str(repo_root),

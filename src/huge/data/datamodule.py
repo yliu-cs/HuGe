@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, Subset
 
 from huge.data.egodex_dataset import EgoDexDataset
 from huge.data.he_dataset import HEDataset
+from huge.data.humanoid_arena_dataset import HumanoidArenaDataset
 from huge.data.prop_dataset import PropDataset
 from huge.data.prop_ego_dataset import PropEgoDataset
 from huge.data.sonic_dataset import MixtureDataset
@@ -138,6 +139,7 @@ def build_stage_dataset(
     egodex_root: str | Path | None = None,
     prop_roots: list[str] | None = None,
     prop_ego_roots: list[str] | None = None,
+    humanoid_arena_roots: list[str] | None = None,
 ) -> Dataset:
     root = Path(repo_root)
     data = root / "resource" / "dataset"
@@ -167,7 +169,7 @@ def build_stage_dataset(
             datasets.extend(PropEgoDataset(path, sample_stride=sample_stride, max_episodes=max_episodes) for path in roots)
             return MixtureDataset(datasets)
 
-        roots = prop_roots or [str(data / "proprietary" / "real" / "cola_merged_cleaned_0530")]
+        roots = [str(data / "proprietary" / "real" / "cola_merged_cleaned_0530")] if prop_roots is None else prop_roots
         datasets.extend(
             PropDataset(
                 path,
@@ -176,6 +178,15 @@ def build_stage_dataset(
                 max_episodes=max_episodes,
             )
             for path in roots
+        )
+        datasets.extend(
+            HumanoidArenaDataset(
+                path,
+                sample_stride=sample_stride,
+                proprio_normalizer=normalizer,
+                max_episodes=max_episodes,
+            )
+            for path in (humanoid_arena_roots or [])
         )
         return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     raise ValueError(f"unknown stage {stage!r}")

@@ -39,13 +39,17 @@ def main() -> None:
     parser.add_argument("--he-cache-root", default="resource/dataset/humanoid-everyday-cache")
     parser.add_argument("--wbt-source-root", default="resource/dataset/G1_WBT")
     parser.add_argument("--prop-root", default="resource/dataset/proprietary/real/cola_merged_cleaned_0530")
+    parser.add_argument("--humanoid-arena-root", default=None, help="e.g. resource/dataset/HumanoidArena/HOI_pp_box")
     parser.add_argument("--out", default="resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json")
     args = parser.parse_args()
     roots = {
         "HE": Path(args.he_cache_root) / "g1_proprio",
         "WBT": Path(args.wbt_source_root) / "g1_proprio",
-        "PROP": Path(args.prop_root) / "g1_proprio",
     }
+    if args.prop_root:
+        roots["PROP"] = Path(args.prop_root) / "g1_proprio"
+    if args.humanoid_arena_root:
+        roots["HUMANOID_ARENA"] = Path(args.humanoid_arena_root) / "g1_proprio"
     arrays: list[np.ndarray] = []
     counts: dict[str, dict[str, int]] = {}
     for tag, root in roots.items():

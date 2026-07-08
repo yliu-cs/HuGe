@@ -39,6 +39,7 @@ dependencies = [
     "ninja>=1.13.0",
     "flash-attn",
     "mpi4py>=4.1.2",
+    "modelscope>=1.38.1",
 ]
 
 [build-system]
