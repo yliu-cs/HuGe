@@ -169,6 +169,28 @@ def _is_main_process(accelerator: Any | None) -> bool:
     return accelerator is None or accelerator.is_main_process
 
 
+def _update_training_progress(
+    *,
+    pbar: Any,
+    accelerator: Any | None,
+    global_step: int,
+    loss: torch.Tensor,
+    lr_scheduler: Any,
+) -> None:
+    """Reduce loss on every process, then update the progress bar on main."""
+    loss_for_log = loss.detach().float()
+    if accelerator is not None:
+        loss_for_log = accelerator.reduce(loss_for_log, reduction="mean")
+    if not _is_main_process(accelerator):
+        return
+    pbar.update(1)
+    pbar.set_postfix(
+        step=global_step,
+        loss=f"{loss_for_log.item():.4f}",
+        lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+    )
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -353,6 +375,7 @@ def train_stage(args: argparse.Namespace) -> Path:
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
         humanoid_arena_roots=args.humanoid_arena_roots,
+        humanoid_arena_task=args.humanoid_arena_task,
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -584,13 +607,12 @@ def train_stage(args: argparse.Namespace) -> Path:
                         optimizer.step()
                     lr_scheduler.step()
                     global_step += 1
-                    pbar.update(1)
-                    current_loss = float(losses["loss"].detach())
-                    current_lr = lr_scheduler.get_last_lr()[0]
-                    pbar.set_postfix(
-                        step=global_step,
-                        loss=f"{current_loss:.4f}",
-                        lr=f"{current_lr:.2e}",
+                    _update_training_progress(
+                        pbar=pbar,
+                        accelerator=accelerator,
+                        global_step=global_step,
+                        loss=losses["loss"],
+                        lr_scheduler=lr_scheduler,
                     )
                     if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
                         _log_main(accelerator, f"[{args.stage}] saving checkpoint: step={global_step} path={out_dir / f'step_{global_step}'}")
@@ -700,6 +722,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)
     p.add_argument("--humanoid-arena-roots", nargs="*", default=None)
+    p.add_argument("--humanoid-arena-task", default="all")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)

@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+VENV_PYTHON="$REPO_ROOT/.venv/bin/python"
+if [[ -x "$VENV_PYTHON" ]] && VENV_PURELIB="$(
+  "$VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null
+)"; then
+  VENV_CUDNN_LIB="$VENV_PURELIB/nvidia/cudnn/lib"
+  if [[ -f "$VENV_CUDNN_LIB/libcudnn.so.9" && -f "$VENV_CUDNN_LIB/libcudnn_graph.so.9" ]]; then
+    case "${LD_LIBRARY_PATH:-}" in
+      "$VENV_CUDNN_LIB"|"$VENV_CUDNN_LIB":*) ;;
+      *) export LD_LIBRARY_PATH="$VENV_CUDNN_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+  elif [[ -d "$VENV_CUDNN_LIB" ]]; then
+    echo "WARNING: incomplete cuDNN installation under $VENV_CUDNN_LIB; leaving LD_LIBRARY_PATH unchanged" >&2
+  fi
+fi
+
 stage="${1:-stage2}"
 shift || true
 

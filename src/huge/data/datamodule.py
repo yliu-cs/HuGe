@@ -140,6 +140,7 @@ def build_stage_dataset(
     prop_roots: list[str] | None = None,
     prop_ego_roots: list[str] | None = None,
     humanoid_arena_roots: list[str] | None = None,
+    humanoid_arena_task: str = "all",
 ) -> Dataset:
     root = Path(repo_root)
     data = root / "resource" / "dataset"
@@ -182,6 +183,7 @@ def build_stage_dataset(
         datasets.extend(
             HumanoidArenaDataset(
                 path,
+                task=humanoid_arena_task,
                 sample_stride=sample_stride,
                 proprio_normalizer=normalizer,
                 max_episodes=max_episodes,

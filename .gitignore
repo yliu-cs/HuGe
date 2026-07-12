@@ -14,6 +14,7 @@ sync*
 .codex/
 .sii/
 AGENTS.md
+docs/
 skills/
 
 # Python / uv
@@ -46,7 +47,7 @@ checkpoints/
 logs/
 wandb/
 mlruns/
-
+tests/
 
 # Model weights and large binary artifacts
 *.ckpt
