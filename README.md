@@ -1,306 +1,521 @@
-# Huge: Humanoid General Foundation Model
+# 🤖 Huge: Humanoid General Foundation Model
 
-QwenSonicFM vision-language-action training stack for humanoid loco-manipulation,
-targeting the 66-D SONIC action schema and the 34-D `unitree_g1_sonic v1`
-proprioception layout.
+Huge is a Qwen3-VL vision-language-action training and inference stack for
+humanoid loco-manipulation.
 
-Staged training path:
+## 🧩 Core contracts
 
-- Stage 1: EgoDex visual-language pretraining (64-D SONIC motion tokens).
-- Stage 2: Humanoid-Everyday + G1-WBT whole-body posttraining.
-- Stage 3: proprietary real-robot adaptation.
+| Item | Value |
+| --- | --- |
+| Action | 66-D: 64-D SONIC motion token + 2 binary hand states |
+| Hand state | left/right; closed = 1, open = 0 |
+| Proprioception | 34-D `unitree_g1_sonic v1` |
+| Action horizon | 50 |
+| Control rate | 50 Hz |
+| Architectures | `qwenpi_v3`, `qwengr00t`, `qwenoft` |
+| Base VLM | `resource/model/Qwen3-VL-2B-Instruct` |
+| SONIC assets | `resource/model/sonic` |
 
-## Environment
+Training stages:
+
+| Stage | Data |
+| --- | --- |
+| `stage1` | EgoDex; 64-D actions are padded and hand dimensions are masked |
+| `stage2` | Humanoid-Everyday + G1-WBT |
+| `stage3` | proprietary real/sim data or the unified HumanoidArena cache |
+
+## ⚙️ Requirements
+
+- Linux x86_64
+- Python 3.12
+- `uv`
+- CUDA 12.8-compatible driver and GPU for training
+
+The lock file pins PyTorch 2.7.1 CUDA 12.8 wheels and the Python 3.12
+`flash-attn` 2.8.3 wheel.
+
+Run all commands from the repository root.
 
 ```bash
-uv sync
+uv sync --frozen
 ```
 
-Pins CUDA 12.8 PyTorch wheels and a prebuilt `flash-attn` (Python 3.12, PyTorch
-2.7, CUDA 12). Verify:
+Verify the environment:
 
 ```bash
-uv run python - <<'PY'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src .venv/bin/python - <<'PY'
 import importlib.metadata as md
 import torch
-print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("flash-attn", md.version("flash-attn"))
+import huge
+
+print("huge:", huge.__file__)
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("flash-attn:", md.version("flash-attn"))
 PY
 ```
 
-## Resources
+Use `PYTHONPATH=src .venv/bin/python` for Huge Python entry points. Do not
+mix the root environment with the separate WBC or Isaac Lab environments.
+
+## 🗂️ Repository layout
 
 ```text
+src/huge/
+  data/          datasets, schemas, preprocessing, stats, normalization
+  models/        QwenSonicFM and action heads
+  training/      runner, losses, checkpointing
+  inference/     policy, ZMQ server, SONIC adapter, deployment logging
+scripts/
+  preprocess/
+  train/
+  eval/
+configs/deepspeed/
+tests/
 resource/
-  dataset/
-    EgoDex -> external EgoDex dataset
-      egodex_repacked_simple/
-    humanoid-everyday -> external Humanoid-Everyday dataset
-    humanoid-everyday-cache/
-      sonic_tokens/
-      g1_proprio/
-      meta/
-    G1_WBT -> external G1-WBT dataset
-      sonic_tokens/
-      g1_proprio/
-      meta/
-    G1_WBT-cache/
-      meta/
-    pico_data -> external collected sample data
-    proprietary/ego/2026-5-23/
-    proprietary/real/cola_merged_cleaned_0530/
-      sonic_tokens/
-      g1_proprio/
-      videos/
-      meta/
-    proprietary/simple/2026-05-21/
+  datasets/
   model/
-    Qwen3-VL-2B-Instruct/
-    sonic/
+.runs/
+GR00T-WholeBodyControl/
+HumanoidArena/
 ```
 
-Default Qwen3-VL path: `resource/model/Qwen3-VL-2B-Instruct`. Default SONIC
-assets: `resource/model/sonic`. Download with `resource/model/hfd.sh`:
+`GR00T-WholeBodyControl` and `HumanoidArena` are external runtime projects
+with their own environments and instructions.
+
+## 📦 Model assets
+
+Download the local Qwen3-VL model and SONIC ONNX assets:
 
 ```bash
-cd resource/model
-./hfd.sh Qwen/Qwen3-VL-2B-Instruct --local-dir Qwen3-VL-2B-Instruct
-./hfd.sh nvidia/GEAR-SONIC --local-dir sonic --include model_encoder.onnx model_decoder.onnx observation_config.yaml
+resource/model/hfd.sh Qwen/Qwen3-VL-2B-Instruct \
+  --tool wget \
+  --local-dir resource/model/Qwen3-VL-2B-Instruct
+
+resource/model/hfd.sh nvidia/GEAR-SONIC \
+  --tool wget \
+  --local-dir resource/model/sonic \
+  --include model_encoder.onnx model_decoder.onnx observation_config.yaml
 ```
 
-## Data Checks
+The Qwen loader uses local files only.
 
-Run the audit before training:
+## 🗃️ HumanoidArena data
 
-```bash
-uv run python src/huge/data/audit.py
-# equivalent launcher shortcut:
-scripts/train/train_huge.sh audit
+### Required inputs
+
+```text
+resource/datasets/
+  HumanoidArena_raw/
+  humanoid-everyday-cache/
+    g1_proprio/
+  G1_WBT/
+    g1_proprio/
 ```
 
-It checks source existence, token/proprio shapes, hand-bit validity, and proprio
-normalizer round trips.
+`G1_WBT` may be an external symlink.
 
-Regenerate proprio stats if needed:
+### Download raw SONIC data
+
+The following command downloads every top-level task's `sonic/` or
+`SONIC/` subtree from `Twang2026/HumanoidArena_raw@master`:
 
 ```bash
-uv run python scripts/preprocess/calc_g1_proprio_stats.py
-uv run python scripts/preprocess/calc_union_proprio_stats.py
+PYTHONPATH=src .venv/bin/python - <<'PY'
+from modelscope.hub.snapshot_download import dataset_snapshot_download
+
+dataset_snapshot_download(
+    dataset_id="Twang2026/HumanoidArena_raw",
+    revision="master",
+    local_dir="resource/datasets/HumanoidArena_raw",
+    allow_patterns=["*/sonic/**", "*/SONIC/**"],
+)
+PY
 ```
 
-## Training
+This is a network and disk-intensive operation.
 
-`scripts/train/train_huge.sh` drives stage training and the data audit. Pass the
-stage explicitly (default `stage2`). The launcher auto-detects node count and
-visible GPUs from `HUGE_*`, `PET_*`, `SLURM_*`, `CUDA_VISIBLE_DEVICES`, and
-`nvidia-smi` (8 bf16 processes on one 8-GPU H200 node).
+### Build the unified cache
 
 ```bash
-# Stage 1: EgoDex pretraining
-scripts/train/train_huge.sh stage1
-
-# Stage 2: HE + WBT posttraining
-scripts/train/train_huge.sh stage2
-
-# Stage 3: proprietary real adaptation
-scripts/train/train_huge.sh stage3
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/proprietary/calc_sonic_tokens_from_humanoid_arena.py
 ```
 
-`stage2`/`stage3` auto-init from the latest checkpoint of the previous stage
-under `.runs/train`. Override with `--init-ckpt <path>`; use `--init-ckpt none`
-to intentionally train a later stage from scratch.
+Default inputs and output:
 
-Explicit distributed overrides:
+| Argument | Default |
+| --- | --- |
+| `--raw-root` | `resource/datasets/HumanoidArena_raw` |
+| `--out-root` | `resource/datasets/HumanoidArena` |
+| `--he-cache-root` | `resource/datasets/humanoid-everyday-cache` |
+| `--wbt-source-root` | `resource/datasets/G1_WBT` |
 
-```bash
-scripts/train/train_huge.sh stage2 \
-  --num_gpus 8 \
-  --num_nodes 1 \
-  --node_rank 0 \
-  --master_addr 127.0.0.1 \
-  --master_port 29500
+The preprocessor validates all episodes, writes to staging, computes
+HE + WBT + HumanoidArena union stats, validates the cache, and publishes it
+atomically.
+
+```text
+resource/datasets/HumanoidArena/
+  _SUCCESS
+  sonic_tokens/
+  g1_proprio/
+  videos/chunk-000/observation.images.ego_view/
+  meta/
+    conversion_manifest.json
+    language_map.json
+    proprio_stats_union_sonic.json
 ```
 
-For multi-node jobs, set scheduler variables (`PET_NNODES`, `PET_NODE_RANK`,
-`MASTER_ADDR`, `MASTER_PORT`) or the `HUGE_*` equivalents on each node.
+Embedded v2 RGB frames are encoded to MP4. V3 sidecar videos are linked back to
+the raw tree. Do not move or delete `HumanoidArena_raw` after preprocessing.
 
-Checkpoints are written under
-`.runs/train/<stage>/<timestamp>/step_<global_step>` as `model.safetensors` plus
-JSON sidecars. Training runs no validation; use offline evaluation for visual
-fit inspection.
+An unchanged completed cache is reused after validation. Use `--rebuild` only
+when intentionally replacing an existing cache.
 
-## Stage Defaults
+## 🏋️ Training
 
-Current code defaults from `src/huge/training/runner.py`:
-
-| Stage | Purpose | Qwen3-VL strategy | LR | Per-process batch | Epochs | Warmup ratio | Weight decay | Sample stride | Max text tokens | Checkpointing |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `stage1` | EgoDex visual-language pretraining; hand dims masked | Qwen frozen, LoRA trainable | `1e-4` | `96` | `1` | `0.05` | `0.01` | `5` | `48` | every `10000` steps |
-| `stage2` | Humanoid-Everyday + G1-WBT posttraining | Qwen frozen, LoRA trainable | `1e-4` | `96` | `1` | `0.05` | `0.01` | `2` | `48` | every `1000` steps |
-| `stage3` | proprietary real adaptation | Qwen frozen, LoRA frozen | `2e-5` | `32` | `10` | `0.1` | `0.005` | `1` | `48` | every `2000` steps |
-
-Shared defaults: PI model only; `action_hidden_size=1024`,
-`num_action_layers=16`, `num_attention_heads=16`,
-`state_dropout_prob=0.2`, `action_horizon=50`, `num_inference_steps=4`,
-`gradient_accumulation_steps=1`, `num_workers=8`, `block_shuffle_size=64`,
-`frame_cache_size=2`, `prefetch_factor=2`, `drop_last=false`,
-`model_max_length=8192`.
-
-Qwen hidden states are projected into the action-head width when needed, so the
-action head is decoupled from the Qwen hidden size. PI uses one flow-matching
-loss over the available SONIC mask. For 66-D datasets this supervises all 66
-action dimensions, including hand bits; EgoDex 64-D inputs pad and mask missing
-hand dims. There is no separate hand BCE branch.
-Stage 3 defaults to
-`resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json`;
-Stage 2 to `resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json`.
-Training images use the explicit GR00T-style preprocessing path:
-pad-to-square, resize to `256x256`, train-time random `0.95` crop plus color
-jitter, and eval-time center `0.95` crop without jitter.
-
-Common overrides:
+Training must use the launcher:
 
 ```bash
-scripts/train/train_huge.sh stage2 --batch-size 64 --learning-rate 2e-5
-scripts/train/train_huge.sh stage3 --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530
-scripts/train/train_huge.sh stage1
+bash scripts/train/train_huge.sh <stage> [options]
 ```
 
-Explicit `--action-hidden-size`, `--num-action-layers`, and
-`--num-attention-heads` overrides are accepted. The action hidden size must be
-divisible by the head count, and `num_action_layers` must not exceed the loaded
-Qwen layer count.
+The launcher configures Accelerate, DeepSpeed, GPU/process discovery, cuDNN,
+and previous-stage checkpoint selection.
 
-LoRA targets Qwen attention projections (`q_proj`, `k_proj`, `v_proj`,
-`o_proj`) with `r=8`, `alpha=16`, dropout `0.0`. Stage 1 trains it, Stage 2
-continues it, Stage 3 freezes Qwen and LoRA while training the Huge PI
-projectors, state encoder, and action head. Override with `--qwen-lora-r`,
-`--qwen-lora-alpha`, `--qwen-lora-dropout`.
-
-DeepSpeed is on by default using `configs/deepspeed/ds_zero2.json` unless
-`--deepspeed-config` or `HUGE_DEEPSPEED_CONFIG` is set. `ds_zero3.json` is
-available for ZeRO-3 runs.
-
-`--max-text-tokens` caps the raw instruction before the chat template;
-`--model-max-length` is a separate full-sequence cap after image and
-chat-template tokens (default `8192`). Huge training requires Qwen processor
-inputs.
-
-## Smoke Checks
-
-Full-flow one-step smoke on a training node:
+### HumanoidArena single configuration
 
 ```bash
-uv lock
-uv run python src/huge/data/audit.py
-scripts/train/train_huge.sh stage1 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/train_huge.sh stage2 --max-steps 1 --max-episodes 1 --batch-size 1
-scripts/train/train_huge.sh stage3 --max-steps 1 --max-episodes 1 --batch-size 1
+bash scripts/train/train_huge.sh stage3 \
+  --model-architecture qwenpi_v3 \
+  --init-ckpt none \
+  --prop-roots \
+  --humanoid-arena-roots resource/datasets/HumanoidArena \
+  --humanoid-arena-task HOI_pp_box \
+  --proprio-stats-path \
+    resource/datasets/HumanoidArena/meta/proprio_stats_union_sonic.json
 ```
 
-Local single-GPU smoke:
+The empty `--prop-roots` is intentional; it disables the default proprietary
+dataset.
+
+Use `--humanoid-arena-task all` for the full unified cache. Valid task names
+are recorded in `meta/conversion_manifest.json`.
+
+### HumanoidArena experiment matrix
+
+`scripts/train/run_huge.sh` defaults to nine sequential runs:
+
+- task: `HOI_pp_box`
+- architectures: `qwenpi_v3 qwengr00t qwenoft`
+- tuning modes: `full lora frozen_vlm`
+- initialization: none
+- epochs: 50
+- checkpoint interval: 3000 steps
+
+Tuning modes:
+
+| Mode | VLM update |
+| --- | --- |
+| `full` | train the full Qwen model |
+| `lora` | train attention LoRA; default r=8, alpha=16, dropout=0 |
+| `frozen_vlm` | freeze Qwen; train Huge action components |
+
+Preview one configuration without training:
 
 ```bash
-HUGE_NUM_PROCESSES=1 HUGE_EXPECTED_NUM_PROCESSES=1 \
-scripts/train/train_huge.sh stage1 \
-  --max-steps 1 \
-  --max-episodes 1 \
-  --batch-size 1 \
-  --num-workers 0
+tmp_dir="$(mktemp -d /tmp/huge-matrix-dry-run.XXXXXX)"
+
+HUGE_DRY_RUN=1 \
+HUGE_STAGE3_DATA=humanoid_arena \
+HUGE_HUMANOID_ARENA_ARCHITECTURES=qwenpi_v3 \
+HUGE_HUMANOID_ARENA_TUNING_MODES=full \
+HUGE_LOCK_FILE="$tmp_dir/run.lock" \
+HUGE_RUN_ROOT="$tmp_dir/runs" \
+bash scripts/train/run_huge.sh
 ```
 
-## Offline Evaluation
-
-Visualize predictions vs ground truth for one or more checkpoints:
+Run the default matrix:
 
 ```bash
-uv run python scripts/eval/offline_compare.py \
-  --ckpt .runs/train/stage3/20260602_014333/step_* \
+bash scripts/train/run_huge.sh
+```
+
+Run one selected configuration:
+
+```bash
+HUGE_HUMANOID_ARENA_TASK=HOI_pp_box \
+HUGE_HUMANOID_ARENA_ARCHITECTURES=qwenpi_v3 \
+HUGE_HUMANOID_ARENA_TUNING_MODES=full \
+bash scripts/train/run_huge.sh
+```
+
+Legacy matrix modes:
+
+- `HUGE_STAGE3_DATA=sim` runs Stage 1 -> Stage 2 -> sim Stage 3 for strides
+  `1 2 5 10 50` and writes under `.runs/stage1_stride_abla`.
+- `HUGE_STAGE3_DATA=real` runs real Stage 3 for those strides, initializes from
+  `HUGE_STAGE2_SOURCE_ROOT`, and writes under `.runs/stage3_real_cola`.
+
+Both modes retain legacy `resource/dataset/` defaults and require path
+alignment before use.
+
+Outputs:
+
+```text
+.runs/stage3_humanoidarena/
+  <task>/<architecture>/<tuning-mode>/stage3/<run-id>/
+    train.log
+    data_manifest.json
+    training_config.json
+    step_<global-step>/
+      model.safetensors
+      config.json
+      proprio_stats_sonic.json
+      proprio_norm_config.json
+```
+
+### Stage defaults
+
+| Stage | LR | Batch/process | Epochs | Stride | Warmup | Weight decay | Periodic checkpoint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `stage1` | `1e-4` | 96 | 1 | 10 | 0.05 | 0.01 | disabled |
+| `stage2` | `1e-4` | 96 | 1 | 1 | 0.05 | 0.01 | disabled |
+| `stage3` | `3e-5` | 32 | 30 | 1 | 0.1 | 0.005 | every 10000 steps |
+
+Shared defaults: `qwenpi_v3`, full Qwen training, bf16, DeepSpeed ZeRO-2,
+16 action layers, 1024 action hidden size, 16 attention heads, 4 inference
+steps, 8 workers, and no validation loop. A final checkpoint is always saved.
+
+For explicit distributed settings:
+
+```bash
+bash scripts/train/train_huge.sh stage3 \
+  --num-gpus 8 \
+  --num-nodes 1 \
+  --node-rank 0 \
+  --master-addr 127.0.0.1 \
+  --master-port 29500 \
+  --init-ckpt none \
+  --prop-roots /path/to/dataset \
+  --proprio-stats-path /path/to/proprio_stats_union_sonic.json
+```
+
+Stage 1 and Stage 2, plus the legacy sim/real pipelines, still default to
+`resource/dataset/`. Stage 1 accepts `--egodex-root`; Stage 2 has no HE/WBT
+root override. See [Compatibility notes](#compatibility-notes).
+
+## 📊 Offline evaluation
+
+`offline_compare.py` plots predicted and ground-truth actions for proprietary
+datasets:
+
+```bash
+MPLCONFIGDIR=/tmp/huge-matplotlib \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+PYTHONPATH=src \
+.venv/bin/python scripts/eval/offline_compare.py \
+  --ckpt '.runs/train/stage3/<run-id>/step_*' \
   --stage stage3 \
-  --proprio-stats-path .runs/train/stage3/20260602_014333/step_5000/proprio_stats_sonic.json \
-  --prop-roots resource/dataset/proprietary/real/cola_merged_cleaned_0530 \
-  --num-inference-steps 8 \
-  --batch-size 8 \
+  --prop-roots /path/to/proprietary/dataset \
+  --proprio-stats-path /path/to/proprio_stats_union_sonic.json \
+  --device cuda \
+  --batch-size 4 \
   --sample-stride 1 \
   --chunk-keep-steps 20 \
-  --episode-idx 123 \
+  --episode-idx 0 \
   --out-dir .runs/eval/offline_compare
 ```
 
-Writes one PNG per checkpoint (all SONIC dimensions and hand bits). No metrics —
-visualization only.
+Base mode writes one PNG per checkpoint. Add
+`--visual-ablation --visual-swap-test` to produce visual-sensitivity JSON
+diagnostics.
 
-`--chunk-keep-steps N` still asks the model to predict the full
-`action_horizon`, but only stitches the first `N` actions from each predicted
-chunk into the plot. With `action_horizon=50` and `N=10`, plot windows start at
-`t=0,10,20,...`; each window discards predicted actions `10:50`, so the plotted
-trajectory is non-overlapping and gap-free.
+This entry point does not expose HumanoidArena manifest/task arguments and is
+not a native HumanoidArena evaluator.
 
-## Inference Server
+## 🌐 Inference server
 
 ```bash
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-
-uv run python src/huge/inference/run_huge_server.py \
-  --ckpt .runs/train/stage3/20260601_091809/step_45170 \
-  --host 0.0.0.0 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+PYTHONPATH=src \
+.venv/bin/python src/huge/inference/run_huge_server.py \
+  --ckpt .runs/train/stage3/<run-id>/step_<step> \
+  --proprio-stats-path /path/to/proprio_stats_union_sonic.json \
+  --host 127.0.0.1 \
   --port 5550 \
   --device cuda \
   --action-horizon 50 \
-  --log-dir .runs/deploy_log/$(date +%Y%m%d_%H%M%S)
+  --log-dir .runs/deploy_log/<run-id>
 ```
 
-The server exposes a ZMQ request/reply endpoint on `tcp://<host>:<port>`. Use
-`--closed-loop-enable` to also publish SONIC actions on `--sonic-pub-bind`
-for closed-loop integration.
-When `--log-dir` is set, each `get_action` call is stored as
-`calls/call_<idx>.msgpack`, with a JSONL manifest for fast filtering and an
-optional JPEG preview for the first image frame.
+The server uses ZMQ REQ/REP with msgpack-numpy. It has no authentication or
+TLS; do not expose it to an untrusted network.
 
-## Deployment Notes
+`--log-dir` writes a JSONL manifest and per-call msgpack payloads under
+`calls/`. The server first uses `--proprio-stats-path`, then a stats file
+bundled in the checkpoint, then the original path in checkpoint metadata.
 
-Deployment uses `GR00T-WholeBodyControl` as the robot-side runtime. Keep the
-Huge server running, then launch the deploy stack and inference client from the
-WBC environment. The observation path expects the 34-D G1 SONIC proprio layout
-and the proprio normalizer copied into each checkpoint directory.
+For standalone requests without the WBC state stream, add
+`--no-state-tap-enable`.
+
+## 🦾 WBC deployment
+
+Real-robot deployment uses the independent WBC environment. Install
+`GR00T-WholeBodyControl/.venv_inference` according to that project's
+instructions. Run each process below in a separate terminal from the
+repository root.
+
+1. Start the Huge server above. Use `--host 0.0.0.0` only on a trusted
+   control network.
+
+2. Start the WBC deploy process:
+
+   ```bash
+   cd GR00T-WholeBodyControl/gear_sonic_deploy
+
+   ./deploy.sh \
+     --input-type zmq_manager \
+     --zmq-host localhost \
+     --hand-type inspire \
+     real
+   ```
+
+3. Start the VLA client:
+
+   ```bash
+   cd GR00T-WholeBodyControl
+
+   .venv_inference/bin/python gear_sonic/scripts/run_vla_inference.py \
+     --host localhost \
+     --port 5550 \
+     --embodiment-tag unitree_g1_sonic \
+     --prompt "Walk forward, grab the cola and throw it into the trash bin" \
+     --action-publish-rate 50 \
+     --action-horizon 50 \
+     --camera-host 192.168.123.164 \
+     --camera-port 5555
+   ```
+
+4. Start the keyboard publisher:
+
+   ```bash
+   cd GR00T-WholeBodyControl
+   .venv_inference/bin/python keyboard_pub.py
+   ```
+
+The deploy process controls physical hardware and requires operator checks.
+Do not automate confirmation or motor enablement.
+
+## 🧪 HumanoidArena simulation evaluation
+
+The wrapper uses HumanoidArena's Isaac Lab and LeRobot environments:
 
 ```bash
-# Terminal 1: Huge server
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-
-uv run python src/huge/inference/run_huge_server.py \
-  --ckpt .runs/qwenpi_v3_stage3/stage3/20260608_191002/step_86910 \
-  --host 0.0.0.0 \
-  --port 5550 \
-  --device cuda \
-  --action-horizon 50 \
-  --log-dir .runs/deploy_log/$(date +%Y%m%d_%H%M%S)
-
-# Terminal 2: GR00T WBC deploy stack
-cd GR00T-WholeBodyControl/gear_sonic_deploy
-./deploy.sh --input-type zmq_manager --zmq-host localhost --hand-type inspire real
-
-# Terminal 3: VLA inference client
-cd GR00T-WholeBodyControl
-source .venv_inference/bin/activate
-python gear_sonic/scripts/run_vla_inference.py \
-  --host localhost \
-  --port 5550 \
-  --embodiment-tag unitree_g1_sonic \
-  --prompt "Walk forward, grab the cola and throw into the trash bin" \
-  --action-publish-rate 50 \
-  --action-horizon 50 \
-  --camera-host 192.168.123.164 \
-  --camera-port 5555
-
-# Terminal 4: Keyboard publisher
-cd GR00T-WholeBodyControl
-python keyboard_pub.py
+bash scripts/eval/humanoidarena/run_eval.sh \
+  <task> <lerobot-model-search-root> [all|sonic|twist2]
 ```
 
-## Acknowledgment
+Automatic discovery searches for `*/checkpoints/*/pretrained_model` and
+two-level `<run>/pretrained_model` directories. Use `MODEL_PATHS_CSV` for an
+explicit model path.
 
-Huge builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC, and
-Qwen3-VL.
+Supported tasks:
+
+```text
+boxing
+doubledesk
+football
+open_door
+pp_box
+sit_sofa
+vision_navi
+```
+
+One-model, one-episode smoke:
+
+```bash
+TEST_MODE=base_test \
+SEEDS_OVERRIDE=0 \
+REPEATS_PER_SEED=1 \
+NUM_WORKERS=1 \
+MODEL_LIMIT=1 \
+MODEL_PATHS_CSV=/absolute/path/to/pretrained_model \
+bash scripts/eval/humanoidarena/run_eval.sh \
+  pp_box /absolute/path/to/existing/model-search-root sonic
+```
+
+Preview the evaluator command without launching simulation:
+
+```bash
+DRY_RUN=1 \
+SKIP_PREFLIGHT=1 \
+TEST_MODE=base_test \
+SEEDS_OVERRIDE=0 \
+REPEATS_PER_SEED=1 \
+NUM_WORKERS=1 \
+MODEL_LIMIT=1 \
+MODEL_PATHS_CSV=/absolute/path/to/pretrained_model \
+bash scripts/eval/humanoidarena/run_eval.sh \
+  pp_box /absolute/path/to/existing/model-search-root sonic
+```
+
+The default full evaluation is not a smoke test. The preflight checks system
+OpenGL libraries, TensorRT, cuDNN, and ONNX Runtime CUDA support.
+`SKIP_PREFLIGHT=1` permits the run after a failed check; it does not suppress
+the check output.
+
+Base-test defaults are 3 seeds x 20 repeats: 60 episodes per model/backend.
+The default `all` backend runs SONIC and TWIST2: 120 episodes per model.
+
+This wrapper discovers HumanoidArena/LeRobot `pretrained_model` directories.
+It does not load Huge `step_*/model.safetensors` checkpoints directly.
+
+## ✅ Validation
+
+HumanoidArena preprocessing tests:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+.venv/bin/python -m unittest discover -s tests \
+  -p 'test_humanoid_arena_preprocess_*.py' -v
+```
+
+Python syntax:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/huge-readme-pycache \
+.venv/bin/python -m compileall -q src scripts tests
+```
+
+Shell syntax:
+
+```bash
+find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+```
+
+## ⚠️ Compatibility notes
+
+- Current data is stored under `resource/datasets/`. Stage 2, the general
+  audit, and several legacy sim/real/preprocessing defaults still use
+  `resource/dataset/`. Do not treat the paths as interchangeable.
+- Stage 1 accepts `--egodex-root resource/datasets/EgoDex`. Stage 2 has no
+  HE/WBT root override and requires path alignment before use with the plural
+  tree.
+- `scripts/download_humanoidarena_vision_navi.py` is not present. The
+  ModelScope snippet above is the supported download command in this README.
+- `tests/test_download_humanoidarena_vision_navi.py` still imports the removed
+  downloader module; restore or remove that stale test before using full
+  `test_*.py` discovery as a green check.
+- `src/huge/data/audit.py` writes a report and still checks legacy singular
+  paths; it is not a complete audit of the unified HumanoidArena cache.
+- `offline_compare.py` is not a native HumanoidArena evaluator.
+- The HumanoidArena simulation wrapper accepts LeRobot checkpoints, not native
+  Huge checkpoints.
+
+## 🙏 Acknowledgments
+
+Huge builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC,
+HumanoidArena, and Qwen3-VL.

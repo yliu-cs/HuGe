@@ -16,6 +16,7 @@ from typing import Literal
 
 import cv2
 import numpy as np
+from tqdm.auto import tqdm
 
 from huge.data.preprocess import atomic_save_npy, projected_gravity_from_quat_wxyz
 from huge.data.proprio_stats import write_proprio_stats
@@ -31,6 +32,7 @@ TASK_PROMPTS = {
     "HSI_boxing": "punch the boxing bag",
     "HSI_open_door": "open the door",
     "HSI_sit_sofa": "sit down on the sofa",
+    "HSI_vision_navi": "navigate through the warehouse",
 }
 
 # ``robot_qpos_before_decimation`` uses HumanoidArena's interleaved SONIC order.
@@ -286,7 +288,10 @@ def discover_and_preflight(raw_root: Path) -> tuple[list[SourceEpisode], str]:
     if not paths:
         raise ValueError(f"no HumanoidArena npz files under {root}")
 
-    episodes = [_preflight_episode(path, root) for path in paths]
+    episodes = [
+        _preflight_episode(path, root)
+        for path in tqdm(paths, desc="Preflight episodes", unit="episode")
+    ]
     seen: dict[str, Path] = {}
     for episode in episodes:
         prior = seen.get(episode.episode_id)
@@ -347,7 +352,12 @@ def _write_embedded_video(npz_path: Path, destination: Path, fps: float) -> None
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"failed to open MP4 writer for {destination}")
     try:
-        for frame in frames:
+        for frame in tqdm(
+            frames,
+            desc="Encode video frames",
+            unit="frame",
+            leave=False,
+        ):
             writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     finally:
         writer.release()
@@ -425,7 +435,7 @@ def _validate_published_cache(root: Path, manifest: dict[str, Any]) -> None:
     if not isinstance(rows, list) or not rows:
         raise ValueError(f"invalid or empty conversion manifest under {root}")
     language = json.loads((root / "meta/language_map.json").read_text(encoding="utf-8"))
-    for row in rows:
+    for row in tqdm(rows, desc="Validate cache", unit="episode"):
         episode_id = row["episode_id"]
         stem = row["stem"]
         token = np.load(root / "sonic_tokens" / f"{stem}.npy", mmap_mode="r")
@@ -521,7 +531,7 @@ def preprocess_humanoid_arena(
     out.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
     try:
-        for episode in episodes:
+        for episode in tqdm(episodes, desc="Convert episodes", unit="episode"):
             _convert_episode(episode, staging)
 
         stats = write_proprio_stats(
@@ -530,6 +540,7 @@ def preprocess_humanoid_arena(
                 "HUMANOID_ARENA": staging / "g1_proprio",
             },
             staging / "meta/proprio_stats_union_sonic.json",
+            show_progress=True,
         )
         language_map = {episode.episode_id: episode.prompt for episode in episodes}
         _atomic_write_json(staging / "meta/language_map.json", language_map)

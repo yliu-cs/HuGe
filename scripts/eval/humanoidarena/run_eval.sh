@@ -1,38 +1,106 @@
 #!/usr/bin/env bash
-# HumanoidArena full VLA evaluation launcher.
-#
-# Usage: scripts/eval/humanoidarena/run_eval.sh <task> <checkpoint_dir> [backend]
-#   task            boxing | doubledesk | football | open_door | pp_box | sit_sofa | vision_navi
-#   checkpoint_dir  a pretrained_model dir, or a parent dir containing one
-#                   (see model_batch_utils.sh's discover_model_paths)
-#   backend         all (default) | sonic | twist2
-#
-# Runs the task's FULL eval config (all seeds x repeats_per_seed from its
-# tasks/common_test_config/*/<task>_*_test.yaml) -- this is not a smoke test.
-# Override via env vars as usual, e.g.:
-#   TEST_MODE=base_test SEEDS_OVERRIDE=0 REPEATS_PER_SEED=1 NUM_WORKERS=1 \
-#     scripts/eval/humanoidarena/run_eval.sh pp_box \
-#     HumanoidArena/checkpoints/small/HOI_pp_box/diffusion_sonic_ppbox_0529
+# Huge-owned HumanoidArena SONIC evaluation launcher.
+# HumanoidArena is an immutable runtime dependency; all outputs stay in Huge.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/env.sh"
+usage() {
+  echo "usage: $0 <task> <checkpoint_dir_or_root> [sonic]" >&2
+  echo "tasks: boxing doubledesk football open_door pp_box sit_sofa vision_navi" >&2
+}
 
-TASK="${1:?usage: $0 <task> <checkpoint_dir> [backend]}"
-CHECKPOINT_DIR="${2:?usage: $0 <task> <checkpoint_dir> [backend]}"
-export EVAL_BACKEND="${3:-${EVAL_BACKEND:-all}}"
-
-TASK_SCRIPT="${ISAACLAB_ROOT}/batch_test_scripts/task/batch_test_${TASK}.sh"
-if [[ ! -f "${TASK_SCRIPT}" ]]; then
-  echo "[run_eval] unknown task '${TASK}' (no such script ${TASK_SCRIPT})" >&2
-  echo "[run_eval] available tasks:" >&2
-  ls "${ISAACLAB_ROOT}/batch_test_scripts/task/" | sed -n 's/^batch_test_\(.*\)\.sh$/  \1/p' >&2
+if (( $# < 2 || $# > 3 )); then
+  usage
   exit 2
 fi
-[[ -d "${CHECKPOINT_DIR}" ]] || { echo "[run_eval] checkpoint dir not found: ${CHECKPOINT_DIR}" >&2; exit 2; }
-export MODEL_ROOT="$(cd "${CHECKPOINT_DIR}" && pwd)"
 
-preflight_check
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-echo "[run_eval] task=${TASK} backend=${EVAL_BACKEND} model_root=${MODEL_ROOT}"
-exec bash "${TASK_SCRIPT}"
+set +e
+source "${SCRIPT_DIR}/env.sh"
+ENV_RC=$?
+set -e
+if (( ENV_RC != 0 )); then
+  echo "[run_eval] failed to resolve the HumanoidArena/Isaac Lab environment" >&2
+  exit 2
+fi
+
+TASK="$1"
+CHECKPOINT_DIR="$2"
+BACKEND="${3:-sonic}"
+
+case "${TASK}" in
+  boxing|doubledesk|football|open_door|pp_box|sit_sofa|vision_navi) ;;
+  *)
+    echo "[run_eval] unknown task: ${TASK}" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+if [[ "${BACKEND}" != "sonic" ]]; then
+  echo "[run_eval] backend must be sonic; all/twist2 are not supported" >&2
+  exit 2
+fi
+
+if [[ "${HUGE_EVAL_DRY_RUN:-0}" != "0" && "${HUGE_EVAL_DRY_RUN:-0}" != "1" ]]; then
+  echo "[run_eval] HUGE_EVAL_DRY_RUN must be 0 or 1" >&2
+  exit 2
+fi
+
+if [[ ! -d "${PROJECT_ROOT}" || ! -d "${ISAACLAB_ROOT}" || ! -x "${ISAACLAB_PYTHON}" ]]; then
+  echo "[run_eval] HumanoidArena or Isaac Lab runtime path is missing" >&2
+  exit 2
+fi
+
+HUMANOIDARENA_ROOT="$(cd "${PROJECT_ROOT}" && pwd)"
+ISAACLAB_ROOT_RESOLVED="$(cd "${ISAACLAB_ROOT}" && pwd)"
+ISAAC_PYTHONPATH="${PYTHONPATH:-}"
+
+if [[ "${HUMANOIDARENA_ROOT}" != "${REPO_ROOT}/HumanoidArena" ]]; then
+  echo "[run_eval] PROJECT_ROOT must be the repository-local HumanoidArena" >&2
+  exit 2
+fi
+if [[ "${ISAACLAB_ROOT_RESOLVED}" != "${HUMANOIDARENA_ROOT}/isaaclab_twist2_g1" ]]; then
+  echo "[run_eval] ISAACLAB_ROOT must be HumanoidArena/isaaclab_twist2_g1" >&2
+  exit 2
+fi
+if [[ ! -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+  echo "[run_eval] Huge root virtual environment is missing" >&2
+  exit 2
+fi
+
+cd "${REPO_ROOT}"
+if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
+  echo "[run_eval] checkpoint directory not found: ${CHECKPOINT_DIR}" >&2
+  exit 2
+fi
+
+CHECKPOINT_BASENAME="$(basename -- "${CHECKPOINT_DIR%/}")"
+if [[ ! "${CHECKPOINT_BASENAME}" =~ ^step_[0-9]+$ ]]; then
+  exec env \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPYCACHEPREFIX=/tmp/huge-agent-pycache \
+    PYTHONPATH="${REPO_ROOT}/src" \
+    "${REPO_ROOT}/.venv/bin/python" \
+    "${SCRIPT_DIR}/batch_eval.py" \
+    "${TASK}" "${CHECKPOINT_DIR}" "${BACKEND}"
+fi
+
+if [[ "${HUGE_EVAL_DRY_RUN:-0}" != "1" ]]; then
+  if ! (preflight_check); then
+    exit 2
+  fi
+fi
+
+exec env \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPYCACHEPREFIX=/tmp/huge-agent-pycache \
+  PYTHONPATH="${REPO_ROOT}/src" \
+  "${REPO_ROOT}/.venv/bin/python" \
+  "${SCRIPT_DIR}/eval_orchestrator.py" \
+  --humanoidarena-root "${HUMANOIDARENA_ROOT}" \
+  --isaaclab-root "${ISAACLAB_ROOT_RESOLVED}" \
+  --isaaclab-python "${ISAACLAB_PYTHON}" \
+  --isaac-pythonpath "${ISAAC_PYTHONPATH}" \
+  "${TASK}" "${CHECKPOINT_DIR}" "${BACKEND}"

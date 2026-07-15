@@ -17,22 +17,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--raw-root",
-        default="resource/dataset/HumanoidArena_raw",
+        default="resource/datasets/HumanoidArena_raw",
         help="read-only raw root containing all task directories",
     )
     parser.add_argument(
         "--out-root",
-        default="resource/dataset/HumanoidArena",
+        default="resource/datasets/HumanoidArena",
         help="unified Stage 3 cache destination",
     )
     parser.add_argument(
         "--he-cache-root",
-        default="resource/dataset/humanoid-everyday-cache",
+        default="resource/datasets/humanoid-everyday-cache",
         help="Humanoid Everyday cache root used for union stats",
     )
     parser.add_argument(
         "--wbt-source-root",
-        default="resource/dataset/G1_WBT",
+        default="resource/datasets/G1_WBT",
         help="G1 WBT source/cache root used for union stats",
     )
     parser.add_argument(
