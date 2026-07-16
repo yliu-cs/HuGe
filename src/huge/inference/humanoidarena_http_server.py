@@ -10,11 +10,12 @@ import json
 import math
 import os
 import re
+import secrets
 import signal
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -36,6 +37,12 @@ from huge.data.schemas import (
     PROPRIO_LAYOUT_VERSION,
     combine_action_dict,
 )
+from huge.inference.humanoidarena_io_trace import (
+    TRACE_RECEIPT_VERSION,
+    ModelIOTraceRecorder,
+    TraceFinishConflictError,
+    TraceReceipt,
+)
 from huge.inference.sonic_adapter import HandHysteresis
 
 
@@ -54,6 +61,7 @@ REQUIRED_CHECKPOINT_FILES = (
 )
 _STEP_RE = re.compile(r"^step_([0-9]+)$")
 _GPU_UUID_RE = re.compile(r"^(?:GPU|MIG-GPU)-[A-Za-z0-9-]+$")
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class CheckpointValidationError(ValueError):
@@ -144,7 +152,34 @@ class ServerContract:
 
 
 class PolicyLike(Protocol):
-    def get_action(self, observation: dict[str, Any]) -> dict[str, np.ndarray]: ...
+    def get_action_with_trace(
+        self,
+        observation: dict[str, Any],
+    ) -> tuple[dict[str, np.ndarray], Any]: ...
+
+
+class TraceRecorderLike(Protocol):
+    def begin_episode(self, *, episode_seed: int, seeded_reset_generation: int) -> None: ...
+
+    def record_call(
+        self,
+        *,
+        http_response_sequence: int,
+        reset_generation: int,
+        front_rgb: np.ndarray,
+        state64: np.ndarray,
+        policy_trace: Any,
+    ) -> None: ...
+
+    def finish_episode(
+        self,
+        *,
+        result_identity: str,
+        episode_seed: int,
+        outcome_sha256: str,
+    ) -> TraceReceipt: ...
+
+    def abandon_episode(self, *, reason: str) -> None: ...
 
 
 def _sha256_file(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -393,6 +428,37 @@ def parse_reset_payload(payload: Any) -> int | None:
     return int(seed)
 
 
+def parse_finish_episode_payload(payload: Any) -> tuple[str, int, str]:
+    body = _require_payload_object(payload)
+    required = {"result_identity", "episode_seed", "outcome_sha256"}
+    if set(body) != required:
+        raise ProtocolError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_finish_fields",
+            "finish_episode requires exactly result_identity, episode_seed, and outcome_sha256",
+        )
+    result_identity = body["result_identity"]
+    if not isinstance(result_identity, str) or not result_identity:
+        raise ProtocolError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_result_identity",
+            "result_identity must be a non-empty string",
+        )
+    episode_seed = body["episode_seed"]
+    if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
+        raise ProtocolError(
+            HTTPStatus.BAD_REQUEST, "invalid_episode_seed", "episode_seed must be an integer"
+        )
+    outcome_sha256 = body["outcome_sha256"]
+    if not isinstance(outcome_sha256, str) or not _SHA256_HEX_RE.fullmatch(outcome_sha256):
+        raise ProtocolError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_outcome_sha256",
+            "outcome_sha256 must be 64 lowercase hexadecimal characters",
+        )
+    return result_identity, int(episode_seed), outcome_sha256
+
+
 def parse_infer_payload(
     payload: Any,
     *,
@@ -571,14 +637,33 @@ def detect_cuda_uuid(device: str = "cuda:0") -> str:
 
 
 class InferenceRuntime:
-    def __init__(self, contract: ServerContract, policy: PolicyLike, *, cuda_uuid: str) -> None:
+    def __init__(
+        self,
+        contract: ServerContract,
+        policy: PolicyLike,
+        *,
+        recorder: TraceRecorderLike,
+        cuda_uuid: str,
+    ) -> None:
         self.contract = contract
         self.policy = policy
+        self.recorder = recorder
         self.cuda_uuid = cuda_uuid
         self.episode = EpisodeState()
         self.state = "starting"
         self.fatal_error_code = ""
         self._lock = threading.Lock()
+        self._trace_status = "incomplete"
+        self._trace_error = ""
+        self._trace_session_active = False
+        self._trace_recording_enabled = False
+        self._trace_finished = False
+        self._trace_seeded_reset_generation = 0
+        self._trace_fallback_session_id = ""
+        self._trace_successful_record_count = 0
+        self._trace_last_http_response_sequence = 0
+        self._finish_key: tuple[str, int, str] | None = None
+        self._finish_receipt: dict[str, Any] | None = None
         self._write_status("starting")
 
     def _status_payload(self, state: str, **extra: Any) -> dict[str, Any]:
@@ -597,6 +682,8 @@ class InferenceRuntime:
             "infer_sequence": self.episode.sequence,
             "last_completed_sequence": self.episode.last_completed_sequence,
             "fatal_error_code": self.fatal_error_code,
+            "trace_status": self._trace_status,
+            "trace_error": self._trace_error,
             "updated_at": time.time(),
         }
         payload.update(extra)
@@ -606,12 +693,90 @@ class InferenceRuntime:
         self.state = state
         atomic_write_json(self.contract.status_file, self._status_payload(state, **extra))
 
+    @staticmethod
+    def _trace_exception_message(operation: str, exc: BaseException) -> str:
+        return f"{operation}: {type(exc).__name__}: {exc}"[:1000]
+
+    def _mark_trace_degraded(self, operation: str, exc: BaseException) -> None:
+        message = self._trace_exception_message(operation, exc)
+        self._trace_status = "degraded"
+        self._trace_error = f"{self._trace_error}; {message}".strip("; ")
+
+    def _abandon_trace_locked(self, reason: str) -> None:
+        if not self._trace_session_active or self._trace_finished:
+            return
+        try:
+            self.recorder.abandon_episode(reason=reason)
+        except Exception as exc:
+            self._mark_trace_degraded("abandon_episode", exc)
+        else:
+            if self._trace_status != "degraded":
+                self._trace_status = "incomplete"
+        finally:
+            self._trace_recording_enabled = False
+            self._trace_session_active = False
+
+    def _begin_trace_locked(self, episode_seed: int) -> None:
+        self._abandon_trace_locked("superseded by a new seeded reset")
+        self._finish_key = None
+        self._finish_receipt = None
+        self._trace_status = "incomplete"
+        self._trace_error = ""
+        self._trace_session_active = True
+        self._trace_recording_enabled = False
+        self._trace_finished = False
+        self._trace_seeded_reset_generation = self.episode.reset_generation
+        self._trace_fallback_session_id = secrets.token_hex(16)
+        self._trace_successful_record_count = 0
+        self._trace_last_http_response_sequence = 0
+        try:
+            self.recorder.begin_episode(
+                episode_seed=episode_seed,
+                seeded_reset_generation=self._trace_seeded_reset_generation,
+            )
+        except Exception as exc:
+            self._mark_trace_degraded("begin_episode", exc)
+        else:
+            self._trace_recording_enabled = True
+
+    def _degraded_receipt_locked(
+        self,
+        *,
+        result_identity: str,
+        episode_seed: int,
+        outcome_sha256: str,
+        error: str,
+    ) -> dict[str, Any]:
+        if not self._trace_fallback_session_id:
+            self._trace_fallback_session_id = secrets.token_hex(16)
+        combined_error = f"{self._trace_error}; {error}".strip("; ")
+        return {
+            "schema_version": TRACE_RECEIPT_VERSION,
+            "run_id": self.contract.run_id,
+            "worker_id": self.contract.worker_id,
+            "trace_session_id": self._trace_fallback_session_id,
+            "result_identity": result_identity,
+            "episode_seed": episode_seed,
+            "seeded_reset_generation": self._trace_seeded_reset_generation,
+            "outcome_sha256": outcome_sha256,
+            "record_count": self._trace_successful_record_count,
+            "last_trace_call_index": self._trace_successful_record_count,
+            "last_http_response_sequence": self._trace_last_http_response_sequence,
+            "trace_status": "degraded",
+            "manifest_relative_path": None,
+            "manifest_sha256": None,
+            "success_marker_relative_path": None,
+            "total_bytes": 0,
+            "error": combined_error or "model I/O trace unavailable",
+        }
+
     def mark_ready(self) -> None:
         with self._lock:
             self._write_status("ready")
 
     def mark_closing(self) -> None:
         with self._lock:
+            self._abandon_trace_locked("server shutdown before finish_episode")
             if self.state != "fatal":
                 self._write_status("closing")
 
@@ -625,7 +790,11 @@ class InferenceRuntime:
     def health(self) -> dict[str, Any]:
         with self._lock:
             if self.state != "ready":
-                raise ProtocolError(HTTPStatus.SERVICE_UNAVAILABLE, "server_not_ready", f"server state is {self.state}")
+                raise ProtocolError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "server_not_ready",
+                    f"server state is {self.state}",
+                )
             checkpoint = self.contract.checkpoint
             return {
                 "status": "ready",
@@ -644,14 +813,22 @@ class InferenceRuntime:
                 "control_hz": CONTROL_FREQ_HZ,
                 "mapping_version": MAPPING_VERSION,
                 "mapping_source_sha256": _mapping_source_sha256(),
+                "trace_status": self._trace_status,
+                "trace_error": self._trace_error,
             }
 
     def reset(self, payload: Any) -> dict[str, Any]:
         seed = parse_reset_payload(payload)
         with self._lock:
             if self.state == "fatal":
-                raise ProtocolError(HTTPStatus.SERVICE_UNAVAILABLE, "server_fatal", "server is in fatal state")
+                raise ProtocolError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "server_fatal",
+                    "server is in fatal state",
+                )
             self.episode.reset(seed)
+            if seed is not None:
+                self._begin_trace_locked(seed)
             self._write_status("ready")
             return {
                 "ok": True,
@@ -668,7 +845,11 @@ class InferenceRuntime:
         )
         with self._lock:
             if self.state == "fatal":
-                raise ProtocolError(HTTPStatus.SERVICE_UNAVAILABLE, "server_fatal", "server is in fatal state")
+                raise ProtocolError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "server_fatal",
+                    "server is in fatal state",
+                )
             self.episode.require_reset()
             next_sequence = self.episode.sequence + 1
             self._write_status("infer_in_progress", pending_sequence=next_sequence)
@@ -679,13 +860,11 @@ class InferenceRuntime:
                     "state": proprio,
                     "language": self.contract.instruction,
                 }
-                parts = self.policy.get_action(observation)
+                parts, policy_trace = self.policy.get_action_with_trace(observation)
                 action = combine_action_dict(parts)
                 if action.ndim == 3 and action.shape[0] == 1:
                     action = action[0]
                 response = build_response(action, self.episode)
-                self._write_status("ready")
-                return response
             except ProtocolError:
                 self._write_status("ready")
                 raise
@@ -694,9 +873,92 @@ class InferenceRuntime:
                 self._write_status("fatal", message=str(exc)[:500])
                 raise
 
+            self._trace_last_http_response_sequence = int(response["sequence"])
+            if self._trace_recording_enabled:
+                try:
+                    self.recorder.record_call(
+                        http_response_sequence=int(response["sequence"]),
+                        reset_generation=int(response["reset_generation"]),
+                        front_rgb=parsed.front_rgb,
+                        state64=parsed.state,
+                        policy_trace=policy_trace,
+                    )
+                    self._trace_successful_record_count += 1
+                except Exception as exc:
+                    self._mark_trace_degraded("record_call", exc)
+                    self._trace_recording_enabled = False
+            self._write_status("ready")
+            return response
+
+    def finish_episode(self, payload: Any) -> dict[str, Any]:
+        result_identity, episode_seed, outcome_sha256 = parse_finish_episode_payload(payload)
+        finish_key = (result_identity, episode_seed, outcome_sha256)
+        with self._lock:
+            if self.state == "fatal":
+                raise ProtocolError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "server_fatal",
+                    "server is in fatal state",
+                )
+            if self._finish_receipt is not None:
+                if finish_key == self._finish_key:
+                    return dict(self._finish_receipt)
+                raise ProtocolError(
+                    HTTPStatus.CONFLICT,
+                    "trace_finish_conflict",
+                    "finish_episode replay does not match the current trace session",
+                )
+
+            try:
+                receipt = self.recorder.finish_episode(
+                    result_identity=result_identity,
+                    episode_seed=episode_seed,
+                    outcome_sha256=outcome_sha256,
+                )
+                receipt_payload = asdict(receipt)
+            except TraceFinishConflictError as exc:
+                raise ProtocolError(
+                    HTTPStatus.CONFLICT, "trace_finish_conflict", str(exc)
+                ) from exc
+            except Exception as exc:
+                self._mark_trace_degraded("finish_episode", exc)
+                receipt_payload = self._degraded_receipt_locked(
+                    result_identity=result_identity,
+                    episode_seed=episode_seed,
+                    outcome_sha256=outcome_sha256,
+                    error=self._trace_exception_message("finish_episode", exc),
+                )
+
+            trace_status = receipt_payload.get("trace_status")
+            if trace_status not in {"complete", "degraded", "incomplete"}:
+                invalid = ValueError(f"invalid recorder trace_status {trace_status!r}")
+                self._mark_trace_degraded("finish_episode", invalid)
+                receipt_payload = self._degraded_receipt_locked(
+                    result_identity=result_identity,
+                    episode_seed=episode_seed,
+                    outcome_sha256=outcome_sha256,
+                    error=str(invalid),
+                )
+            elif self._trace_status == "degraded":
+                receipt_payload["trace_status"] = "degraded"
+                receipt_payload["success_marker_relative_path"] = None
+                prior_error = receipt_payload.get("error")
+                receipt_payload["error"] = "; ".join(
+                    item for item in (self._trace_error, str(prior_error or "")) if item
+                )
+
+            self._trace_status = str(receipt_payload["trace_status"])
+            self._trace_error = str(receipt_payload.get("error") or "")
+            self._trace_finished = True
+            self._trace_recording_enabled = False
+            self._finish_key = finish_key
+            self._finish_receipt = dict(receipt_payload)
+            self._write_status("ready")
+            return dict(receipt_payload)
+
 
 class HumanoidArenaHTTPServer(HTTPServer):
-    allow_reuse_address = False
+    allow_reuse_address = True
 
     def __init__(
         self,
@@ -708,6 +970,33 @@ class HumanoidArenaHTTPServer(HTTPServer):
         self.runtime = runtime
         self.max_body_bytes = int(max_body_bytes)
         super().__init__(address, HumanoidArenaRequestHandler)
+
+
+class ServerShutdownCoordinator:
+    """Request server shutdown without blocking the signal handler."""
+
+    def __init__(self, server: HumanoidArenaHTTPServer) -> None:
+        self.server = server
+        self.started = threading.Event()
+        self._worker_thread: threading.Thread | None = None
+
+    @property
+    def worker_thread(self) -> threading.Thread | None:
+        return self._worker_thread
+
+    def request(self) -> bool:
+        if self.started.is_set():
+            return False
+        self.started.set()
+        self._worker_thread = threading.Thread(target=self._stop_server, daemon=True)
+        self._worker_thread.start()
+        return True
+
+    def _stop_server(self) -> None:
+        try:
+            self.server.runtime.mark_closing()
+        finally:
+            self.server.shutdown()
 
 
 class HumanoidArenaRequestHandler(BaseHTTPRequestHandler):
@@ -764,14 +1053,15 @@ class HumanoidArenaRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path not in {"/reset", "/infer"}:
+            if self.path not in {"/reset", "/infer", "/finish_episode"}:
                 raise ProtocolError(HTTPStatus.NOT_FOUND, "unknown_endpoint", "unknown endpoint")
             payload = self._read_json()
-            result = (
-                self.server.runtime.reset(payload)
-                if self.path == "/reset"
-                else self.server.runtime.infer(payload)
-            )
+            if self.path == "/reset":
+                result = self.server.runtime.reset(payload)
+            elif self.path == "/infer":
+                result = self.server.runtime.infer(payload)
+            else:
+                result = self.server.runtime.finish_episode(payload)
             self._send_json(HTTPStatus.OK, result)
         except ProtocolError as exc:
             self._send_error(exc)
@@ -788,10 +1078,11 @@ def create_server(
     contract: ServerContract,
     policy: PolicyLike,
     *,
+    recorder: TraceRecorderLike,
     cuda_uuid: str,
     max_body_bytes: int = MAX_JSON_BODY_BYTES,
 ) -> HumanoidArenaHTTPServer:
-    runtime = InferenceRuntime(contract, policy, cuda_uuid=cuda_uuid)
+    runtime = InferenceRuntime(contract, policy, recorder=recorder, cuda_uuid=cuda_uuid)
     return HumanoidArenaHTTPServer((contract.host, contract.port), runtime, max_body_bytes=max_body_bytes)
 
 
@@ -799,6 +1090,21 @@ def _path_not_under_humanoidarena(path: Path, repo_root: Path) -> None:
     humanoidarena = (repo_root / "HumanoidArena").resolve()
     if _is_relative_to(path.resolve(), humanoidarena):
         raise ValueError(f"server write path cannot be inside HumanoidArena: {path}")
+
+
+def _resolve_model_io_root(value: str | Path, *, attempt_dir: str | Path) -> Path:
+    attempt = Path(attempt_dir).expanduser().resolve()
+    model_io_root = Path(value).expanduser().resolve()
+    expected = (attempt / "model_io").resolve()
+    if model_io_root != expected or not _is_relative_to(model_io_root, attempt):
+        raise ValueError(f"model_io_root must be the current attempt model_io directory: {expected}")
+    return model_io_root
+
+
+def _require_sha256_cli(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256_HEX_RE.fullmatch(value):
+        raise ValueError(f"{label} must be 64 lowercase hexadecimal characters")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -817,6 +1123,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-id", required=True)
     parser.add_argument("--attempt-dir", required=True)
     parser.add_argument("--status-file", required=True)
+    parser.add_argument("--model-io-root", required=True)
+    parser.add_argument("--contract-hash", required=True)
+    parser.add_argument("--source-inventory-digest", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-body-bytes", type=int, default=MAX_JSON_BODY_BYTES)
     return parser
@@ -837,7 +1146,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     status_file = Path(args.status_file).expanduser().resolve()
     if not attempt_dir.is_dir() or not _is_relative_to(status_file, attempt_dir):
         raise ValueError("status file must resolve inside an existing attempt directory")
+    model_io_root = _resolve_model_io_root(args.model_io_root, attempt_dir=attempt_dir)
+    contract_hash = _require_sha256_cli(args.contract_hash, label="contract_hash")
+    source_inventory_digest = _require_sha256_cli(
+        args.source_inventory_digest, label="source_inventory_digest"
+    )
     _path_not_under_humanoidarena(attempt_dir, repo_root)
+    _path_not_under_humanoidarena(model_io_root, repo_root)
     contract = resolve_checkpoint_contract(
         args.checkpoint,
         allowed_root=args.allowed_checkpoint_root,
@@ -866,10 +1181,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "task": args.task,
         "checkpoint_sha256": contract.checkpoint_sha256,
         "cuda_uuid": args.expected_cuda_uuid,
+        "trace_status": "incomplete",
+        "trace_error": "",
         "updated_at": time.time(),
     }
     atomic_write_json(status_file, starting_status)
     try:
+        recorder = ModelIOTraceRecorder(
+            model_io_root=model_io_root,
+            run_id=args.run_id,
+            worker_id=args.worker_id,
+            task=args.task,
+            checkpoint_sha256=contract.checkpoint_sha256,
+            contract_hash=contract_hash,
+            source_inventory_digest=source_inventory_digest,
+            model_architecture=str(
+                contract.config.get("model_architecture", "qwenpi_v3") or "qwenpi_v3"
+            ),
+            action_horizon=int(contract.config.get("action_horizon", ACTION_HORIZON)),
+            num_inference_steps=int(contract.config.get("num_inference_steps", 4)),
+            mapping_version=MAPPING_VERSION,
+        )
         policy = load_policy_strict(contract, device=args.device)
         cuda_uuid = detect_cuda_uuid(args.device)
     except Exception as exc:
@@ -895,15 +1227,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     server = create_server(
         server_contract,
         policy,
+        recorder=recorder,
         cuda_uuid=cuda_uuid,
         max_body_bytes=args.max_body_bytes,
     )
     server.runtime.mark_ready()
+    shutdown_coordinator = ServerShutdownCoordinator(server)
 
     def request_shutdown(signum: int, _frame: Any) -> None:
         print(f"[humanoidarena_http] received signal {signum}; shutting down")
-        server.runtime.mark_closing()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        shutdown_coordinator.request()
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
@@ -914,8 +1247,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         server.serve_forever(poll_interval=0.2)
     finally:
-        server.runtime.mark_closing()
-        server.server_close()
+        try:
+            server.runtime.mark_closing()
+        finally:
+            server.server_close()
     return 0
 
 

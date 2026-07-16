@@ -9,10 +9,16 @@ model loading, or SimulationApp creation.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import concurrent.futures
+import copy
+import ctypes
 from dataclasses import asdict, dataclass
+import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -47,7 +53,11 @@ MANIFEST_SCHEMA_VERSION = "huge_humanoidarena_attempt_v1"
 COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
 SUMMARY_SCHEMA_VERSION = "huge_humanoidarena_summary_v1"
+RETRY_ATTEMPT_SCHEMA_VERSION = "huge_humanoidarena_retry_attempt_v1"
+GPU_ADMISSION_SCHEMA_VERSION = "huge_ha_gpu_admission_v1"
 KIT_MAP_SCHEMA_VERSION = "huge_kit_gpu_map_v1"
+WORKER_STATUS_SCHEMA_VERSION = "huge_ha_worker_status_v1"
+MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
 EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
 SONIC_ENCODER_SHA256 = "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
@@ -62,9 +72,22 @@ DEFAULT_WORKERS_PER_GPU = 1
 MAX_WORKERS_PER_GPU = 2
 
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[a-f0-9]{8}$")
 _WORKER_RE = re.compile(r"^w[0-9]{2}$")
 _SHM_RE = re.compile(r"^huge_ha_([a-z0-9]{8})_(w[0-9]{2})_([a-f0-9]{16,32})$")
+_SHADOW_SESSION_RE = re.compile(r"^[a-f0-9]{16,32}$")
 _LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "max_steps", "sim_stopped"}
+_EXECUTION_FAILED = "execution_failed"
+_COMPLETED_WITH_FAILURES_MARKER = "_COMPLETED_WITH_FAILURES"
+_SHADOW_TERMINAL_EXIT_CODES = {
+    "complete": 0,
+    "server_or_infer_fatal": 40,
+    "sim_runtime_fatal": 50,
+    "integrity_failure": 50,
+    "interrupted": 130,
+}
+_SHADOW_GUARD_REMOVAL_SCHEMA_VERSION = "huge_ha_guard_removal_v1"
+_GPU_ADMISSION_FILENAME_RE = re.compile(r"^admission-([0-9]{4})\.json$")
 _CANCEL_REQUESTED = False
 
 
@@ -82,6 +105,17 @@ class ServerError(RuntimeError):
 
 class SimulationError(RuntimeError):
     pass
+
+
+class UnsafeCleanupError(SimulationError):
+    pass
+
+
+class EpisodeAttemptError(SimulationError):
+    def __init__(self, job: EpisodeJob, attempt_number: int, message: str) -> None:
+        super().__init__(message)
+        self.job = job
+        self.attempt_number = attempt_number
 
 
 @dataclass(frozen=True)
@@ -169,6 +203,44 @@ class ChildProcess:
     worker_id: str
     process: subprocess.Popen[bytes]
     log_stream: Any
+    process_start_ticks: int | None = None
+    command_sha256: str = ""
+
+
+@dataclass
+class WorkerCleanup:
+    future: concurrent.futures.Future[None]
+    shadow: ChildProcess | None
+    server: ChildProcess | None
+    job: EpisodeJob | None
+    attempt_number: int | None
+    reason: str
+    error: str
+    consume_attempt: bool
+
+
+@dataclass
+class WorkerRuntime:
+    worker_id: str
+    binding: GpuBinding
+    server: ChildProcess | None
+    port: int
+    pending: deque[EpisodeJob]
+    active_shadow: ChildProcess | None = None
+    active_job: EpisodeJob | None = None
+    active_shm: OwnedShm | None = None
+    active_session_id: str | None = None
+    active_status_path: Path | None = None
+    active_log_path: Path | None = None
+    active_started_monotonic: float | None = None
+    active_binding_verified: bool = False
+    active_attempt_number: int | None = None
+    prepared_attempt_number: int | None = None
+    server_starting_attempt_number: int | None = None
+    server_started_monotonic: float | None = None
+    server_started_wall_time: float | None = None
+    retry_not_before_monotonic: float = 0.0
+    cleanup: WorkerCleanup | None = None
 
 
 @dataclass
@@ -185,7 +257,7 @@ class OwnedShm:
             return
         info = self.path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid:
-            raise SimulationError(f"owned SHM appeared with unsafe identity: {self.path}")
+            raise UnsafeCleanupError(f"owned SHM appeared with unsafe identity: {self.path}")
         self.device, self.inode, self.mode = info.st_dev, info.st_ino, info.st_mode
 
     def cleanup(self) -> bool:
@@ -304,6 +376,38 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without ever replacing a destination."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise ConfigError("Linux renameat2(RENAME_NOREPLACE) is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise ConfigError(f"evaluation attempt already exists: {destination}")
+    raise OSError(
+        error_number,
+        f"renameat2(RENAME_NOREPLACE) failed for {source} -> {destination}",
+    )
+
+
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -312,7 +416,129 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
-def _json_object(path: Path, *, label: str) -> dict[str, Any]:
+def _require_owned_attempt_path(
+    attempt: Path,
+    path: Path,
+    *,
+    label: str,
+    directory: bool,
+) -> Path:
+    """Require a real, owned attempt child while allowing attempt itself to be a symlink."""
+    try:
+        attempt_root = attempt.resolve(strict=True)
+        root_info = attempt_root.lstat()
+        relative = path.relative_to(attempt)
+        if (
+            root_info.st_uid != os.getuid()
+            or stat.S_ISLNK(root_info.st_mode)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ConfigError(f"{label} has an unsafe attempt root or relative path")
+        cursor = attempt
+        for index, part in enumerate(relative.parts):
+            cursor = cursor / part
+            info = cursor.lstat()
+            expect_directory = index < len(relative.parts) - 1 or directory
+            if (
+                info.st_uid != os.getuid()
+                or stat.S_ISLNK(info.st_mode)
+                or (
+                    expect_directory
+                    and not stat.S_ISDIR(info.st_mode)
+                )
+                or (
+                    not expect_directory
+                    and not stat.S_ISREG(info.st_mode)
+                )
+            ):
+                raise ConfigError(f"{label} must be an owned real path: {path}")
+        resolved = path.resolve(strict=True)
+    except ConfigError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"cannot validate {label}: {path}: {exc}") from exc
+    if not _is_relative_to(resolved, attempt_root):
+        raise ConfigError(f"{label} escapes the attempt: {path}")
+    return path
+
+
+def _validate_canonical_attempt_entry(path: Path, attempts_root: Path) -> Path:
+    """Validate one canonical attempt entry without following an unsafe link."""
+    if _ATTEMPT_ID_RE.fullmatch(path.name) is None:
+        raise ConfigError(f"attempt name is not canonical: {path.name}")
+    try:
+        entry_stat = path.lstat()
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect attempt entry: {path}: {exc}") from exc
+    if entry_stat.st_uid != os.getuid():
+        raise ConfigError(f"attempt entry is not owned by the current user: {path}")
+    if stat.S_ISDIR(entry_stat.st_mode):
+        return path
+    if not stat.S_ISLNK(entry_stat.st_mode):
+        raise ConfigError(f"attempt entry must be a directory or safe symlink: {path}")
+    try:
+        target = os.readlink(path)
+    except OSError as exc:
+        raise ConfigError(f"cannot read attempt symlink: {path}: {exc}") from exc
+    target_path = Path(target)
+    backing_pattern = re.compile(
+        rf"^\.{re.escape(path.name)}\.object\.[0-9]+\.[0-9]+\.[a-f0-9]{{16}}$"
+    )
+    if (
+        target_path.is_absolute()
+        or len(target_path.parts) != 1
+        or backing_pattern.fullmatch(target) is None
+    ):
+        raise ConfigError(f"attempt symlink target is unsafe: {path} -> {target!r}")
+    backing = attempts_root / target
+    try:
+        backing_stat = backing.lstat()
+        root_resolved = attempts_root.resolve(strict=True)
+        backing_resolved = backing.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"attempt backing is unavailable: {path} -> {target!r}: {exc}") from exc
+    if (
+        backing_stat.st_uid != os.getuid()
+        or stat.S_ISLNK(backing_stat.st_mode)
+        or not stat.S_ISDIR(backing_stat.st_mode)
+        or backing_resolved.parent != root_resolved
+    ):
+        raise ConfigError(f"attempt backing is unsafe: {path} -> {target!r}")
+    return path
+
+
+def _canonical_attempt_candidates(attempts_root: Path) -> list[Path]:
+    candidates: list[tuple[int, str, Path]] = []
+    for path in attempts_root.iterdir():
+        if _ATTEMPT_ID_RE.fullmatch(path.name) is None:
+            continue
+        entry_stat = path.lstat()
+        candidates.append((entry_stat.st_mtime_ns, path.name, path))
+    return [entry[2] for entry in sorted(candidates)]
+
+
+def _visible_attempt_targets_backing(attempt: Path, backing_name: str) -> bool:
+    try:
+        return stat.S_ISLNK(attempt.lstat().st_mode) and os.readlink(attempt) == backing_name
+    except OSError:
+        return False
+
+
+def _json_object(
+    path: Path,
+    *,
+    label: str,
+    attempt: Path | None = None,
+) -> dict[str, Any]:
+    if attempt is not None:
+        _require_owned_attempt_path(
+            attempt,
+            path,
+            label=label,
+            directory=False,
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -367,6 +593,9 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
             raise ConfigError("HUGE_EVAL_GPU_LOGICAL_IDS must be non-empty, unique, non-negative integers")
     return {
         "test_mode": test_mode,
+        "effective_persistent_sim": False,
+        "simulator_process_scope": "per_episode_v1",
+        "model_io_schema": MODEL_IO_TRACE_SCHEMA_VERSION,
         "seeds_override": environ.get("SEEDS_OVERRIDE", ""),
         "repeats_override": environ.get("REPEATS_PER_SEED", ""),
         "max_steps": _parse_int("MAX_STEPS", environ.get("MAX_STEPS", str(task.default_max_steps)), minimum=1),
@@ -385,6 +614,32 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
         ),
         "shutdown_grace_sec": _parse_float(
             "HUGE_EVAL_SHUTDOWN_GRACE_SEC", environ.get("HUGE_EVAL_SHUTDOWN_GRACE_SEC", "30"), minimum=0.0
+        ),
+        "shadow_startup_timeout_sec": _parse_float(
+            "HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC",
+            environ.get("HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC", "180"),
+            minimum=0.001,
+        ),
+        "episode_timeout_sec": _parse_float(
+            "HUGE_EVAL_EPISODE_TIMEOUT_SEC",
+            environ.get("HUGE_EVAL_EPISODE_TIMEOUT_SEC", "900"),
+            minimum=0.001,
+        ),
+        "episode_max_retries": _parse_int(
+            "HUGE_EVAL_EPISODE_MAX_RETRIES",
+            environ.get("HUGE_EVAL_EPISODE_MAX_RETRIES", "5"),
+            minimum=0,
+            maximum=100,
+        ),
+        "retry_backoff_sec": _parse_float(
+            "HUGE_EVAL_RETRY_BACKOFF_SEC",
+            environ.get("HUGE_EVAL_RETRY_BACKOFF_SEC", "5"),
+            minimum=0.0,
+        ),
+        "min_free_gpu_memory_gib": _parse_float(
+            "HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB",
+            environ.get("HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB", "0"),
+            minimum=0.0,
         ),
         "base_port": _parse_int("HUGE_EVAL_BASE_PORT", environ.get("HUGE_EVAL_BASE_PORT", "18080"), minimum=1024, maximum=65535),
         "dry_run": _parse_bool("HUGE_EVAL_DRY_RUN", environ.get("HUGE_EVAL_DRY_RUN", "0")),
@@ -494,7 +749,7 @@ def validate_yaml_config(path: str | Path, task: TaskSpec) -> dict[str, Any]:
     vision = vision if isinstance(vision, dict) and vision.get("enabled") is True else None
     return {
         "path": str(yaml_path), "sha256": sha256_file(yaml_path), "seeds": list(seeds),
-        "repeats_per_seed": repeats, "persistent_sim": True,
+        "repeats_per_seed": repeats, "source_persistent_sim": True,
         "episode_seed_formula": EPISODE_SEED_FORMULA, "vision_randomization": vision,
     }
 
@@ -546,6 +801,29 @@ def partition_pending_jobs(jobs: Sequence[EpisodeJob], worker_count: int) -> lis
     return [ordered[index::active] for index in range(active)] if active else []
 
 
+def partition_remaining_jobs(
+    jobs: Sequence[EpisodeJob],
+    worker_count: int,
+    completed_result_identities: set[str],
+) -> list[tuple[int, list[EpisodeJob]]]:
+    shards = partition_pending_jobs(jobs, worker_count)
+    return [
+        (
+            worker_index,
+            [
+                job
+                for job in shard
+                if job.result_identity not in completed_result_identities
+            ],
+        )
+        for worker_index, shard in enumerate(shards)
+        if any(
+            job.result_identity not in completed_result_identities
+            for job in shard
+        )
+    ]
+
+
 def expand_worker_bindings(
     bindings: Sequence[GpuBinding], workers_per_gpu: int
 ) -> list[GpuBinding]:
@@ -595,13 +873,35 @@ def build_source_inventory(
     for relative, expected in WRAPPER_BASELINE.items():
         wrappers[relative] = _verify_hash(isaaclab / relative, expected, label="wrapper semantics file")
     huge_paths = (
+        "src/huge/inference/humanoidarena_io_trace.py",
         "src/huge/inference/humanoidarena_http_server.py",
+        "src/huge/inference/policy.py",
+        "src/huge/inference/observation.py",
+        "src/huge/inference/sonic_adapter.py",
+        "src/huge/data/state_normalizer.py",
+        "src/huge/data/transforms.py",
+        "src/huge/models/qwen_sonicfm.py",
+        "src/huge/data/humanoid_arena_preprocess.py",
+        "src/huge/data/schemas.py",
+        "src/huge/models/action_heads/__init__.py",
+        "src/huge/models/action_heads/hand_binary_head.py",
+        "src/huge/models/action_heads/layerwise_cross_dit_fm.py",
+        "src/huge/models/action_heads/starvla_gr00t_head.py",
+        "src/huge/models/action_heads/starvla_oft_head.py",
+        "src/huge/models/action_heads/starvla_pi_head.py",
         "scripts/eval/humanoidarena/eval_orchestrator.py",
+        "scripts/eval/humanoidarena/watch_eval_summary.py",
+        "scripts/eval/humanoidarena/shard_checkpoints.py",
         "scripts/eval/humanoidarena/sim_eval_shadow.py",
         "scripts/eval/humanoidarena/run_eval.sh",
         "scripts/eval/humanoidarena/env.sh",
     )
-    huge = {relative: sha256_file(repo / relative) for relative in huge_paths if (repo / relative).is_file()}
+    huge: dict[str, str] = {}
+    for relative in huge_paths:
+        source_path = repo / relative
+        if not source_path.is_file():
+            raise ConfigError(f"required Huge evaluation source is missing: {source_path}")
+        huge[relative] = sha256_file(source_path)
     encoder = repo / "resource/model/sonic/model_encoder.onnx"
     decoder = repo / "resource/model/sonic/model_decoder.onnx"
     _verify_hash(encoder, SONIC_ENCODER_SHA256, label="Huge SONIC encoder")
@@ -687,7 +987,17 @@ def build_static_plan(
 def build_executable_contract(
     static_plan: Mapping[str, Any], bindings: Sequence[Mapping[str, Any] | GpuBinding], kit_map_digest: str
 ) -> dict[str, Any]:
-    normalized = [asdict(binding) if isinstance(binding, GpuBinding) else dict(binding) for binding in bindings]
+    normalized: list[dict[str, Any]] = []
+    for binding in bindings:
+        row = copy.deepcopy(
+            asdict(binding) if isinstance(binding, GpuBinding) else dict(binding)
+        )
+        gpu = row.get("gpu")
+        if isinstance(gpu, Mapping):
+            normalized_gpu = dict(gpu)
+            normalized_gpu["free_memory_bytes"] = None
+            row["gpu"] = normalized_gpu
+        normalized.append(row)
     contract = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "static_plan": dict(static_plan),
@@ -753,7 +1063,9 @@ def _nvidia_inventory() -> tuple[list[dict[str, str]], str]:
     return rows, rows[0]["driver_version"]
 
 
-def discover_visible_gpus(policy: Mapping[str, Any]) -> tuple[list[GpuIdentity], str]:
+def discover_visible_gpus(
+    policy: Mapping[str, Any],
+) -> tuple[list[GpuIdentity], str, float]:
     try:
         import torch
     except ImportError as exc:
@@ -788,12 +1100,52 @@ def discover_visible_gpus(policy: Mapping[str, Any]) -> tuple[list[GpuIdentity],
         row = by_uuid.get(uuid)
         if not uuid or row is None:
             raise GpuError(f"CUDA logical device {ordinal} has no unambiguous UUID/PCI identity")
+        raw_free_memory = str(row.get("memory_free_mib", "")).strip()
+        if raw_free_memory.upper() in {"", "N/A", "NA", "NOT SUPPORTED"}:
+            free_memory_bytes = None
+        else:
+            try:
+                free_memory_mib = float(raw_free_memory)
+            except ValueError as exc:
+                raise GpuError(
+                    f"invalid free-memory snapshot for {row['uuid']}: {raw_free_memory!r}"
+                ) from exc
+            if not math.isfinite(free_memory_mib) or free_memory_mib < 0.0:
+                raise GpuError(
+                    f"invalid free-memory snapshot for {row['uuid']}: {raw_free_memory!r}"
+                )
+            free_memory_bytes = int(free_memory_mib * 1024 * 1024)
         identities.append(GpuIdentity(
             ordinal, row["uuid"], row["uuid"], row["pci_bus_id"], str(properties.name),
             int(properties.total_memory), f"{properties.major}.{properties.minor}",
-            int(float(row["memory_free_mib"]) * 1024 * 1024),
+            free_memory_bytes,
         ))
-    return identities, driver
+    captured_at = float(time.time())
+    threshold_raw = policy.get("min_free_gpu_memory_gib", 0.0)
+    if isinstance(threshold_raw, bool):
+        raise GpuError("GPU free-memory threshold must be a non-negative finite number")
+    try:
+        threshold_gib = float(threshold_raw)
+    except (TypeError, ValueError) as exc:
+        raise GpuError("GPU free-memory threshold must be a non-negative finite number") from exc
+    if not math.isfinite(threshold_gib) or threshold_gib < 0.0:
+        raise GpuError("GPU free-memory threshold must be a non-negative finite number")
+    required_bytes = math.ceil(threshold_gib * 1024**3)
+    if required_bytes:
+        for gpu in identities:
+            observed = gpu.free_memory_bytes
+            if observed is None or observed < required_bytes:
+                observed_text = (
+                    "unavailable"
+                    if observed is None
+                    else f"{observed / 1024**3:.6f} GiB ({observed} bytes)"
+                )
+                raise GpuError(
+                    f"GPU {gpu.cuda_uuid} free-memory admission failed: "
+                    f"observed={observed_text}, "
+                    f"required={threshold_gib:.6f} GiB ({required_bytes} bytes)"
+                )
+    return identities, driver, captured_at
 
 
 def host_fingerprint() -> str:
@@ -917,35 +1269,605 @@ def select_or_create_attempt(
 ) -> Path:
     root = Path(attempts_root)
     root.mkdir(parents=True, exist_ok=True)
-    existing: list[Path] = []
-    for candidate in sorted((path for path in root.iterdir() if path.is_dir()), reverse=True):
-        manifest_path = candidate / "manifest.json"
-        if not manifest_path.is_file():
-            continue
-        manifest = _json_object(manifest_path, label="attempt manifest")
-        if manifest.get("contract_hash") != contract_hash:
-            raise ConfigError(f"attempt contract drift detected: {candidate}")
-        existing.append(candidate)
     if resume and not force_new:
-        incomplete = [path for path in existing if not (path / "_SUCCESS").exists()]
-        if incomplete:
-            return incomplete[0]
+        try:
+            existing = _canonical_attempt_candidates(root)
+        except OSError as exc:
+            raise ConfigError(f"cannot list evaluation attempts: {root}: {exc}") from exc
         if existing:
-            return existing[0]
+            candidate = _validate_canonical_attempt_entry(existing[-1], root)
+            manifest_path = candidate / "manifest.json"
+            if not os.path.lexists(manifest_path):
+                raise ConfigError(f"latest attempt has no manifest: {candidate}")
+            manifest = _json_object(
+                manifest_path,
+                label="latest attempt manifest",
+                attempt=candidate,
+            )
+            if (
+                manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+                or manifest.get("contract_hash") != contract_hash
+                or manifest.get("run_id") != candidate.name
+            ):
+                raise ConfigError(f"latest attempt manifest drift detected: {candidate}")
+            if manifest.get("state") == "unsafe_cleanup":
+                raise ConfigError(
+                    "latest attempt has unresolved cleanup failure and cannot be resumed "
+                    f"safely: {candidate}"
+                )
+            return candidate
     timestamp = now or time.strftime("%Y%m%d_%H%M%S", time.localtime())
     random_nonce = nonce or secrets.token_hex(4)
     run_id = f"{timestamp}_{random_nonce}"
-    if not _SAFE_COMPONENT_RE.fullmatch(run_id):
+    if _ATTEMPT_ID_RE.fullmatch(run_id) is None:
         raise ConfigError("generated attempt id is unsafe")
     attempt = root / run_id
-    attempt.mkdir()
-    for relative in ("logs", "status", "shards", "raw_results", "completions", "episodes", "videos/success", "videos/failure", "recordings"):
-        (attempt / relative).mkdir(parents=True, exist_ok=True)
-    return attempt
+    staging_parent = root.parent / (
+        f".{root.name}.{run_id}.staging.{os.getpid()}."
+        f"{time.time_ns()}.{secrets.token_hex(8)}"
+    )
+    staging_attempt = staging_parent / run_id
+    staging_parent_created = False
+    published = False
+    backing = root / (
+        f".{run_id}.object.{os.getpid()}.{time.time_ns()}."
+        f"{secrets.token_hex(8)}"
+    )
+    backing_created = False
+    operation_error: BaseException | None = None
+    try:
+        staging_parent.mkdir()
+        staging_parent_created = True
+        staging_attempt.mkdir()
+        staging_attempt.rmdir()
+        _fsync_directory(staging_parent)
+        backing.mkdir()
+        backing_created = True
+        directories = tuple(
+            backing / relative
+            for relative in (
+                "logs",
+                "status",
+                "shards",
+                "raw_results",
+                "completions",
+                "episodes",
+                "retry_ledger",
+                "gpu_admission",
+                ".gpu_admission_staging",
+                "videos",
+                "videos/success",
+                "videos/failure",
+                "recordings",
+                "model_io",
+            )
+        )
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+        for directory in reversed(directories):
+            _fsync_directory(directory)
+        atomic_write_json(
+            backing / "manifest.json",
+            {
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "contract_hash": contract_hash,
+                "run_id": run_id,
+                "state": "starting",
+                "runtime": {"phase": "admission_pending"},
+            },
+        )
+        _fsync_directory(backing)
+        _fsync_directory(root)
+        try:
+            _rename_directory_no_replace(backing, attempt)
+            published = True
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS}:
+                raise
+            try:
+                os.symlink(backing.name, attempt, target_is_directory=True)
+            except FileExistsError as collision:
+                raise ConfigError(f"evaluation attempt already exists: {attempt}") from collision
+            published = True
+        _fsync_directory(root)
+        _fsync_directory(staging_parent)
+        _fsync_directory(root.parent)
+        return attempt
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        if backing_created:
+            published = published or _visible_attempt_targets_backing(attempt, backing.name)
+            if not published and os.path.lexists(backing):
+                try:
+                    shutil.rmtree(backing)
+                    _fsync_directory(root)
+                except OSError:
+                    if operation_error is None:
+                        raise
+        if staging_parent_created and os.path.lexists(staging_parent):
+            try:
+                shutil.rmtree(staging_parent)
+                _fsync_directory(staging_parent.parent)
+            except OSError:
+                if operation_error is None:
+                    raise
 
 
 def _completion_filename(job: EpisodeJob) -> str:
     return f"seed-{job.seed:010d}-repeat-{job.repeat_idx:03d}-episode-{job.episode_index:05d}.json"
+
+
+def _episode_attempt_directory(attempt: Path, job: EpisodeJob) -> Path:
+    if re.fullmatch(r"[a-f0-9]{64}", job.result_identity) is None:
+        raise SimulationError(f"unsafe episode result identity: {job.result_identity!r}")
+    return attempt / "retry_ledger" / job.result_identity
+
+
+def _episode_attempt_records(attempt: Path, job: EpisodeJob) -> list[dict[str, Any]]:
+    root = _episode_attempt_directory(attempt, job)
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise SimulationError(f"episode retry ledger is not a directory: {root}")
+    records: list[dict[str, Any]] = []
+    for ordinal, path in enumerate(sorted(root.glob("attempt-*.json")), start=1):
+        expected_name = f"attempt-{ordinal:03d}.json"
+        if path.name != expected_name or not path.is_file():
+            raise SimulationError(f"episode retry ledger is not contiguous: {path}")
+        record = _json_object(path, label="episode retry attempt")
+        if (
+            record.get("schema_version") != RETRY_ATTEMPT_SCHEMA_VERSION
+            or record.get("result_identity") != job.result_identity
+            or record.get("job") != asdict(job)
+            or record.get("attempt_number") != ordinal
+            or record.get("state") not in {
+                "starting", "server_ready", "running", "terminating", "succeeded", "failed"
+            }
+        ):
+            raise SimulationError(f"episode retry ledger record is invalid: {path}")
+        records.append(record)
+    unexpected = [
+        path
+        for path in root.iterdir()
+        if path.is_file()
+        and re.fullmatch(r"attempt-[0-9]{3}\.json", path.name) is None
+        and re.fullmatch(
+            r"\.attempt-[0-9]{3}\.json\.tmp\.[0-9]+\.[0-9]+",
+            path.name,
+        )
+        is None
+    ]
+    if unexpected:
+        raise SimulationError(f"episode retry ledger contains unexpected files: {unexpected}")
+    return records
+
+
+def _begin_episode_attempt(
+    attempt: Path,
+    job: EpisodeJob,
+    *,
+    worker_id: str,
+    phase: str,
+    session_id: str,
+    log_path: Path,
+    server: ChildProcess | None = None,
+) -> int:
+    if _WORKER_RE.fullmatch(worker_id) is None:
+        raise SimulationError(f"invalid retry worker id: {worker_id!r}")
+    if not phase or not _SAFE_COMPONENT_RE.fullmatch(phase):
+        raise SimulationError(f"invalid retry phase: {phase!r}")
+    records = _episode_attempt_records(attempt, job)
+    if any(record["state"] not in {"succeeded", "failed"} for record in records):
+        raise SimulationError(f"episode has an unfinished persisted attempt: {job.result_identity}")
+    ordinal = len(records) + 1
+    root = _episode_attempt_directory(attempt, job)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"attempt-{ordinal:03d}.json"
+    if os.path.lexists(path):
+        raise SimulationError(f"episode retry attempt already exists: {path}")
+    record: dict[str, Any] = {
+        "schema_version": RETRY_ATTEMPT_SCHEMA_VERSION,
+        "result_identity": job.result_identity,
+        "job": asdict(job),
+        "attempt_number": ordinal,
+        "worker_id": worker_id,
+        "phase": phase,
+        "session_id": session_id,
+        "log_path": str(log_path),
+        "owner_host": platform.node(),
+        "owner_uid": os.getuid(),
+        "orchestrator_pid": os.getpid(),
+        "state": "starting",
+        "started_at": time.time(),
+        "updated_at": time.time(),
+    }
+    if server is not None:
+        record.update(
+            {
+                "server_process_pid": server.process.pid,
+                "server_process_group_id": server.process.pid,
+                "server_process_start_ticks": server.process_start_ticks,
+                "server_process_command_sha256": server.command_sha256,
+            }
+        )
+    atomic_write_json(path, record)
+    return ordinal
+
+
+def _update_episode_attempt(
+    attempt: Path,
+    job: EpisodeJob,
+    ordinal: int,
+    *,
+    state: str,
+    **updates: Any,
+) -> None:
+    records = _episode_attempt_records(attempt, job)
+    if ordinal < 1 or ordinal > len(records):
+        raise SimulationError(f"unknown episode attempt {ordinal}: {job.result_identity}")
+    path = _episode_attempt_directory(attempt, job) / f"attempt-{ordinal:03d}.json"
+    record = records[ordinal - 1]
+    current = str(record["state"])
+    allowed = {
+        "starting": {"starting", "server_ready", "running", "terminating", "failed"},
+        "server_ready": {"running", "failed"},
+        "running": {"terminating", "succeeded", "failed"},
+        "terminating": {"failed"},
+    }
+    if state not in allowed.get(current, set()):
+        raise SimulationError(
+            f"invalid episode attempt transition {current!r} -> {state!r}: {path}"
+        )
+    record.update(updates)
+    record["state"] = state
+    record["updated_at"] = time.time()
+    if state in {"succeeded", "failed"}:
+        record["finished_at"] = time.time()
+    atomic_write_json(path, record)
+
+
+def _mark_episode_attempt_running(
+    attempt: Path,
+    job: EpisodeJob,
+    ordinal: int,
+    *,
+    pid: int,
+    process_start_ticks: int | None = None,
+    process_command_sha256: str = "",
+    server: ChildProcess | None = None,
+    session_id: str | None = None,
+    log_path: Path | None = None,
+) -> None:
+    updates: dict[str, Any] = {
+        "process_pid": pid,
+        "process_group_id": pid,
+        "process_role": "shadow",
+        "process_start_ticks": process_start_ticks,
+        "process_command_sha256": process_command_sha256,
+        "phase": "shadow",
+    }
+    if server is not None:
+        updates.update(
+            {
+                "server_process_pid": server.process.pid,
+                "server_process_group_id": server.process.pid,
+                "server_process_start_ticks": server.process_start_ticks,
+                "server_process_command_sha256": server.command_sha256,
+            }
+        )
+    if session_id is not None:
+        updates["session_id"] = session_id
+    if log_path is not None:
+        updates["log_path"] = str(log_path)
+    _update_episode_attempt(
+        attempt,
+        job,
+        ordinal,
+        state="running",
+        **updates,
+    )
+
+
+def _finish_episode_attempt(
+    attempt: Path,
+    job: EpisodeJob,
+    ordinal: int,
+    *,
+    state: str,
+    reason: str = "",
+    error: str = "",
+    returncode: int | None = None,
+) -> None:
+    if state not in {"succeeded", "failed"}:
+        raise SimulationError(f"invalid terminal episode attempt state: {state!r}")
+    updates: dict[str, Any] = {
+        "reason": reason,
+        "error": error[:2000],
+        "returncode": returncode,
+    }
+    _update_episode_attempt(attempt, job, ordinal, state=state, **updates)
+
+
+def _episode_retry_exhausted(attempt: Path, job: EpisodeJob, *, max_retries: int) -> bool:
+    failures = sum(record["state"] == "failed" for record in _episode_attempt_records(attempt, job))
+    return failures > max_retries
+
+
+def _reconcile_unfinished_episode_attempts(attempt: Path, job: EpisodeJob) -> int:
+    reconciled = 0
+    records = _episode_attempt_records(attempt, job)
+    for record in records:
+        state = str(record["state"])
+        if state in {"starting", "server_ready", "running", "terminating"}:
+            _finish_episode_attempt(
+                attempt,
+                job,
+                int(record["attempt_number"]),
+                state="failed",
+                reason="orchestrator_restarted",
+                error=f"persisted attempt was left in state {state!r}",
+            )
+            reconciled += 1
+        elif state == "succeeded":
+            raise SimulationError(
+                "retry ledger records success but no valid episode completion exists: "
+                f"{job.result_identity}"
+            )
+    return reconciled
+
+
+def _cleanup_persisted_runtime(
+    attempt: Path,
+    jobs: Sequence[EpisodeJob],
+    *,
+    shutdown_grace_sec: float,
+    shm_root: Path = Path("/dev/shm"),
+) -> None:
+    unfinished: list[dict[str, Any]] = []
+    latest_by_worker: dict[str, dict[str, Any]] = {}
+    latest_key_by_worker: dict[str, tuple[float, int, int]] = {}
+    for job in jobs:
+        for record in _episode_attempt_records(attempt, job):
+            state = str(record["state"])
+            if state in {"starting", "server_ready", "running", "terminating"}:
+                unfinished.append(record)
+            worker_id = record.get("worker_id")
+            if not isinstance(worker_id, str) or _WORKER_RE.fullmatch(worker_id) is None:
+                raise UnsafeCleanupError("persisted retry record has an invalid worker identity")
+            timestamp = record.get("updated_at")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp))
+            ):
+                raise UnsafeCleanupError("persisted retry record has an invalid update timestamp")
+            key = (
+                float(timestamp),
+                int(record["job"]["episode_index"]),
+                int(record["attempt_number"]),
+            )
+            if worker_id not in latest_key_by_worker or key > latest_key_by_worker[worker_id]:
+                latest_by_worker[worker_id] = record
+                latest_key_by_worker[worker_id] = key
+
+    references: dict[tuple[int, int], tuple[dict[str, Any], str, str]] = {}
+
+    def add_reference(record: dict[str, Any], prefix: str, role: str) -> None:
+        pid = record.get(f"{prefix}process_pid")
+        if pid is None:
+            return
+        group_id = record.get(f"{prefix}process_group_id", pid)
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 1
+            or isinstance(group_id, bool)
+            or not isinstance(group_id, int)
+            or group_id < 1
+        ):
+            raise UnsafeCleanupError(
+                f"persisted {role} process identity is malformed for {record.get('worker_id')}"
+            )
+        key = (pid, group_id)
+        existing = references.get(key)
+        candidate = (record, prefix, role)
+        if existing is not None:
+            for suffix in ("process_start_ticks", "process_command_sha256"):
+                if existing[0].get(f"{existing[1]}{suffix}") != record.get(
+                    f"{prefix}{suffix}"
+                ):
+                    raise UnsafeCleanupError(
+                        f"persisted process identity drifted for PID {pid}"
+                    )
+            return
+        references[key] = candidate
+
+    for record in unfinished:
+        add_reference(record, "", str(record.get("process_role", "child")))
+    for record in latest_by_worker.values():
+        add_reference(record, "server_", "server")
+        if record.get("process_role") == "server":
+            add_reference(record, "", "server")
+
+    for (pid, group_id), (record, prefix, role) in references.items():
+        if not _process_group_has_live_members(group_id):
+            continue
+        start_ticks = record.get(f"{prefix}process_start_ticks")
+        command_sha256 = record.get(f"{prefix}process_command_sha256")
+        owner_uid = record.get("owner_uid")
+        if (
+            record.get("owner_host") != platform.node()
+            or isinstance(owner_uid, bool)
+            or not isinstance(owner_uid, int)
+            or owner_uid != os.getuid()
+            or group_id != pid
+            or isinstance(start_ticks, bool)
+            or not isinstance(start_ticks, int)
+            or start_ticks < 1
+            or not isinstance(command_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", command_sha256) is None
+        ):
+            raise UnsafeCleanupError(
+                f"cannot prove ownership of live persisted {role} process group {group_id}"
+            )
+        _terminate_persisted_process_group(
+            group_id,
+            shutdown_grace_sec,
+            process_start_ticks=start_ticks,
+            process_command_sha256=command_sha256,
+            owner_uid=owner_uid,
+        )
+
+    cleaned_sessions: set[tuple[str, str]] = set()
+    run8 = re.sub(r"[^a-z0-9]", "", attempt.name.lower())[:8]
+    if len(run8) != 8:
+        raise UnsafeCleanupError("attempt identity cannot represent persisted SHM ownership")
+    for record in unfinished:
+        if record.get("phase") != "shadow":
+            continue
+        worker_id = str(record.get("worker_id", ""))
+        session_id = str(record.get("session_id", ""))
+        session_key = (worker_id, session_id)
+        if session_key in cleaned_sessions:
+            continue
+        if (
+            _WORKER_RE.fullmatch(worker_id) is None
+            or _SHADOW_SESSION_RE.fullmatch(session_id) is None
+        ):
+            raise UnsafeCleanupError("persisted shadow resource identity is malformed")
+        status_path = attempt / "status" / f"shadow-{worker_id}-{session_id}.json"
+        _remove_owned_shutdown_guard(
+            status_path,
+            run_id=attempt.name,
+            worker_id=worker_id,
+            session_id=session_id,
+        )
+        shm_name = f"huge_ha_{run8}_{worker_id}_{session_id}"
+        shm = OwnedShm(shm_name, shm_root / shm_name, os.getuid())
+        shm.observe()
+        if not shm.cleanup():
+            raise UnsafeCleanupError(f"SHM cleanup identity failed for {shm.name}")
+        cleaned_sessions.add(session_key)
+
+
+def _schedule_episode_failure(
+    worker: WorkerRuntime,
+    *,
+    attempt: Path,
+    job: EpisodeJob,
+    attempt_number: int,
+    max_retries: int,
+    backoff_sec: float,
+    reason: str,
+    error: str,
+    returncode: int | None,
+    now: float,
+) -> bool:
+    records = _episode_attempt_records(attempt, job)
+    if not records or attempt_number != len(records):
+        raise SimulationError(
+            f"worker {worker.worker_id} retry attempt identity drift for {job.result_identity}"
+        )
+    if records[-1]["state"] != "failed":
+        _finish_episode_attempt(
+            attempt,
+            job,
+            attempt_number,
+            state="failed",
+            reason=reason,
+            error=error,
+            returncode=returncode,
+        )
+    exhausted = _episode_retry_exhausted(attempt, job, max_retries=max_retries)
+    if not exhausted:
+        worker.retry_not_before_monotonic = now + backoff_sec
+        return False
+    if not worker.pending or worker.pending[0].result_identity != job.result_identity:
+        raise SimulationError(f"worker {worker.worker_id} pending queue identity drift")
+    records = _episode_attempt_records(attempt, job)
+    _publish_execution_failed_completion(
+        attempt,
+        job,
+        worker_id=worker.worker_id,
+        attempt_count=len(records),
+        last_reason=reason,
+        last_error=error,
+    )
+    canonical = validate_and_publish_completion(attempt, job)
+    if canonical is None or canonical.get("classification") != "execution_failed":
+        raise SimulationError(
+            f"failed to publish terminal execution failure: {job.result_identity}"
+        )
+    worker.pending.popleft()
+    worker.retry_not_before_monotonic = 0.0
+    return True
+
+
+def _shadow_watchdog_reason(
+    worker: WorkerRuntime,
+    *,
+    now: float,
+    startup_timeout_sec: float,
+    episode_timeout_sec: float,
+) -> str | None:
+    started = worker.active_started_monotonic
+    if started is None:
+        return None
+    elapsed = max(0.0, now - started)
+    if elapsed >= episode_timeout_sec:
+        return "episode_timeout"
+    if not worker.active_binding_verified and elapsed >= startup_timeout_sec:
+        return "shadow_startup_timeout"
+    return None
+
+
+def _publish_execution_failed_completion(
+    attempt: Path,
+    job: EpisodeJob,
+    *,
+    worker_id: str,
+    attempt_count: int,
+    last_reason: str,
+    last_error: str,
+) -> dict[str, Any]:
+    if attempt_count < 1:
+        raise SimulationError("execution failure requires at least one attempted execution")
+    raw_path = attempt / "raw_results" / _completion_filename(job)
+    payload = {
+        "task": job.isaac_task_name,
+        "seed": job.seed,
+        "repeat_idx": job.repeat_idx,
+        "episode_seed": job.episode_seed,
+        "episode_index": job.episode_index,
+        "success": False,
+        "failure_reason": _EXECUTION_FAILED,
+        "error": "",
+        "episode_steps": 0,
+        "duration_sec": 0.0,
+        "video_recorded": False,
+        "video_path": "",
+        "execution_attempts": attempt_count,
+        "retry_count": max(0, attempt_count - 1),
+        "last_execution_failure": last_reason,
+        "last_execution_error": last_error[:2000],
+    }
+    atomic_write_json(raw_path, payload)
+    identity_keys = ("task", "seed", "repeat_idx", "episode_seed", "episode_index")
+    completion = {
+        "schema_version": COMPLETION_SCHEMA_VERSION,
+        "run_id": attempt.name,
+        "worker_id": worker_id,
+        "result_identity": job.result_identity,
+        "identity": {key: payload[key] for key in identity_keys},
+        "payload_sha256": canonical_sha256(payload),
+        "raw_result_path": str(raw_path.resolve()),
+        "raw_result_sha256": sha256_file(raw_path),
+        "payload": payload,
+    }
+    atomic_write_json(attempt / "completions" / _completion_filename(job), completion)
+    return completion
 
 
 def classify_existing_result(job: EpisodeJob, completion: Mapping[str, Any] | None) -> str:
@@ -976,23 +1898,31 @@ def classify_existing_result(job: EpisodeJob, completion: Mapping[str, Any] | No
         return "pending_integrity"
     if failure == "sim_error" or error:
         return "pending_infrastructure"
+    if failure == _EXECUTION_FAILED and payload["success"] is False:
+        return "execution_failed"
     if failure in _LEGAL_TASK_OUTCOMES and bool(payload["success"]) == (failure == "success"):
         return "task_complete"
     return "pending_integrity"
 
 
-def validate_and_publish_completion(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
+def validate_completion_envelope(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
     completion_path = attempt / "completions" / _completion_filename(job)
-    if not completion_path.is_file():
+    if not os.path.lexists(completion_path):
         return None
     try:
-        completion = _json_object(completion_path, label="completion envelope")
+        completion = _json_object(
+            completion_path,
+            label="completion envelope",
+            attempt=attempt,
+        )
     except ConfigError:
         return None
-    if classify_existing_result(job, completion) != "task_complete":
+    classification = classify_existing_result(job, completion)
+    if classification not in {"task_complete", "execution_failed"}:
         return None
+    attempt_root = attempt.resolve()
     raw_path = Path(str(completion.get("raw_result_path", ""))).resolve()
-    if not _is_relative_to(raw_path, attempt) or not raw_path.is_file():
+    if not _is_relative_to(raw_path, attempt_root) or not raw_path.is_file():
         return None
     if completion.get("raw_result_sha256") != sha256_file(raw_path):
         return None
@@ -1002,24 +1932,36 @@ def validate_and_publish_completion(attempt: Path, job: EpisodeJob) -> dict[str,
     artifacts: dict[str, Any] = {}
     if payload.get("video_recorded"):
         video_path = Path(str(payload.get("video_path", ""))).resolve()
-        if not _is_relative_to(video_path, attempt) or not video_path.is_file():
+        if not _is_relative_to(video_path, attempt_root) or not video_path.is_file():
             return None
         artifacts["video"] = {"path": str(video_path), "sha256": sha256_file(video_path)}
     canonical = {
         "schema_version": EPISODE_SCHEMA_VERSION, "result_identity": job.result_identity,
         "job": asdict(job), "payload": payload, "worker_id": completion.get("worker_id", ""),
-        "artifacts": artifacts, "completion_sha256": sha256_file(completion_path),
+        "classification": classification, "artifacts": artifacts,
+        "completion_sha256": sha256_file(completion_path),
     }
+    return canonical
+
+
+def validate_and_publish_completion(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
+    canonical = validate_completion_envelope(attempt, job)
+    if canonical is None:
+        return None
     atomic_write_json(attempt / "episodes" / _completion_filename(job), canonical)
     return canonical
 
 
 def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
     path = attempt / "episodes" / _completion_filename(job)
-    if not path.is_file():
+    if not os.path.lexists(path):
         return None
     try:
-        payload = _json_object(path, label="canonical episode")
+        payload = _json_object(
+            path,
+            label="canonical episode",
+            attempt=attempt,
+        )
     except ConfigError:
         return None
     if (
@@ -1029,11 +1971,15 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
     ):
         return None
     result = payload.get("payload")
-    if classify_existing_result(job, {
+    classification = classify_existing_result(job, {
         "schema_version": COMPLETION_SCHEMA_VERSION,
         "result_identity": job.result_identity,
         "raw_payload": result,
-    }) != "task_complete":
+    })
+    if classification not in {"task_complete", "execution_failed"}:
+        return None
+    stored_classification = payload.get("classification")
+    if stored_classification is not None and stored_classification != classification:
         return None
     if isinstance(result, dict) and result.get("video_recorded"):
         artifact = payload.get("artifacts", {}).get("video") if isinstance(payload.get("artifacts"), dict) else None
@@ -1041,7 +1987,7 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
             return None
         video_path = Path(str(artifact.get("path", ""))).resolve()
         if (
-            not _is_relative_to(video_path, attempt)
+            not _is_relative_to(video_path, attempt.resolve())
             or not video_path.is_file()
             or artifact.get("sha256") != sha256_file(video_path)
         ):
@@ -1049,15 +1995,208 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
     return payload
 
 
-def _verify_success_attempt(
+def _persisted_shadow_proves_completion(
+    attempt: Path,
+    job: EpisodeJob,
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    worker_id = str(record.get("worker_id", ""))
+    session_id = str(record.get("session_id", ""))
+    process_pid = record.get("process_pid")
+    process_group_id = record.get("process_group_id", process_pid)
+    if (
+        _WORKER_RE.fullmatch(worker_id) is None
+        or _SHADOW_SESSION_RE.fullmatch(session_id) is None
+        or isinstance(process_pid, bool)
+        or not isinstance(process_pid, int)
+        or process_pid < 1
+        or isinstance(process_group_id, bool)
+        or not isinstance(process_group_id, int)
+        or process_group_id != process_pid
+    ):
+        return None
+    status_path = attempt / "status" / f"shadow-{worker_id}-{session_id}.json"
+    guard_path = status_path.with_name(f".{status_path.name}.shutdown_guard")
+    marker_path = _shadow_guard_removal_marker_path(status_path)
+    if (
+        not status_path.is_file()
+        or os.path.lexists(guard_path)
+        or os.path.lexists(marker_path)
+    ):
+        return None
+    try:
+        _require_owned_attempt_path(
+            attempt,
+            status_path,
+            label="persisted shadow status",
+            directory=False,
+        )
+        status = _json_object(status_path, label="persisted shadow status")
+        semantic_state, semantic_exit_code, _ = _decode_shadow_terminal_status(status)
+    except (ConfigError, SimulationError):
+        return None
+    expected_identity = _expected_shadow_episode_identity(job)
+    expected_completion = (attempt / "completions" / _completion_filename(job)).resolve()
+    actual_completion = Path(str(status.get("completion", ""))).expanduser().resolve()
+    process_started_at = status.get("process_started_at")
+    if (
+        status.get("schema_version") != WORKER_STATUS_SCHEMA_VERSION
+        or status.get("run_id") != attempt.name
+        or status.get("worker_id") != worker_id
+        or status.get("shadow_session_id") != session_id
+        or status.get("simulator_pid") != process_pid
+        or isinstance(process_started_at, bool)
+        or not isinstance(process_started_at, (int, float))
+        or not math.isfinite(float(process_started_at))
+        or float(process_started_at) <= 0.0
+        or semantic_state != "complete"
+        or semantic_exit_code != 0
+        or status.get("cleanup_errors") != []
+        or status.get("classification") != "completed"
+        or status.get("completed_count") != 1
+        or not _strict_episode_identity_matches(
+            status.get("episode_identity"), expected_identity
+        )
+        or not _strict_episode_identity_matches(
+            status.get("current_episode"), expected_identity
+        )
+        or actual_completion != expected_completion
+        or _process_group_has_live_members(process_group_id)
+    ):
+        return None
+    completion = validate_completion_envelope(attempt, job)
+    if completion is None:
+        return None
+    envelope = _json_object(expected_completion, label="persisted completion envelope")
+    expected_completion_identity = dict(expected_identity)
+    expected_completion_identity.pop("result_identity")
+    payload = completion.get("payload")
+    if (
+        envelope.get("run_id") != attempt.name
+        or envelope.get("worker_id") != worker_id
+        or envelope.get("result_identity") != job.result_identity
+        or not _strict_episode_identity_matches(
+            envelope.get("identity"), expected_completion_identity
+        )
+        or not isinstance(payload, dict)
+        or status.get("upstream_payload_sha256") != canonical_sha256(payload)
+    ):
+        return None
+    return completion
+
+
+def _load_reusable_episode_result(
+    attempt: Path,
+    job: EpisodeJob,
+    *,
+    max_retries: int,
+) -> dict[str, Any] | None:
+    result = _read_existing_episode(attempt, job) or validate_completion_envelope(
+        attempt, job
+    )
+    if result is None:
+        return None
+    records = _episode_attempt_records(attempt, job)
+    if not records:
+        return result
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    classification = classify_existing_result(
+        job,
+        {
+            "schema_version": COMPLETION_SCHEMA_VERSION,
+            "result_identity": job.result_identity,
+            "raw_payload": payload,
+        },
+    )
+    if classification == "execution_failed":
+        attempts = payload.get("execution_attempts")
+        retry_count = payload.get("retry_count")
+        return (
+            result
+            if len(records) == max_retries + 1
+            and all(record["state"] == "failed" for record in records)
+            and type(attempts) is int
+            and attempts == len(records)
+            and type(retry_count) is int
+            and retry_count == attempts - 1
+            else None
+        )
+    if classification != "task_complete":
+        return None
+    last = records[-1]
+    if last["state"] == "succeeded":
+        return result
+    proven_completion = None
+    if last["state"] == "running":
+        proven_completion = _persisted_shadow_proves_completion(attempt, job, last)
+    if proven_completion is not None:
+        _finish_episode_attempt(
+            attempt,
+            job,
+            int(last["attempt_number"]),
+            state="succeeded",
+            reason="completion_recovered_after_orchestrator_restart",
+            returncode=0,
+        )
+        atomic_write_json(
+            attempt / "episodes" / _completion_filename(job), proven_completion
+        )
+        return proven_completion
+    return None
+
+
+def _verify_completed_attempt(
     attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, source_digest: str
-) -> None:
-    summary = _json_object(attempt / "summary.json", label="successful attempt summary")
-    marker = attempt / "_SUCCESS"
+) -> int:
+    summary = _json_object(
+        attempt / "summary.json",
+        label="terminal attempt summary",
+        attempt=attempt,
+    )
+    success_marker = attempt / "_SUCCESS"
+    failure_marker = attempt / _COMPLETED_WITH_FAILURES_MARKER
+    success_present = os.path.lexists(success_marker)
+    failure_present = os.path.lexists(failure_marker)
+    if success_present == failure_present:
+        raise ConfigError("terminal attempt must have exactly one completion marker")
+    marker = failure_marker if failure_present else success_marker
+    _require_owned_attempt_path(
+        attempt,
+        marker,
+        label="terminal attempt marker",
+        directory=False,
+    )
     try:
         marker_digest = marker.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise ConfigError(f"cannot read successful attempt marker: {exc}") from exc
+        raise ConfigError(f"cannot read terminal attempt marker: {exc}") from exc
+    raw_execution_failed = summary.get("execution_failed", 0)
+    if (
+        isinstance(raw_execution_failed, bool)
+        or not isinstance(raw_execution_failed, int)
+        or raw_execution_failed < 0
+    ):
+        raise ConfigError("terminal attempt has invalid execution_failed count")
+    execution_failed = int(raw_execution_failed)
+    expected_state = "completed_with_failures" if failure_present else "success"
+    manifest = _json_object(
+        attempt / "manifest.json",
+        label="terminal attempt manifest",
+        attempt=attempt,
+    )
+    runtime = manifest.get("runtime")
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or manifest.get("contract_hash") != contract_hash
+        or manifest.get("run_id") != attempt.name
+        or manifest.get("state") != expected_state
+        or not isinstance(runtime, dict)
+        or (failure_present and execution_failed < 1)
+        or (success_present and execution_failed != 0)
+    ):
+        raise ConfigError("terminal attempt manifest/marker state is inconsistent")
     if (
         summary.get("schema_version") != SUMMARY_SCHEMA_VERSION
         or summary.get("contract_hash") != contract_hash
@@ -1066,9 +2205,59 @@ def _verify_success_attempt(
         or summary.get("completed") != len(jobs)
         or marker_digest != canonical_sha256(summary)
     ):
-        raise ConfigError("successful attempt summary/marker does not match the current contract")
-    if any(_read_existing_episode(attempt, job) is None for job in jobs):
-        raise ConfigError("successful attempt has missing, drifted, or invalid canonical episodes")
+        raise ConfigError("terminal attempt summary/marker does not match the current contract")
+    episodes: list[dict[str, Any]] = []
+    for job in jobs:
+        episode = _read_existing_episode(attempt, job)
+        if episode is None:
+            raise ConfigError(
+                "terminal attempt has missing, drifted, or invalid canonical episodes"
+            )
+        episodes.append(episode)
+    successes = sum(bool(episode["payload"].get("success")) for episode in episodes)
+    actual_execution_failed = sum(
+        episode["payload"].get("failure_reason") == _EXECUTION_FAILED
+        for episode in episodes
+    )
+    expected_by_seed = {
+        str(seed): {
+            "completed": sum(episode["job"]["seed"] == seed for episode in episodes),
+            "success": sum(
+                episode["job"]["seed"] == seed
+                and bool(episode["payload"].get("success"))
+                for episode in episodes
+            ),
+        }
+        for seed in sorted({job.seed for job in jobs})
+    }
+    resume_reused = summary.get("resume_reused")
+    if (
+        summary.get("task_success") != successes
+        or summary.get("task_failure") != len(episodes) - successes
+        or summary.get("infrastructure_failure") != 0
+        or summary.get("infrastructure_errors") != []
+        or execution_failed != actual_execution_failed
+        or summary.get("success_rate")
+        != {"numerator": successes, "denominator": len(episodes)}
+        or summary.get("by_seed") != expected_by_seed
+        or isinstance(resume_reused, bool)
+        or not isinstance(resume_reused, int)
+        or not 0 <= resume_reused <= len(episodes)
+        or runtime.get("completed") != len(episodes)
+        or runtime.get("reused") != resume_reused
+        or runtime.get("execution_failed", 0) != actual_execution_failed
+    ):
+        raise ConfigError(
+            "terminal attempt summary/manifest counts do not match canonical episodes"
+        )
+    return execution_failed
+
+
+def _verify_success_attempt(
+    attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, source_digest: str
+) -> None:
+    if _verify_completed_attempt(attempt, jobs, contract_hash, source_digest) != 0:
+        raise ConfigError("successful attempt contains execution failures")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1203,17 +2392,18 @@ def _runtime_environment(task: TaskSpec, yaml_config: Mapping[str, Any], policy:
     return env
 
 
-def _make_shm(run_id: str, worker_id: str) -> OwnedShm:
+def _make_shm(run_id: str, worker_id: str, shadow_session_id: str) -> OwnedShm:
     run8 = re.sub(r"[^a-z0-9]", "", run_id.lower())[:8]
-    if len(run8) != 8 or not _WORKER_RE.fullmatch(worker_id):
-        raise SimulationError("run/worker identity cannot be represented by the SHM ownership format")
-    for _ in range(100):
-        nonce = secrets.token_hex(8)
-        name = f"huge_ha_{run8}_{worker_id}_{nonce}"
-        path = Path("/dev/shm") / name
-        if not os.path.lexists(path):
-            return OwnedShm(name, path, os.getuid())
-    raise SimulationError("unable to allocate a unique SHM ownership name")
+    if (
+        len(run8) != 8 or not _WORKER_RE.fullmatch(worker_id)
+        or _SHADOW_SESSION_RE.fullmatch(shadow_session_id) is None
+    ):
+        raise SimulationError("run/worker/session identity cannot be represented by the SHM ownership format")
+    name = f"huge_ha_{run8}_{worker_id}_{shadow_session_id}"
+    path = Path("/dev/shm") / name
+    if os.path.lexists(path):
+        raise SimulationError(f"shadow session SHM already exists: {path}")
+    return OwnedShm(name, path, os.getuid())
 
 
 def _reserve_ports(base: int, count: int) -> list[socket.socket]:
@@ -1240,7 +2430,8 @@ def _reserve_ports(base: int, count: int) -> list[socket.socket]:
 
 def _server_command(
     args: argparse.Namespace, task: TaskSpec, checkpoint: CheckpointContract, binding: GpuBinding,
-    run_id: str, worker_id: str, attempt: Path, port: int,
+    run_id: str, worker_id: str, attempt: Path, port: int, *,
+    contract_hash: str, source_inventory_digest: str,
 ) -> list[str]:
     return [
         str(args.repo / ".venv/bin/python"), "-m", "huge.inference.humanoidarena_http_server",
@@ -1250,14 +2441,43 @@ def _server_command(
         "--isaac-task", task.isaac_task, "--instruction", task.instruction,
         "--host", "127.0.0.1", "--port", str(port), "--expected-cuda-uuid", binding.gpu.cuda_uuid,
         "--run-id", run_id, "--worker-id", worker_id, "--attempt-dir", str(attempt),
-        "--status-file", str(attempt / "status" / f"server-{worker_id}.json"), "--device", "cuda:0",
+        "--status-file", str(attempt / "status" / f"server-{worker_id}.json"),
+        "--model-io-root", str(attempt / "model_io"), "--contract-hash", contract_hash,
+        "--source-inventory-digest", source_inventory_digest,
+        "--device", "cuda:0",
     ]
+
+
+def _expected_server_health(
+    task: TaskSpec,
+    checkpoint: CheckpointContract,
+    binding: GpuBinding,
+) -> dict[str, Any]:
+    return {
+        "status": "ready",
+        "protocol_version": PROTOCOL_VERSION,
+        "checkpoint_sha256": checkpoint.checkpoint_sha256,
+        "task": task.cli_task,
+        "cuda_uuid": binding.gpu.cuda_uuid,
+        "state_dim": 34,
+        "action_dim": 66,
+        "motion_token_dim": 64,
+        "action_horizon": 50,
+        "control_hz": 50,
+    }
 
 
 def _write_shard(
     path: Path, jobs: Sequence[EpisodeJob], attempt: Path, checkpoint: CheckpointContract,
-    policy: Mapping[str, Any], worker_id: str,
+    policy: Mapping[str, Any], worker_id: str, *, shadow_session_id: str | None = None,
 ) -> None:
+    if len(jobs) != 1:
+        raise SimulationError(f"single-episode shard requires exactly one job, got {len(jobs)}")
+    if shadow_session_id is not None and _SHADOW_SESSION_RE.fullmatch(shadow_session_id) is None:
+        raise SimulationError("shadow session id must contain 16..32 lowercase hex characters")
+    recording_dir = attempt / "recordings" / worker_id
+    if shadow_session_id is not None:
+        recording_dir /= shadow_session_id
     episodes = []
     for job in jobs:
         episodes.append({
@@ -1270,7 +2490,7 @@ def _write_shard(
             "post_termination_record_steps": policy["post_termination_record_steps"],
             "model_label": checkpoint.checkpoint_dir.name,
             "eval_model_path": str(checkpoint.checkpoint_dir),
-            "recording_save_dir": str(attempt / "recordings" / worker_id),
+            "recording_save_dir": str(recording_dir),
             "max_steps": policy["max_steps"],
         })
     atomic_write_json(path, {"schema_version": "huge_humanoidarena_shard_v1", "worker_id": worker_id, "episodes": episodes})
@@ -1280,7 +2500,15 @@ def _shadow_command(
     args: argparse.Namespace, task: TaskSpec, checkpoint: CheckpointContract, binding: GpuBinding,
     run_id: str, worker_id: str, attempt: Path, shard_path: Path, jobs: Sequence[EpisodeJob],
     port: int, shm: OwnedShm, policy: Mapping[str, Any], yaml_config: Mapping[str, Any],
+    *, shadow_session_id: str,
 ) -> list[str]:
+    if len(jobs) != 1:
+        raise SimulationError(f"single-episode shadow requires exactly one job, got {len(jobs)}")
+    if _SHADOW_SESSION_RE.fullmatch(shadow_session_id) is None:
+        raise SimulationError("shadow session id must contain 16..32 lowercase hex characters")
+    job = jobs[0]
+    recording_dir = attempt / "recordings" / worker_id / shadow_session_id
+    status_path = attempt / "status" / f"shadow-{worker_id}-{shadow_session_id}.json"
     command = [
         str(args.isaaclab_python), str(args.shadow),
         "--humanoidarena-root", str(args.humanoidarena_root), "--isaaclab-root", str(args.isaaclab_root),
@@ -1288,7 +2516,7 @@ def _shadow_command(
         "--renderer-gpu-ordinal", str(binding.renderer_ordinal), "--expected-cuda-uuid", binding.gpu.cuda_uuid,
         "--expected-pci-bus-id", binding.gpu.pci_bus_id,
         "--task", task.isaac_task, "--env_config_yaml", str(yaml_config["path"]),
-        "--seed", str(jobs[0].seed), "--episode_batch_json", str(shard_path),
+        "--seed", str(job.seed), "--episode_batch_json", str(shard_path),
         "--max_steps", str(policy["max_steps"]),
         "--sonic_encoder_path", str(args.repo / "resource/model/sonic/model_encoder.onnx"),
         "--sonic_decoder_path", str(args.repo / "resource/model/sonic/model_decoder.onnx"),
@@ -1300,15 +2528,176 @@ def _shadow_command(
         "--record_video_every_n", str(policy["record_video_every_n"]),
         "--step_log_every_n", str(policy["step_log_every_n"]),
         "--model_label", checkpoint.checkpoint_dir.name, "--eval_model_path", str(checkpoint.checkpoint_dir),
-        "--recording_save_dir", str(attempt / "recordings" / worker_id), "--headless", "--device", "cuda:0",
+        "--recording_save_dir", str(recording_dir), "--headless", "--device", "cuda:0",
         "--owned-shm-name", shm.name, "--run-id", run_id, "--worker-id", worker_id,
         "--attempt-dir", str(attempt), "--server-status-json", str(attempt / "status" / f"server-{worker_id}.json"),
-        "--worker-status-json", str(attempt / "status" / f"worker-{worker_id}.json"),
+        "--worker-status-json", str(status_path),
+        "--result-identity", job.result_identity,
+        "--expected-episode-seed", str(job.episode_seed),
+        "--shadow-session-id", shadow_session_id,
         "--completion-dir", str(attempt / "completions"),
     ]
     if task.memory_limit_percent is not None:
         command.extend(["--memory-limit-percent", str(task.memory_limit_percent)])
     return command
+
+
+def _namespace_process_table() -> list[dict[str, Any]]:
+    proc = Path("/proc")
+    try:
+        namespace_inode = (proc / "self" / "ns" / "pid").stat().st_ino
+        self_status = (proc / "self" / "status").read_text(encoding="ascii")
+        self_namespace_pid_line = next(
+            line for line in self_status.splitlines() if line.startswith("NSpid:")
+        )
+        namespace_depth = len(self_namespace_pid_line.partition(":")[2].split())
+        if namespace_depth < 1:
+            raise ValueError("empty current NSpid chain")
+        entries = list(proc.iterdir())
+    except (OSError, UnicodeDecodeError, StopIteration, ValueError) as exc:
+        raise UnsafeCleanupError(f"cannot inspect the current PID namespace: {exc}") from exc
+
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            status_text = (entry / "status").read_text(encoding="ascii")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UnsafeCleanupError(
+                f"cannot inspect process namespace status for {entry}: {exc}"
+            ) from exc
+        status: dict[str, str] = {}
+        for line in status_text.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                status[key] = value.strip()
+        try:
+            namespace_pids = [int(value) for value in status["NSpid"].split()]
+        except (KeyError, ValueError) as exc:
+            raise UnsafeCleanupError(
+                f"process namespace identity is incomplete for {entry}"
+            ) from exc
+        if len(namespace_pids) != namespace_depth:
+            continue
+        try:
+            entry_namespace_inode = (entry / "ns" / "pid").stat().st_ino
+            raw_stat = (entry / "stat").read_text(encoding="ascii")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UnsafeCleanupError(
+                f"cannot inspect process identity for {entry}: {exc}"
+            ) from exc
+        if entry_namespace_inode != namespace_inode:
+            continue
+        try:
+            namespace_groups = [int(value) for value in status["NSpgid"].split()]
+            namespace_sessions = [int(value) for value in status["NSsid"].split()]
+            real_uid = int(status["Uid"].split()[0])
+            status_state = status["State"].split()[0]
+            host_pid = int(entry.name)
+            close_paren = raw_stat.rfind(")")
+            if close_paren < 0:
+                raise ValueError("missing stat command terminator")
+            start_ticks = int(raw_stat[close_paren + 2 :].split()[19])
+        except (KeyError, ValueError, IndexError) as exc:
+            raise UnsafeCleanupError(
+                f"process identity fields are incomplete for {entry}"
+            ) from exc
+        if (
+            not namespace_pids
+            or len(namespace_pids) != len(namespace_groups)
+            or len(namespace_pids) != len(namespace_sessions)
+            or namespace_pids[0] != host_pid
+            or namespace_pids[-1] < 1
+            or namespace_groups[-1] < 1
+            or namespace_sessions[-1] < 1
+            or real_uid < 0
+            or len(status_state) != 1
+            or start_ticks < 1
+        ):
+            raise UnsafeCleanupError(f"process identity drifted while inspecting {entry}")
+        rows.append(
+            {
+                "proc_path": entry,
+                "pid": namespace_pids[-1],
+                "process_group_id": namespace_groups[-1],
+                "session_id": namespace_sessions[-1],
+                "start_ticks": start_ticks,
+                "state": status_state,
+                "uid": real_uid,
+            }
+        )
+    return rows
+
+
+def _read_process_identity(pid: int) -> dict[str, Any] | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+        return None
+
+    def read_at(process_root: Path) -> dict[str, Any] | None:
+        try:
+            if (
+                (process_root / "ns" / "pid").stat().st_ino
+                != (Path("/proc") / "self" / "ns" / "pid").stat().st_ino
+            ):
+                return None
+            status_text = (process_root / "status").read_text(encoding="ascii")
+            status = {
+                key: value.strip()
+                for line in status_text.splitlines()
+                for key, separator, value in [line.partition(":")]
+                if separator
+            }
+            namespace_pids = [int(value) for value in status["NSpid"].split()]
+            namespace_groups = [int(value) for value in status["NSpgid"].split()]
+            process_uid = int(status["Uid"].split()[0])
+            if (
+                not namespace_pids
+                or len(namespace_pids) != len(namespace_groups)
+                or namespace_pids[-1] != pid
+            ):
+                return None
+            raw_cmdline = (process_root / "cmdline").read_bytes()
+            raw_stat = (process_root / "stat").read_text(encoding="ascii")
+            fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+            start_ticks = int(fields[19])
+            command = [
+                os.fsdecode(token)
+                for token in raw_cmdline.split(b"\0")
+                if token
+            ]
+        except (OSError, UnicodeDecodeError, KeyError, ValueError, IndexError):
+            return None
+        if start_ticks < 1 or not command:
+            return None
+        return {
+            "process_group_id": namespace_groups[-1],
+            "start_ticks": start_ticks,
+            "command_sha256": canonical_sha256(command),
+            "uid": process_uid,
+        }
+
+    direct = read_at(Path("/proc") / str(pid))
+    if direct is not None:
+        return direct
+    try:
+        matches = [row for row in _namespace_process_table() if row["pid"] == pid]
+    except UnsafeCleanupError:
+        return None
+    if len(matches) != 1 or matches[0]["state"] == "Z":
+        return None
+    row = matches[0]
+    identity = read_at(Path(row["proc_path"]))
+    if identity is None or any(
+        identity[key] != row[key]
+        for key in ("process_group_id", "start_ticks", "uid")
+    ):
+        return None
+    return identity
 
 
 def _launch_child(role: str, worker_id: str, command: Sequence[str], log_path: Path, env: Mapping[str, str], cwd: Path) -> ChildProcess:
@@ -1322,104 +2711,1421 @@ def _launch_child(role: str, worker_id: str, command: Sequence[str], log_path: P
     except Exception:
         stream.close()
         raise
-    return ChildProcess(role, worker_id, process, stream)
+    identity = _read_process_identity(process.pid)
+    return ChildProcess(
+        role,
+        worker_id,
+        process,
+        stream,
+        process_start_ticks=(
+            int(identity["start_ticks"]) if identity is not None else None
+        ),
+        command_sha256=canonical_sha256(list(command)),
+    )
 
 
-def _health(port: int, expected: Mapping[str, Any], timeout: float, child: ChildProcess) -> None:
-    deadline = time.monotonic() + timeout
-    last_error = "not ready"
-    while time.monotonic() < deadline and not _CANCEL_REQUESTED:
-        returncode = child.process.poll()
-        if returncode is not None:
-            raise ServerError(f"Huge server {child.worker_id} exited during startup with {returncode}")
+def _expected_shadow_episode_identity(job: EpisodeJob) -> dict[str, Any]:
+    return {
+        "result_identity": job.result_identity,
+        "task": job.isaac_task_name,
+        "seed": job.seed,
+        "repeat_idx": job.repeat_idx,
+        "episode_seed": job.episode_seed,
+        "episode_index": job.episode_index,
+    }
+
+
+def _strict_episode_identity_matches(
+    actual: Any, expected: Mapping[str, Any]
+) -> bool:
+    if not isinstance(actual, dict) or set(actual) != set(expected):
+        return False
+    for key, expected_value in expected.items():
+        actual_value = actual[key]
+        if type(expected_value) is int:
+            if type(actual_value) is not int:
+                return False
+        elif type(expected_value) is str:
+            if type(actual_value) is not str:
+                return False
+        else:
+            return False
+        if actual_value != expected_value:
+            return False
+    return True
+
+
+def _decode_shadow_terminal_status(
+    status: Mapping[str, Any],
+) -> tuple[str, int, bool]:
+    """Return semantic state, semantic exit code, and whether this is a handoff."""
+    state = status.get("state")
+    if state == "shutdown_ready":
+        if "exit_code" in status:
+            raise SimulationError("shadow shutdown_ready status contains final exit_code")
+        if "planned_state" not in status or "planned_exit_code" not in status:
+            raise SimulationError("shadow shutdown_ready status lacks planned terminal fields")
+        semantic_state = status["planned_state"]
+        semantic_exit_code = status["planned_exit_code"]
+        is_shutdown_handoff = True
+    else:
+        if type(state) is not str or state not in _SHADOW_TERMINAL_EXIT_CODES:
+            raise SimulationError(f"shadow terminal state is invalid: {state!r}")
+        if "planned_state" in status or "planned_exit_code" in status:
+            raise SimulationError("shadow final status contains planned terminal fields")
+        if "exit_code" not in status:
+            raise SimulationError("shadow final status lacks exit_code")
+        semantic_state = state
+        semantic_exit_code = status["exit_code"]
+        is_shutdown_handoff = False
+
+    if type(semantic_state) is not str or semantic_state not in _SHADOW_TERMINAL_EXIT_CODES:
+        raise SimulationError(f"shadow semantic terminal state is invalid: {semantic_state!r}")
+    expected_exit_code = _SHADOW_TERMINAL_EXIT_CODES[semantic_state]
+    if type(semantic_exit_code) is not int or semantic_exit_code != expected_exit_code:
+        raise SimulationError(
+            "shadow semantic terminal code is invalid: "
+            f"state={semantic_state!r} code={semantic_exit_code!r} "
+            f"expected={expected_exit_code}"
+        )
+    return semantic_state, semantic_exit_code, is_shutdown_handoff
+
+
+def _validate_live_server_status(
+    status: Mapping[str, Any],
+    *,
+    worker_id: str,
+    allow_infer_in_progress: bool,
+) -> None:
+    state = status.get("state")
+    if state == "fatal" or status.get("fatal_error_code"):
+        raise ServerError(
+            f"Huge server {worker_id} entered fatal state: "
+            f"{status.get('fatal_error_code', 'unknown')}"
+        )
+    if state == "ready":
+        return
+    if state != "infer_in_progress" or not allow_infer_in_progress:
+        raise ServerError(
+            f"Huge server {worker_id} entered unexpected live state: {state!r}"
+        )
+
+    sequence_fields = (
+        "pending_sequence",
+        "infer_sequence",
+        "last_completed_sequence",
+        "reset_generation",
+    )
+    if any(type(status.get(field)) is not int for field in sequence_fields):
+        raise ServerError(
+            f"Huge server {worker_id} infer_in_progress sequence fields are invalid"
+        )
+    pending_sequence = status["pending_sequence"]
+    infer_sequence = status["infer_sequence"]
+    last_completed_sequence = status["last_completed_sequence"]
+    reset_generation = status["reset_generation"]
+    if (
+        pending_sequence != infer_sequence + 1
+        or last_completed_sequence != infer_sequence
+        or infer_sequence < 0
+        or last_completed_sequence < 0
+        or pending_sequence < 1
+        or reset_generation < 1
+    ):
+        raise ServerError(
+            f"Huge server {worker_id} infer_in_progress sequence values are invalid"
+        )
+
+
+def _validate_shadow_exit_status(
+    worker: WorkerRuntime,
+    *,
+    run_id: str,
+    returncode: int,
+) -> dict[str, Any]:
+    shadow = worker.active_shadow
+    job = worker.active_job
+    session_id = worker.active_session_id
+    status_path = worker.active_status_path
+    if shadow is None or job is None or session_id is None or status_path is None:
+        raise SimulationError(f"worker {worker.worker_id} has incomplete active shadow state")
+    if not status_path.is_file():
+        raise SimulationError(f"shadow status is missing for {worker.worker_id}: {status_path}")
+    shutdown_guard_path = status_path.with_name(f".{status_path.name}.shutdown_guard")
+    if os.path.lexists(shutdown_guard_path):
+        raise SimulationError(
+            f"shadow shutdown guard is still present for {worker.worker_id}: {shutdown_guard_path}"
+        )
+    status = _json_object(
+        status_path,
+        label="shadow session status",
+        attempt=status_path.parent.parent,
+    )
+    if (
+        status.get("schema_version") != WORKER_STATUS_SCHEMA_VERSION
+        or status.get("run_id") != run_id
+        or status.get("worker_id") != worker.worker_id
+        or status.get("shadow_session_id") != session_id
+    ):
+        raise SimulationError(f"shadow session status identity mismatch for {worker.worker_id}")
+    simulator_pid = status.get("simulator_pid")
+    if isinstance(simulator_pid, bool) or not isinstance(simulator_pid, int):
+        raise SimulationError(f"shadow simulator_pid is invalid for {worker.worker_id}")
+    if simulator_pid != shadow.process.pid:
+        raise SimulationError(
+            f"shadow simulator PID mismatch for {worker.worker_id}: {simulator_pid} != {shadow.process.pid}"
+        )
+    process_started_at = status.get("process_started_at")
+    if (
+        isinstance(process_started_at, bool)
+        or not isinstance(process_started_at, (int, float))
+        or not math.isfinite(float(process_started_at))
+        or float(process_started_at) <= 0.0
+    ):
+        raise SimulationError(f"shadow process_started_at is invalid for {worker.worker_id}")
+    expected_episode_identity = _expected_shadow_episode_identity(job)
+    if not _strict_episode_identity_matches(
+        status.get("episode_identity"), expected_episode_identity
+    ):
+        raise SimulationError(f"shadow episode identity mismatch for {worker.worker_id}")
+    cleanup_errors = status.get("cleanup_errors")
+    if not isinstance(cleanup_errors, list):
+        raise SimulationError(f"shadow cleanup_errors is not a list for {worker.worker_id}")
+    if cleanup_errors:
+        raise SimulationError(f"shadow cleanup failed for {worker.worker_id}: {cleanup_errors}")
+    semantic_state, semantic_exit_code, is_shutdown_handoff = (
+        _decode_shadow_terminal_status(status)
+    )
+    terminal_detail = (
+        f"semantic={semantic_state} code={semantic_exit_code} process={returncode} "
+        f"error={status.get('error')!r}"
+    )
+    if type(returncode) is not int:
+        raise SimulationError(
+            f"shadow process exit code is invalid for {worker.worker_id}: {terminal_detail}"
+        )
+    if is_shutdown_handoff:
+        if returncode not in {0, semantic_exit_code}:
+            raise SimulationError(
+                f"shadow handoff/process exit mismatch for {worker.worker_id}: {terminal_detail}"
+            )
+    elif returncode != semantic_exit_code:
+        raise SimulationError(
+            f"shadow final/process exit mismatch for {worker.worker_id}: {terminal_detail}"
+        )
+    if semantic_state == "server_or_infer_fatal":
+        raise ServerError(
+            f"shadow {worker.worker_id} classified server/inference failure: {terminal_detail}"
+        )
+    if semantic_state != "complete":
+        raise SimulationError(
+            f"shadow {worker.worker_id} classified terminal simulation failure: {terminal_detail}"
+        )
+    if status.get("classification") != "completed":
+        raise SimulationError(f"shadow completion classification is invalid for {worker.worker_id}")
+    completed_count = status.get("completed_count")
+    if (
+        isinstance(completed_count, bool)
+        or not isinstance(completed_count, int)
+        or completed_count != 1
+    ):
+        raise SimulationError(f"shadow completed_count is invalid for {worker.worker_id}")
+    if not _strict_episode_identity_matches(
+        status.get("current_episode"), expected_episode_identity
+    ):
+        raise SimulationError(f"shadow current episode identity mismatch for {worker.worker_id}")
+    return status
+
+
+def _finish_worker_shadow(
+    worker: WorkerRuntime,
+    *,
+    attempt: Path,
+    run_id: str,
+    returncode: int,
+) -> None:
+    shadow = worker.active_shadow
+    job = worker.active_job
+    shm = worker.active_shm
+    attempt_number = worker.active_attempt_number
+    if shadow is None or job is None or shm is None or attempt_number is None:
+        raise SimulationError(f"worker {worker.worker_id} cannot finish an incomplete active shadow")
+
+    first_error: Exception | None = None
+    try:
+        waited_returncode = shadow.process.wait(timeout=0)
+        if waited_returncode != returncode:
+            raise SimulationError(
+                f"shadow wait/poll exit mismatch for {worker.worker_id}: {waited_returncode} != {returncode}"
+            )
+        if _process_group_has_live_members(shadow.process.pid):
+            raise SimulationError(
+                f"shadow {worker.worker_id} left live process-group descendants"
+            )
+    except Exception as exc:
+        first_error = exc
+    try:
+        shadow.log_stream.close()
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+
+    status_valid = False
+    status: dict[str, Any] | None = None
+    try:
+        status = _validate_shadow_exit_status(worker, run_id=run_id, returncode=returncode)
+        status_valid = True
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+
+    if status_valid:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
-                payload = json.loads(response.read())
-            for key, value in expected.items():
-                matches = (
-                    _normalize_uuid(str(payload.get(key, ""))) == _normalize_uuid(str(value))
-                    if key == "cuda_uuid" else payload.get(key) == value
+            completion = validate_completion_envelope(attempt, job)
+            if completion is None:
+                raise SimulationError(
+                    f"shadow completed without a valid completion envelope: {job.result_identity}"
                 )
-                if not matches:
-                    raise ValueError(f"health {key}={payload.get(key)!r}, expected {value!r}")
-            return
-        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-            last_error = str(exc)
-            time.sleep(0.5)
-    raise ServerError(f"Huge server health identity check failed: {last_error}")
+            if status is not None:
+                expected_episode_identity = _expected_shadow_episode_identity(job)
+                expected_completion_identity = dict(expected_episode_identity)
+                expected_completion_identity.pop("result_identity")
+                expected_path = (attempt / "completions" / _completion_filename(job)).resolve()
+                completion_path = Path(str(status.get("completion", ""))).expanduser().resolve()
+                if completion_path != expected_path:
+                    raise SimulationError(
+                        f"shadow completion path mismatch for {worker.worker_id}: "
+                        f"{completion_path} != {expected_path}"
+                    )
+                envelope_path = attempt / "completions" / _completion_filename(job)
+                envelope = _json_object(
+                    envelope_path,
+                    label="completion envelope",
+                    attempt=attempt,
+                )
+                if (
+                    envelope.get("run_id") != run_id
+                    or envelope.get("worker_id") != worker.worker_id
+                ):
+                    raise SimulationError(
+                        f"shadow completion ownership mismatch for {worker.worker_id}"
+                    )
+                if not _strict_episode_identity_matches(
+                    envelope.get("identity"), expected_completion_identity
+                ):
+                    raise SimulationError(
+                        f"shadow completion identity mismatch for {worker.worker_id}"
+                    )
+                payload = completion.get("payload")
+                if (
+                    not isinstance(payload, dict)
+                    or status.get("upstream_payload_sha256") != canonical_sha256(payload)
+                ):
+                    raise SimulationError(
+                        f"shadow completion payload hash mismatch for {worker.worker_id}"
+                    )
+                payload_identity = {
+                    key: payload.get(key) for key in expected_completion_identity
+                }
+                if not _strict_episode_identity_matches(
+                    payload_identity, expected_completion_identity
+                ):
+                    raise SimulationError(
+                        f"shadow completion payload identity mismatch for {worker.worker_id}"
+                    )
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+
+    try:
+        shm.observe()
+        if not shm.cleanup():
+            raise UnsafeCleanupError(f"SHM cleanup identity failed for {shm.name}")
+    except Exception as exc:
+        if first_error is None or isinstance(exc, UnsafeCleanupError):
+            first_error = exc
+
+    if first_error is None:
+        if not worker.pending or worker.pending[0].result_identity != job.result_identity:
+            first_error = SimulationError(f"worker {worker.worker_id} pending queue identity drift")
+        try:
+            if first_error is None:
+                _finish_episode_attempt(
+                    attempt,
+                    job,
+                    attempt_number,
+                    state="succeeded",
+                    returncode=returncode,
+                )
+        except Exception as exc:
+            first_error = exc
+        if first_error is None:
+            worker.pending.popleft()
+
+    if first_error is None:
+        _clear_worker_shadow_state(worker)
+    if first_error is not None:
+        raise first_error
+
+
+def _allocate_shadow_resources(
+    attempt: Path,
+    *,
+    run_id: str,
+    worker_id: str,
+) -> tuple[str, Path, Path, Path, OwnedShm]:
+    for _ in range(100):
+        shadow_session_id = secrets.token_hex(8)
+        shard_path = attempt / "shards" / f"worker-{worker_id}-{shadow_session_id}.json"
+        status_path = attempt / "status" / f"shadow-{worker_id}-{shadow_session_id}.json"
+        log_path = attempt / "logs" / f"sim-{worker_id}-{shadow_session_id}.log"
+        recording_path = attempt / "recordings" / worker_id / shadow_session_id
+        if any(os.path.lexists(path) for path in (shard_path, status_path, log_path, recording_path)):
+            continue
+        shm = _make_shm(run_id, worker_id, shadow_session_id)
+        return shadow_session_id, shard_path, status_path, log_path, shm
+    raise SimulationError(f"unable to allocate unique shadow resources for {worker_id}")
+
+
+def _launch_worker_shadow(
+    worker: WorkerRuntime,
+    *,
+    args: argparse.Namespace,
+    task: TaskSpec,
+    checkpoint: CheckpointContract,
+    run_id: str,
+    attempt: Path,
+    policy: Mapping[str, Any],
+    yaml_config: Mapping[str, Any],
+    runtime_env: Mapping[str, str],
+) -> None:
+    if worker.active_shadow is not None or worker.active_job is not None:
+        raise SimulationError(f"worker {worker.worker_id} already has an active shadow")
+    if not worker.pending:
+        return
+    if worker.server is None or worker.server_starting_attempt_number is not None:
+        raise SimulationError(f"worker {worker.worker_id} server is not ready for shadow launch")
+    job = worker.pending[0]
+    session_id, shard_path, status_path, log_path, shm = _allocate_shadow_resources(
+        attempt,
+        run_id=run_id,
+        worker_id=worker.worker_id,
+    )
+    attempt_number = worker.prepared_attempt_number
+    if attempt_number is None:
+        attempt_number = _begin_episode_attempt(
+            attempt,
+            job,
+            worker_id=worker.worker_id,
+            phase="shadow",
+            session_id=session_id,
+            log_path=log_path,
+            server=worker.server,
+        )
+    else:
+        records = _episode_attempt_records(attempt, job)
+        if (
+            attempt_number != len(records)
+            or records[-1]["state"] != "server_ready"
+        ):
+            raise SimulationError(
+                f"worker {worker.worker_id} prepared retry attempt is invalid"
+            )
+    shadow: ChildProcess | None = None
+    try:
+        _write_shard(
+            shard_path,
+            [job],
+            attempt,
+            checkpoint,
+            policy,
+            worker.worker_id,
+            shadow_session_id=session_id,
+        )
+        shadow_env = _isaac_environment(
+            args,
+            run_id=run_id,
+            worker_id=worker.worker_id,
+            gpu_uuid=worker.binding.gpu.cuda_uuid,
+        )
+        shadow_env.update(runtime_env)
+        shadow_env["ISAAC_MULTI_IMAGE_SHM_NAME"] = shm.name
+        command = _shadow_command(
+            args,
+            task,
+            checkpoint,
+            worker.binding,
+            run_id,
+            worker.worker_id,
+            attempt,
+            shard_path,
+            [job],
+            worker.port,
+            shm,
+            policy,
+            yaml_config,
+            shadow_session_id=session_id,
+        )
+        shadow = _launch_child("shadow", worker.worker_id, command, log_path, shadow_env, attempt)
+        worker.active_shadow = shadow
+        worker.active_job = job
+        worker.active_shm = shm
+        worker.active_session_id = session_id
+        worker.active_status_path = status_path
+        worker.active_log_path = log_path
+        worker.active_started_monotonic = time.monotonic()
+        worker.active_binding_verified = False
+        worker.active_attempt_number = attempt_number
+        _mark_episode_attempt_running(
+            attempt,
+            job,
+            attempt_number,
+            pid=shadow.process.pid,
+            process_start_ticks=shadow.process_start_ticks,
+            process_command_sha256=shadow.command_sha256,
+            server=worker.server,
+            session_id=session_id,
+            log_path=log_path,
+        )
+    except Exception as exc:
+        cleanup_error: Exception | None = None
+        if shadow is not None:
+            try:
+                _abort_worker_shadow(
+                    worker,
+                    run_id=run_id,
+                    grace=float(policy["shutdown_grace_sec"]),
+                )
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
+        else:
+            try:
+                shm.observe()
+                if not shm.cleanup():
+                    raise UnsafeCleanupError(f"SHM cleanup identity failed for {shm.name}")
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
+        worker.prepared_attempt_number = None
+        if cleanup_error is not None:
+            raise cleanup_error from exc
+        raise EpisodeAttemptError(
+            job,
+            attempt_number,
+            f"shadow launch failed for {worker.worker_id}: {type(exc).__name__}: {exc}",
+        ) from exc
+    worker.prepared_attempt_number = None
+
+
+def _restart_worker_server(
+    worker: WorkerRuntime,
+    *,
+    args: argparse.Namespace,
+    task: TaskSpec,
+    checkpoint: CheckpointContract,
+    run_id: str,
+    attempt: Path,
+    policy: Mapping[str, Any],
+    contract_hash: str,
+    source_inventory_digest: str,
+) -> ChildProcess:
+    if (
+        worker.server is not None
+        or worker.active_shadow is not None
+        or worker.server_starting_attempt_number is not None
+    ):
+        raise ServerError(f"worker {worker.worker_id} is not ready for server restart")
+    if not worker.pending:
+        raise ServerError(f"worker {worker.worker_id} has no episode for server recovery")
+    job = worker.pending[0]
+    next_ordinal = len(_episode_attempt_records(attempt, job)) + 1
+    session_id = secrets.token_hex(8)
+    log_path = attempt / "logs" / (
+        f"server-{worker.worker_id}-retry-{next_ordinal:03d}-{session_id}.log"
+    )
+    attempt_number = _begin_episode_attempt(
+        attempt,
+        job,
+        worker_id=worker.worker_id,
+        phase="server_restart",
+        session_id=session_id,
+        log_path=log_path,
+    )
+    server: ChildProcess | None = None
+    started_monotonic = time.monotonic()
+    started_wall_time = time.time()
+    try:
+        command = _server_command(
+            args,
+            task,
+            checkpoint,
+            worker.binding,
+            run_id,
+            worker.worker_id,
+            attempt,
+            worker.port,
+            contract_hash=contract_hash,
+            source_inventory_digest=source_inventory_digest,
+        )
+        server = _launch_child(
+            "server",
+            worker.worker_id,
+            command,
+            log_path,
+            _server_environment(args.repo, worker.binding.gpu.cuda_uuid),
+            args.repo,
+        )
+        worker.server = server
+        _update_episode_attempt(
+            attempt,
+            job,
+            attempt_number,
+            state="starting",
+            process_role="server",
+            process_pid=server.process.pid,
+            process_group_id=server.process.pid,
+            process_start_ticks=server.process_start_ticks,
+            process_command_sha256=server.command_sha256,
+        )
+        worker.server_starting_attempt_number = attempt_number
+        worker.server_started_monotonic = started_monotonic
+        worker.server_started_wall_time = started_wall_time
+    except Exception as exc:
+        if server is not None:
+            try:
+                _stop_worker_server(
+                    worker,
+                    grace=float(policy["shutdown_grace_sec"]),
+                )
+            except Exception as cleanup_exc:
+                raise UnsafeCleanupError(
+                    f"worker {worker.worker_id} server recovery cleanup failed: {cleanup_exc}"
+                ) from exc
+        raise EpisodeAttemptError(
+            job,
+            attempt_number,
+            f"server restart failed for {worker.worker_id}: {type(exc).__name__}: {exc}",
+        ) from exc
+    return server
+
+
+def _advance_worker_server_startup(
+    worker: WorkerRuntime,
+    *,
+    attempt: Path,
+    run_id: str,
+    expected_health: Mapping[str, Any],
+    ready_timeout_sec: float,
+    now_monotonic: float | None = None,
+) -> bool:
+    server = worker.server
+    attempt_number = worker.server_starting_attempt_number
+    started_monotonic = worker.server_started_monotonic
+    started_wall_time = worker.server_started_wall_time
+    if (
+        server is None
+        or attempt_number is None
+        or started_monotonic is None
+        or started_wall_time is None
+        or not worker.pending
+    ):
+        raise SimulationError(
+            f"worker {worker.worker_id} has incomplete server startup state"
+        )
+    job = worker.pending[0]
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+
+    def pending_or_timeout(last_error: str) -> bool:
+        if now - started_monotonic >= ready_timeout_sec:
+            raise ServerError(
+                f"Huge server {worker.worker_id} startup timed out: {last_error}"
+            )
+        return False
+
+    try:
+        returncode = server.process.poll()
+        if returncode is not None:
+            raise ServerError(
+                f"Huge server {worker.worker_id} exited during startup with {returncode}"
+            )
+        status_path = attempt / "status" / f"server-{worker.worker_id}.json"
+        if not status_path.is_file():
+            return pending_or_timeout("status file is not available")
+        status = _json_object(
+            status_path,
+            label="Huge server startup status",
+            attempt=attempt,
+        )
+        updated_at = status.get("updated_at")
+        if (
+            isinstance(updated_at, bool)
+            or not isinstance(updated_at, (int, float))
+            or not math.isfinite(float(updated_at))
+        ):
+            raise SimulationError(
+                f"server status updated_at is invalid for {worker.worker_id}"
+            )
+        if float(updated_at) < started_wall_time:
+            return pending_or_timeout("only a stale status file is available")
+        if status.get("run_id") != run_id or status.get("worker_id") != worker.worker_id:
+            raise SimulationError(
+                f"server startup status identity mismatch for {worker.worker_id}"
+            )
+        state = str(status.get("state", ""))
+        if state == "fatal" or status.get("fatal_error_code"):
+            raise ServerError(
+                f"Huge server {worker.worker_id} entered fatal state during startup: "
+                f"{status.get('fatal_error_code', 'unknown')}"
+            )
+        if state == "starting":
+            return pending_or_timeout("model is still loading")
+        if state != "ready":
+            raise ServerError(
+                f"Huge server {worker.worker_id} entered unexpected startup state {state!r}"
+            )
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{worker.port}/health", timeout=0.25
+            ) as response:
+                payload = json.loads(response.read())
+        except (OSError, TimeoutError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            return pending_or_timeout(f"health endpoint is not ready: {exc}")
+        if not isinstance(payload, dict):
+            raise ServerError(
+                f"Huge server {worker.worker_id} health response is not an object"
+            )
+        for key, expected_value in expected_health.items():
+            matches = (
+                _normalize_uuid(str(payload.get(key, "")))
+                == _normalize_uuid(str(expected_value))
+                if key == "cuda_uuid"
+                else payload.get(key) == expected_value
+            )
+            if not matches:
+                raise ServerError(
+                    f"Huge server {worker.worker_id} health {key}={payload.get(key)!r}, "
+                    f"expected {expected_value!r}"
+                )
+        _update_episode_attempt(
+            attempt,
+            job,
+            attempt_number,
+            state="server_ready",
+            process_pid=server.process.pid,
+            process_group_id=server.process.pid,
+        )
+    except EpisodeAttemptError:
+        raise
+    except Exception as exc:
+        raise EpisodeAttemptError(
+            job,
+            attempt_number,
+            f"server startup failed for {worker.worker_id}: {type(exc).__name__}: {exc}",
+        ) from exc
+    worker.prepared_attempt_number = attempt_number
+    worker.server_starting_attempt_number = None
+    worker.server_started_monotonic = None
+    worker.server_started_wall_time = None
+    return True
+
+
+def _clear_worker_server_state(
+    worker: WorkerRuntime, expected_server: ChildProcess
+) -> None:
+    if worker.server is not expected_server:
+        raise SimulationError(f"worker {worker.worker_id} server ownership drifted")
+    worker.server = None
+    worker.prepared_attempt_number = None
+    worker.server_starting_attempt_number = None
+    worker.server_started_monotonic = None
+    worker.server_started_wall_time = None
+
+
+def _stop_worker_server(worker: WorkerRuntime, *, grace: float) -> None:
+    server = worker.server
+    if server is None:
+        return
+    _terminate_children([server], grace)
+    _clear_worker_server_state(worker, server)
+
+
+def _validate_live_server(worker: WorkerRuntime, *, attempt: Path, run_id: str) -> None:
+    if worker.server is None:
+        raise ServerError(f"Huge server {worker.worker_id} is unavailable")
+    returncode = worker.server.process.poll()
+    if returncode is not None:
+        raise ServerError(f"Huge server {worker.worker_id} exited early with {returncode}")
+    status_path = attempt / "status" / f"server-{worker.worker_id}.json"
+    if not status_path.is_file():
+        raise SimulationError(f"server status is missing for {worker.worker_id}")
+    status = _json_object(
+        status_path,
+        label="Huge server status",
+        attempt=attempt,
+    )
+    if status.get("run_id") != run_id or status.get("worker_id") != worker.worker_id:
+        raise SimulationError(f"server status identity mismatch for {worker.worker_id}")
+    _validate_live_server_status(
+        status,
+        worker_id=worker.worker_id,
+        allow_infer_in_progress=worker.active_shadow is not None,
+    )
+
+
+def _observe_shadow_binding(worker: WorkerRuntime, *, run_id: str) -> bool:
+    if worker.active_binding_verified:
+        return True
+    shadow = worker.active_shadow
+    job = worker.active_job
+    session_id = worker.active_session_id
+    status_path = worker.active_status_path
+    if shadow is None or job is None or session_id is None or status_path is None:
+        raise SimulationError(f"worker {worker.worker_id} has incomplete active shadow state")
+    if not status_path.is_file():
+        return False
+    status = _json_object(
+        status_path,
+        label="shadow session status",
+        attempt=status_path.parent.parent,
+    )
+    if (
+        status.get("schema_version") != WORKER_STATUS_SCHEMA_VERSION
+        or status.get("run_id") != run_id
+        or status.get("worker_id") != worker.worker_id
+        or status.get("shadow_session_id") != session_id
+        or status.get("simulator_pid") != shadow.process.pid
+        or not _strict_episode_identity_matches(
+            status.get("episode_identity"), _expected_shadow_episode_identity(job)
+        )
+    ):
+        raise SimulationError(f"shadow startup status identity mismatch for {worker.worker_id}")
+    state = str(status.get("state", ""))
+    if state in {"binding_verified", "shutdown_ready", "complete"}:
+        worker.active_binding_verified = True
+    elif state != "starting":
+        raise SimulationError(
+            f"shadow {worker.worker_id} entered unexpected startup state {state!r}"
+        )
+    return worker.active_binding_verified
+
+
+def _shadow_guard_removal_marker_path(status_path: Path) -> Path:
+    return status_path.with_name(
+        f".{status_path.name}.shutdown_guard.removed_by_orchestrator.json"
+    )
+
+
+def _read_owned_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[bytes, os.stat_result]:
+    try:
+        path_info = path.lstat()
+    except OSError as exc:
+        raise UnsafeCleanupError(f"cannot inspect {label} {path}: {exc}") from exc
+    if (
+        stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISREG(path_info.st_mode)
+        or path_info.st_uid != os.getuid()
+    ):
+        raise UnsafeCleanupError(f"{label} ownership mismatch: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise UnsafeCleanupError(f"cannot open {label} {path}: {exc}") from exc
+    try:
+        opened_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_info.st_mode)
+            or opened_info.st_uid != os.getuid()
+            or opened_info.st_dev != path_info.st_dev
+            or opened_info.st_ino != path_info.st_ino
+        ):
+            raise UnsafeCleanupError(f"{label} identity changed while reading: {path}")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            size += len(block)
+            if size > 1024 * 1024:
+                raise UnsafeCleanupError(f"{label} is unexpectedly large: {path}")
+            chunks.append(block)
+        return b"".join(chunks), opened_info
+    except OSError as exc:
+        raise UnsafeCleanupError(f"cannot read {label} {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _validate_shadow_guard_removal_marker(
+    marker: Path,
+    *,
+    run_id: str,
+    worker_id: str,
+    session_id: str,
+) -> dict[str, Any]:
+    content, _ = _read_owned_regular_bytes(
+        marker,
+        label="shadow guard-removal provenance marker",
+    )
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UnsafeCleanupError(
+            f"invalid shadow guard-removal provenance marker {marker}: {exc}"
+        ) from exc
+    removed_at = payload.get("removed_at") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _SHADOW_GUARD_REMOVAL_SCHEMA_VERSION
+        or payload.get("run_id") != run_id
+        or payload.get("worker_id") != worker_id
+        or payload.get("shadow_session_id") != session_id
+        or payload.get("removed_by") != "orchestrator"
+        or isinstance(removed_at, bool)
+        or not isinstance(removed_at, (int, float))
+        or not math.isfinite(float(removed_at))
+        or float(removed_at) <= 0.0
+    ):
+        raise UnsafeCleanupError(
+            f"shadow guard-removal provenance identity mismatch: {marker}"
+        )
+    return payload
+
+
+def _publish_shadow_guard_removal_marker(
+    marker: Path,
+    *,
+    run_id: str,
+    worker_id: str,
+    session_id: str,
+) -> None:
+    if os.path.lexists(marker):
+        _validate_shadow_guard_removal_marker(
+            marker,
+            run_id=run_id,
+            worker_id=worker_id,
+            session_id=session_id,
+        )
+        return
+
+    removed_at = float(time.time())
+    if not math.isfinite(removed_at) or removed_at <= 0.0:
+        raise UnsafeCleanupError("cannot create shadow guard-removal provenance timestamp")
+    payload = {
+        "schema_version": _SHADOW_GUARD_REMOVAL_SCHEMA_VERSION,
+        "run_id": run_id,
+        "worker_id": worker_id,
+        "shadow_session_id": session_id,
+        "removed_by": "orchestrator",
+        "removed_at": removed_at,
+    }
+    content = (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    temporary = marker.with_name(
+        f".{marker.name}.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    try:
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            persisted, _ = _read_owned_regular_bytes(
+                temporary,
+                label="temporary shadow guard-removal provenance marker",
+            )
+            if persisted != content:
+                raise UnsafeCleanupError(
+                    f"temporary shadow guard-removal provenance was truncated: {temporary}"
+                )
+            _validate_shadow_guard_removal_marker(
+                temporary,
+                run_id=run_id,
+                worker_id=worker_id,
+                session_id=session_id,
+            )
+            try:
+                os.link(temporary, marker)
+            except FileExistsError:
+                _validate_shadow_guard_removal_marker(
+                    marker,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                )
+            _fsync_directory(marker.parent)
+            _validate_shadow_guard_removal_marker(
+                marker,
+                run_id=run_id,
+                worker_id=worker_id,
+                session_id=session_id,
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+    except UnsafeCleanupError:
+        raise
+    except OSError as exc:
+        raise UnsafeCleanupError(
+            f"cannot publish shadow guard-removal provenance marker {marker}: {exc}"
+        ) from exc
+
+
+def _remove_owned_shutdown_guard(
+    status_path: Path,
+    *,
+    run_id: str,
+    worker_id: str,
+    session_id: str,
+) -> None:
+    try:
+        _require_owned_attempt_path(
+            status_path.parent.parent,
+            status_path.parent,
+            label="shadow status directory",
+            directory=True,
+        )
+    except ConfigError as exc:
+        raise UnsafeCleanupError(str(exc)) from exc
+    guard = status_path.with_name(f".{status_path.name}.shutdown_guard")
+    marker = _shadow_guard_removal_marker_path(status_path)
+    if not os.path.lexists(guard):
+        if os.path.lexists(marker):
+            _validate_shadow_guard_removal_marker(
+                marker,
+                run_id=run_id,
+                worker_id=worker_id,
+                session_id=session_id,
+            )
+        return
+    content, info = _read_owned_regular_bytes(
+        guard,
+        label="shadow shutdown guard",
+    )
+    expected = f"{run_id} {worker_id} {session_id}\n".encode("ascii")
+    if content != expected:
+        raise UnsafeCleanupError(f"shadow shutdown guard ownership mismatch: {guard}")
+    _publish_shadow_guard_removal_marker(
+        marker,
+        run_id=run_id,
+        worker_id=worker_id,
+        session_id=session_id,
+    )
+    current_content, current_info = _read_owned_regular_bytes(
+        guard,
+        label="shadow shutdown guard",
+    )
+    if (
+        current_content != expected
+        or current_info.st_dev != info.st_dev
+        or current_info.st_ino != info.st_ino
+    ):
+        raise UnsafeCleanupError(f"shadow shutdown guard identity changed: {guard}")
+    guard.unlink()
+    _fsync_directory(guard.parent)
+
+
+def _clear_worker_shadow_state(worker: WorkerRuntime) -> None:
+    worker.active_shadow = None
+    worker.active_job = None
+    worker.active_shm = None
+    worker.active_session_id = None
+    worker.active_status_path = None
+    worker.active_log_path = None
+    worker.active_started_monotonic = None
+    worker.active_binding_verified = False
+    worker.active_attempt_number = None
+
+
+def _abort_worker_shadow(
+    worker: WorkerRuntime,
+    *,
+    run_id: str,
+    grace: float,
+) -> int | None:
+    shadow = worker.active_shadow
+    shm = worker.active_shm
+    session_id = worker.active_session_id
+    status_path = worker.active_status_path
+    if shadow is None or shm is None or session_id is None or status_path is None:
+        raise SimulationError(f"worker {worker.worker_id} cannot abort an incomplete active shadow")
+    try:
+        _terminate_children([shadow], grace)
+    except Exception as exc:
+        raise UnsafeCleanupError(
+            f"worker {worker.worker_id} shadow process group could not be reaped: {exc}"
+        ) from exc
+    return _release_worker_shadow_resources(worker, run_id=run_id)
+
+
+def _release_worker_shadow_resources(
+    worker: WorkerRuntime,
+    *,
+    run_id: str,
+) -> int | None:
+    shadow = worker.active_shadow
+    shm = worker.active_shm
+    session_id = worker.active_session_id
+    status_path = worker.active_status_path
+    if shadow is None or shm is None or session_id is None or status_path is None:
+        raise SimulationError(
+            f"worker {worker.worker_id} cannot release incomplete active shadow resources"
+        )
+    _remove_owned_shutdown_guard(
+        status_path,
+        run_id=run_id,
+        worker_id=worker.worker_id,
+        session_id=session_id,
+    )
+    shm.observe()
+    if not shm.cleanup():
+        raise UnsafeCleanupError(f"SHM cleanup identity failed for {shm.name}")
+    returncode = shadow.process.poll()
+    _clear_worker_shadow_state(worker)
+    return returncode
+
+
+def _start_worker_cleanup(
+    worker: WorkerRuntime,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    *,
+    children: Sequence[ChildProcess],
+    shadow: ChildProcess | None,
+    server: ChildProcess | None,
+    job: EpisodeJob | None,
+    attempt_number: int | None,
+    reason: str,
+    error: str,
+    consume_attempt: bool,
+    shutdown_grace_sec: float,
+) -> None:
+    if worker.cleanup is not None:
+        raise SimulationError(f"worker {worker.worker_id} already has cleanup in progress")
+    owned_children = tuple(children)
+    if not owned_children or any(
+        child.worker_id != worker.worker_id for child in owned_children
+    ):
+        raise SimulationError(f"worker {worker.worker_id} cleanup children are invalid")
+    if shadow is not None and shadow not in owned_children:
+        raise SimulationError(f"worker {worker.worker_id} shadow cleanup ownership drifted")
+    if server is not None and server not in owned_children:
+        raise SimulationError(f"worker {worker.worker_id} server cleanup ownership drifted")
+    if consume_attempt and (job is None or attempt_number is None):
+        raise SimulationError(f"worker {worker.worker_id} cleanup lacks retry identity")
+    future = executor.submit(
+        _terminate_children,
+        owned_children,
+        shutdown_grace_sec,
+    )
+    worker.cleanup = WorkerCleanup(
+        future=future,
+        shadow=shadow,
+        server=server,
+        job=job,
+        attempt_number=attempt_number,
+        reason=reason,
+        error=error,
+        consume_attempt=consume_attempt,
+    )
+
+
+def _finish_worker_cleanup(
+    worker: WorkerRuntime,
+    *,
+    attempt: Path,
+    run_id: str,
+    max_retries: int,
+    backoff_sec: float,
+) -> tuple[str, int | None, bool | None] | None:
+    cleanup = worker.cleanup
+    if cleanup is None or not cleanup.future.done():
+        return None
+    cleanup.future.result()
+    returncode: int | None = None
+    if cleanup.shadow is not None:
+        if worker.active_shadow is not cleanup.shadow:
+            raise SimulationError(f"worker {worker.worker_id} shadow cleanup identity drifted")
+        returncode = _release_worker_shadow_resources(worker, run_id=run_id)
+    if cleanup.server is not None:
+        _clear_worker_server_state(worker, cleanup.server)
+    worker.cleanup = None
+    exhausted: bool | None = None
+    if cleanup.consume_attempt:
+        if cleanup.job is None or cleanup.attempt_number is None:
+            raise SimulationError(f"worker {worker.worker_id} cleanup lost retry identity")
+        exhausted = _schedule_episode_failure(
+            worker,
+            attempt=attempt,
+            job=cleanup.job,
+            attempt_number=cleanup.attempt_number,
+            max_retries=max_retries,
+            backoff_sec=backoff_sec,
+            reason=cleanup.reason,
+            error=cleanup.error,
+            returncode=returncode,
+            now=time.monotonic(),
+        )
+    return cleanup.reason, cleanup.attempt_number, exhausted
+
+
+def _process_group_has_live_members(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        members = [
+            row
+            for row in _namespace_process_table()
+            if row["process_group_id"] == process_group_id
+        ]
+    except UnsafeCleanupError:
+        return True
+    if members:
+        return any(row["state"] != "Z" for row in members)
+    # Some container runtimes expose a host /proc while Popen reports namespace-local
+    # PIDs.  If killpg proves the group exists but /proc cannot identify its members,
+    # fail closed and keep treating the group as live.
+    return True
+
+
+def _signal_process_group(process_group_id: int, signum: int) -> None:
+    try:
+        os.killpg(process_group_id, signum)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise UnsafeCleanupError(
+            f"cannot signal owned process group {process_group_id}: {exc}"
+        ) from exc
+
+
+def _signal_child_process_group(child: ChildProcess, signum: int) -> None:
+    process_group_id = child.process.pid
+    if not _process_group_has_live_members(process_group_id):
+        return
+    returncode = child.process.poll()
+    current = _read_process_identity(process_group_id)
+    has_recorded_identity = (
+        child.process_start_ticks is not None
+        and re.fullmatch(r"[a-f0-9]{64}", child.command_sha256) is not None
+    )
+    if current is not None:
+        expected = {
+            "process_group_id": process_group_id,
+            "start_ticks": child.process_start_ticks,
+            "command_sha256": child.command_sha256,
+            "uid": os.getuid(),
+        }
+        if not has_recorded_identity or current != expected:
+            raise UnsafeCleanupError(
+                f"refusing to signal reused or unverified PID/PGID {process_group_id}"
+            )
+    elif returncode is None and has_recorded_identity:
+        returncode = child.process.poll()
+        if returncode is None:
+            raise UnsafeCleanupError(
+                f"cannot revalidate live child process identity for PID {process_group_id}"
+            )
+    _signal_process_group(process_group_id, signum)
+
+
+def _prove_persisted_process_group(
+    process_group_id: int,
+    *,
+    process_start_ticks: int,
+    process_command_sha256: str,
+    owner_uid: int,
+) -> bool:
+    try:
+        rows = _namespace_process_table()
+    except UnsafeCleanupError:
+        raise
+    members = [
+        row for row in rows if row["process_group_id"] == process_group_id
+    ]
+    if not members:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise UnsafeCleanupError(
+                f"cannot inspect persisted process group {process_group_id}: {exc}"
+            ) from exc
+        raise UnsafeCleanupError(
+            f"cannot enumerate live persisted process group {process_group_id}"
+        )
+    for member in members:
+        if (
+            member["uid"] != owner_uid
+            or member["session_id"] != process_group_id
+            or member["pid"] < 1
+            or member["start_ticks"] < 1
+        ):
+            raise UnsafeCleanupError(
+                f"persisted process group {process_group_id} contains an unowned member"
+            )
+
+    leaders = [row for row in rows if row["pid"] == process_group_id]
+    if len(leaders) > 1:
+        raise UnsafeCleanupError(
+            f"persisted leader PID {process_group_id} is ambiguous"
+        )
+    current = _read_process_identity(process_group_id)
+    expected = {
+        "process_group_id": process_group_id,
+        "start_ticks": process_start_ticks,
+        "command_sha256": process_command_sha256,
+        "uid": owner_uid,
+    }
+    if current is not None:
+        if current != expected:
+            raise UnsafeCleanupError(
+                f"live PID {process_group_id} no longer matches the persisted identity"
+            )
+    elif leaders:
+        leader = leaders[0]
+        if (
+            leader["state"] != "Z"
+            or leader["process_group_id"] != process_group_id
+            or leader["session_id"] != process_group_id
+            or leader["uid"] != owner_uid
+            or leader["start_ticks"] != process_start_ticks
+        ):
+            raise UnsafeCleanupError(
+                f"leader PID {process_group_id} was reused or cannot be proven"
+            )
+    # On Linux the numeric PID backing a process-group ID cannot be reused while
+    # members of that group remain.  Therefore, once the original session leader is
+    # absent, a completely enumerated same-session/same-UID residual group still
+    # proves continuity with the persisted group.
+    return any(member["state"] != "Z" for member in members)
+
+
+def _signal_persisted_process_group(
+    process_group_id: int,
+    signum: int,
+    *,
+    process_start_ticks: int,
+    process_command_sha256: str,
+    owner_uid: int,
+) -> None:
+    if not _process_group_has_live_members(process_group_id):
+        return
+    if not _prove_persisted_process_group(
+        process_group_id,
+        process_start_ticks=process_start_ticks,
+        process_command_sha256=process_command_sha256,
+        owner_uid=owner_uid,
+    ):
+        return
+    _signal_process_group(process_group_id, signum)
+
+
+def _terminate_persisted_process_group(
+    process_group_id: int,
+    grace: float,
+    *,
+    process_start_ticks: int,
+    process_command_sha256: str,
+    owner_uid: int,
+) -> None:
+    if not _process_group_has_live_members(process_group_id):
+        return
+    _signal_persisted_process_group(
+        process_group_id,
+        signal.SIGTERM,
+        process_start_ticks=process_start_ticks,
+        process_command_sha256=process_command_sha256,
+        owner_uid=owner_uid,
+    )
+    deadline = time.monotonic() + grace
+    while (
+        time.monotonic() < deadline
+        and _process_group_has_live_members(process_group_id)
+    ):
+        time.sleep(0.1)
+    if _process_group_has_live_members(process_group_id):
+        _signal_persisted_process_group(
+            process_group_id,
+            signal.SIGKILL,
+            process_start_ticks=process_start_ticks,
+            process_command_sha256=process_command_sha256,
+            owner_uid=owner_uid,
+        )
+    deadline = time.monotonic() + 5.0
+    while (
+        time.monotonic() < deadline
+        and _process_group_has_live_members(process_group_id)
+    ):
+        time.sleep(0.05)
+    if _process_group_has_live_members(process_group_id):
+        raise UnsafeCleanupError(
+            f"persisted process group {process_group_id} remained alive after shutdown"
+        )
 
 
 def _terminate_children(children: Sequence[ChildProcess], grace: float) -> None:
-    for child in children:
-        if child.process.poll() is None:
-            try:
-                os.killpg(child.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+    unique = list({id(child): child for child in children}.values())
+    groups = {child.process.pid: child for child in unique}
+    for child in unique:
+        child.process.poll()
+    for process_group_id, child in groups.items():
+        if _process_group_has_live_members(process_group_id):
+            _signal_child_process_group(child, signal.SIGTERM)
     deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and any(child.process.poll() is None for child in children):
+    while (
+        time.monotonic() < deadline
+        and any(_process_group_has_live_members(group) for group in groups)
+    ):
+        for child in unique:
+            child.process.poll()
         time.sleep(0.1)
-    for child in children:
-        if child.process.poll() is None:
-            try:
-                os.killpg(child.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    for child in children:
+    for process_group_id, child in groups.items():
+        if _process_group_has_live_members(process_group_id):
+            _signal_child_process_group(child, signal.SIGKILL)
+    unreaped: list[ChildProcess] = []
+    for child in unique:
         try:
             child.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            pass
-        child.log_stream.close()
-
-
-def _monitor(
-    shadows: Sequence[ChildProcess], servers: Sequence[ChildProcess], shms: Sequence[OwnedShm],
-    attempt: Path, run_id: str,
-) -> int:
-    while not _CANCEL_REQUESTED:
-        for shm in shms:
-            shm.observe()
-        for server in servers:
-            returncode = server.process.poll()
-            if returncode is not None:
-                raise ServerError(f"Huge server {server.worker_id} exited early with {returncode}")
-            status_path = attempt / "status" / f"server-{server.worker_id}.json"
-            if status_path.is_file():
-                status = _json_object(status_path, label="Huge server status")
-                if status.get("run_id") != run_id or status.get("worker_id") != server.worker_id:
-                    raise SimulationError(f"server status identity mismatch for {server.worker_id}")
-                if status.get("state") == "fatal" or status.get("fatal_error_code"):
-                    raise ServerError(
-                        f"Huge server {server.worker_id} entered fatal state: "
-                        f"{status.get('fatal_error_code', 'unknown')}"
-                    )
-        for shadow in shadows:
-            status_path = attempt / "status" / f"worker-{shadow.worker_id}.json"
-            if not status_path.is_file():
-                continue
-            status = _json_object(status_path, label="shadow worker status")
-            if status.get("run_id") != run_id or status.get("worker_id") != shadow.worker_id:
-                raise SimulationError(f"worker status identity mismatch for {shadow.worker_id}")
-            state = str(status.get("state", ""))
-            if state == "server_or_infer_fatal":
-                raise ServerError(f"shadow {shadow.worker_id} classified server/inference failure")
-            if state in {"sim_runtime_fatal", "integrity_failure", "interrupted"}:
-                raise SimulationError(f"shadow {shadow.worker_id} entered {state}")
-        returncodes = [shadow.process.poll() for shadow in shadows]
-        if all(code is not None for code in returncodes):
-            if any(code == 40 for code in returncodes):
-                raise ServerError("shadow classified a server/inference fatal error")
-            if any(code != 0 for code in returncodes):
-                raise SimulationError(f"shadow workers failed: {returncodes}")
-            return 0
-        for shadow, code in zip(shadows, returncodes):
-            if code == 40:
-                raise ServerError(f"shadow {shadow.worker_id} classified server/inference failure")
-            if code is not None and code != 0:
-                raise SimulationError(f"shadow {shadow.worker_id} exited with {code}")
-        time.sleep(0.5)
-    return EXIT_INTERRUPTED
+            unreaped.append(child)
+        finally:
+            child.log_stream.close()
+    group_deadline = time.monotonic() + 5.0
+    live_groups = {
+        group for group in groups if _process_group_has_live_members(group)
+    }
+    while live_groups and time.monotonic() < group_deadline:
+        time.sleep(0.05)
+        live_groups = {
+            group for group in live_groups if _process_group_has_live_members(group)
+        }
+    if live_groups:
+        labels = sorted(live_groups)
+        if any(child.role == "server" for child in unique):
+            raise ServerError(f"process groups remained alive after shutdown: {labels}")
+        raise SimulationError(f"process groups remained alive after shutdown: {labels}")
+    if unreaped:
+        labels = [f"{child.role}:{child.worker_id}:{child.process.pid}" for child in unreaped]
+        if any(child.role == "server" for child in unreaped):
+            raise ServerError(f"child processes remained alive after shutdown: {labels}")
+        raise SimulationError(f"child processes remained alive after shutdown: {labels}")
 
 
 class ContractLock:
@@ -1456,8 +4162,8 @@ class ContractLock:
 def _write_manifest(attempt: Path, contract_hash: str, state: str, **runtime: Any) -> None:
     existing: dict[str, Any] = {}
     path = attempt / "manifest.json"
-    if path.is_file():
-        existing = _json_object(path, label="attempt manifest")
+    if os.path.lexists(path):
+        existing = _json_object(path, label="attempt manifest", attempt=attempt)
     existing.update({
         "schema_version": MANIFEST_SCHEMA_VERSION, "contract_hash": contract_hash,
         "run_id": attempt.name, "state": state, "runtime": runtime,
@@ -1465,7 +4171,328 @@ def _write_manifest(attempt: Path, contract_hash: str, state: str, **runtime: An
     atomic_write_json(path, existing)
 
 
-def _finalize(attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, source_digest: str, reused: int) -> None:
+def _require_owned_directory(path: Path, *, label: str) -> None:
+    if not os.path.lexists(path):
+        raise SimulationError(f"missing {label}: {path}")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SimulationError(f"cannot inspect {label} {path}: {exc}") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+    ):
+        raise SimulationError(f"{label} ownership mismatch: {path}")
+
+
+def _validate_gpu_admission_payload(
+    payload: Any,
+    *,
+    run_id: str,
+    contract_hash: str,
+    ordinal: int,
+    path: Path,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "contract_hash",
+        "ordinal",
+        "captured_at",
+        "threshold_gib",
+        "gpus",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise SimulationError(f"GPU admission payload shape is invalid: {path}")
+    captured_at = payload.get("captured_at")
+    threshold_gib = payload.get("threshold_gib")
+    gpus = payload.get("gpus")
+    if (
+        payload.get("schema_version") != GPU_ADMISSION_SCHEMA_VERSION
+        or payload.get("run_id") != run_id
+        or payload.get("contract_hash") != contract_hash
+        or type(payload.get("ordinal")) is not int
+        or payload.get("ordinal") != ordinal
+        or type(captured_at) is not float
+        or not math.isfinite(captured_at)
+        or captured_at <= 0.0
+        or type(threshold_gib) is not float
+        or not math.isfinite(threshold_gib)
+        or threshold_gib < 0.0
+        or not isinstance(gpus, list)
+        or not gpus
+    ):
+        raise SimulationError(f"GPU admission payload values are invalid: {path}")
+
+    expected_gpu_keys = {
+        "parent_logical_ordinal",
+        "cuda_uuid",
+        "total_memory_bytes",
+        "free_memory_bytes",
+    }
+    logical_ordinals: set[int] = set()
+    normalized_uuids: set[str] = set()
+    for gpu in gpus:
+        if not isinstance(gpu, dict) or set(gpu) != expected_gpu_keys:
+            raise SimulationError(f"GPU admission identity shape is invalid: {path}")
+        logical_ordinal = gpu.get("parent_logical_ordinal")
+        cuda_uuid = gpu.get("cuda_uuid")
+        total_memory_bytes = gpu.get("total_memory_bytes")
+        free_memory_bytes = gpu.get("free_memory_bytes")
+        if (
+            type(logical_ordinal) is not int
+            or logical_ordinal < 0
+            or logical_ordinal in logical_ordinals
+            or type(cuda_uuid) is not str
+            or type(total_memory_bytes) is not int
+            or total_memory_bytes <= 0
+            or (
+                free_memory_bytes is not None
+                and (
+                    type(free_memory_bytes) is not int
+                    or free_memory_bytes < 0
+                )
+            )
+        ):
+            raise SimulationError(f"GPU admission identity values are invalid: {path}")
+        try:
+            normalized_uuid = _normalize_uuid(cuda_uuid)
+        except GpuError as exc:
+            raise SimulationError(
+                f"GPU admission UUID is invalid in {path}: {cuda_uuid!r}"
+            ) from exc
+        if not normalized_uuid or normalized_uuid in normalized_uuids:
+            raise SimulationError(f"GPU admission UUIDs are not unique: {path}")
+        logical_ordinals.add(logical_ordinal)
+        normalized_uuids.add(normalized_uuid)
+    return payload
+
+
+def _read_gpu_admission_records(
+    attempt: Path,
+    *,
+    run_id: str,
+    contract_hash: str,
+) -> list[dict[str, Any]]:
+    directory = attempt / "gpu_admission"
+    _require_owned_directory(directory, label="GPU admission directory")
+    try:
+        entries = sorted(directory.iterdir(), key=lambda candidate: candidate.name)
+    except OSError as exc:
+        raise SimulationError(
+            f"cannot enumerate GPU admission directory {directory}: {exc}"
+        ) from exc
+    records: list[dict[str, Any]] = []
+    for expected_ordinal, path in enumerate(entries, start=1):
+        match = _GPU_ADMISSION_FILENAME_RE.fullmatch(path.name)
+        if match is None or int(match.group(1)) != expected_ordinal:
+            raise SimulationError(
+                f"GPU admission evidence is unexpected or non-contiguous: {path}"
+            )
+        content, _ = _read_owned_regular_bytes(path, label="GPU admission evidence")
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SimulationError(f"invalid GPU admission evidence {path}: {exc}") from exc
+        records.append(
+            _validate_gpu_admission_payload(
+                payload,
+                run_id=run_id,
+                contract_hash=contract_hash,
+                ordinal=expected_ordinal,
+                path=path,
+            )
+        )
+    return records
+
+
+def _append_gpu_admission(
+    attempt: Path,
+    *,
+    run_id: str,
+    contract_hash: str,
+    threshold_gib: float,
+    captured_at: float,
+    gpus: Sequence[GpuIdentity],
+) -> int:
+    if run_id != attempt.name:
+        raise SimulationError(
+            f"GPU admission run identity mismatch: {run_id!r} != {attempt.name!r}"
+        )
+    records = _read_gpu_admission_records(
+        attempt,
+        run_id=run_id,
+        contract_hash=contract_hash,
+    )
+    ordinal = len(records) + 1
+    if ordinal > 9999:
+        raise SimulationError("GPU admission evidence exhausted its four-digit ordinal space")
+    payload = {
+        "schema_version": GPU_ADMISSION_SCHEMA_VERSION,
+        "run_id": run_id,
+        "contract_hash": contract_hash,
+        "ordinal": ordinal,
+        "captured_at": captured_at,
+        "threshold_gib": threshold_gib,
+        "gpus": [
+            {
+                "parent_logical_ordinal": gpu.parent_logical_ordinal,
+                "cuda_uuid": gpu.cuda_uuid,
+                "total_memory_bytes": gpu.total_memory_bytes,
+                "free_memory_bytes": gpu.free_memory_bytes,
+            }
+            for gpu in gpus
+        ],
+    }
+    final_path = attempt / "gpu_admission" / f"admission-{ordinal:04d}.json"
+    _validate_gpu_admission_payload(
+        payload,
+        run_id=run_id,
+        contract_hash=contract_hash,
+        ordinal=ordinal,
+        path=final_path,
+    )
+    if os.path.lexists(final_path):
+        raise SimulationError(f"GPU admission evidence already exists: {final_path}")
+
+    staging = attempt / ".gpu_admission_staging"
+    _require_owned_directory(staging, label="GPU admission staging directory")
+    descriptor: int | None = None
+    temporary: Path | None = None
+    for _ in range(100):
+        candidate = staging / (
+            f"admission-{ordinal:04d}.{os.getpid()}.{time.time_ns()}."
+            f"{secrets.token_hex(8)}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor is None or temporary is None:
+        raise SimulationError("unable to allocate a unique GPU admission staging file")
+
+    content = canonical_json_bytes(payload) + b"\n"
+    operation_error: BaseException | None = None
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("GPU admission staging write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        persisted, _ = _read_owned_regular_bytes(
+            temporary,
+            label="temporary GPU admission evidence",
+        )
+        if persisted != content:
+            raise SimulationError(
+                f"temporary GPU admission evidence was truncated: {temporary}"
+            )
+        try:
+            persisted_payload = json.loads(persisted.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SimulationError(
+                f"temporary GPU admission evidence is invalid: {temporary}: {exc}"
+            ) from exc
+        _validate_gpu_admission_payload(
+            persisted_payload,
+            run_id=run_id,
+            contract_hash=contract_hash,
+            ordinal=ordinal,
+            path=temporary,
+        )
+        try:
+            os.link(temporary, final_path, follow_symlinks=False)
+        except OSError as exc:
+            raise SimulationError(
+                f"cannot publish GPU admission evidence {final_path}: {exc}"
+            ) from exc
+        _fsync_directory(final_path.parent)
+        return ordinal
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                if operation_error is None:
+                    raise
+        try:
+            temporary.unlink(missing_ok=True)
+            _fsync_directory(staging)
+        except OSError:
+            if operation_error is None:
+                raise
+
+
+def _record_gpu_admission(
+    attempt: Path,
+    contract_hash: str,
+    *,
+    threshold_gib: float,
+    captured_at: float,
+    gpus: Sequence[GpuIdentity],
+) -> int:
+    try:
+        _write_manifest(
+            attempt,
+            contract_hash,
+            "starting",
+            phase="admission_pending",
+        )
+        ordinal = _append_gpu_admission(
+            attempt,
+            run_id=attempt.name,
+            contract_hash=contract_hash,
+            threshold_gib=threshold_gib,
+            captured_at=captured_at,
+            gpus=gpus,
+        )
+        _write_manifest(
+            attempt,
+            contract_hash,
+            "starting",
+            phase="admission_recorded",
+            gpu_admission_ordinal=ordinal,
+        )
+        return ordinal
+    except Exception as exc:
+        try:
+            _write_manifest(
+                attempt,
+                contract_hash,
+                "failed",
+                phase="admission_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+        except Exception:
+            pass
+        raise
+
+
+def _finalize(
+    attempt: Path,
+    jobs: Sequence[EpisodeJob],
+    contract_hash: str,
+    source_digest: str,
+    reused: int,
+) -> int:
     finalizing = attempt / "_FINALIZING"
     atomic_write_text(finalizing, "\n")
     episodes: list[dict[str, Any]] = []
@@ -1478,6 +4505,10 @@ def _finalize(attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, sou
         raise SimulationError("final episode identity set is not unique")
     successes = sum(bool(episode["payload"].get("success")) for episode in episodes)
     task_failures = len(episodes) - successes
+    execution_failed = sum(
+        episode["payload"].get("failure_reason") == _EXECUTION_FAILED
+        for episode in episodes
+    )
     steps = sorted(int(episode["payload"].get("episode_steps", 0)) for episode in episodes)
     durations = sorted(float(episode["payload"].get("duration_sec", 0.0)) for episode in episodes)
     percentile = lambda values, fraction: values[min(len(values) - 1, int(round((len(values) - 1) * fraction)))]
@@ -1485,6 +4516,7 @@ def _finalize(attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, sou
         "schema_version": SUMMARY_SCHEMA_VERSION, "contract_hash": contract_hash,
         "source_inventory_digest": source_digest, "expected": len(jobs), "completed": len(episodes),
         "task_success": successes, "task_failure": task_failures, "infrastructure_failure": 0,
+        "execution_failed": execution_failed,
         "success_rate": {"numerator": successes, "denominator": len(episodes)}, "resume_reused": reused,
         "by_seed": {
             str(seed): {
@@ -1517,19 +4549,49 @@ def _finalize(attempt: Path, jobs: Sequence[EpisodeJob], contract_hash: str, sou
         "infrastructure_errors": [],
     }
     atomic_write_json(attempt / "summary.json", summary)
-    rows = ["metric,value", f"expected,{len(jobs)}", f"completed,{len(episodes)}", f"task_success,{successes}", f"task_failure,{task_failures}", f"resume_reused,{reused}"]
+    rows = [
+        "metric,value",
+        f"expected,{len(jobs)}",
+        f"completed,{len(episodes)}",
+        f"task_success,{successes}",
+        f"task_failure,{task_failures}",
+        f"execution_failed,{execution_failed}",
+        f"resume_reused,{reused}",
+    ]
     atomic_write_text(attempt / "summary.csv", "\n".join(rows) + "\n")
-    _write_manifest(attempt, contract_hash, "success", completed=len(jobs), reused=reused)
-    atomic_write_text(attempt / "_SUCCESS", canonical_sha256(summary) + "\n")
+    marker_digest = canonical_sha256(summary) + "\n"
+    if execution_failed:
+        (attempt / "_SUCCESS").unlink(missing_ok=True)
+        _write_manifest(
+            attempt,
+            contract_hash,
+            "completed_with_failures",
+            completed=len(jobs),
+            reused=reused,
+            execution_failed=execution_failed,
+        )
+        atomic_write_text(attempt / _COMPLETED_WITH_FAILURES_MARKER, marker_digest)
+    else:
+        (attempt / _COMPLETED_WITH_FAILURES_MARKER).unlink(missing_ok=True)
+        _write_manifest(
+            attempt,
+            contract_hash,
+            "success",
+            completed=len(jobs),
+            reused=reused,
+            execution_failed=0,
+        )
+        atomic_write_text(attempt / "_SUCCESS", marker_digest)
     finalizing.unlink()
     _fsync_directory(attempt)
+    return execution_failed
 
 
 def _execute(
     args: argparse.Namespace, task: TaskSpec, checkpoint: CheckpointContract, policy: Mapping[str, Any],
     jobs: Sequence[EpisodeJob], source_inventory: Mapping[str, Any], static_plan: Mapping[str, Any],
 ) -> int:
-    gpus, driver = discover_visible_gpus(policy)
+    gpus, driver, gpu_snapshot_captured_at = discover_visible_gpus(policy)
     host = host_fingerprint()
     isaac_version, kit_build = isaac_fingerprint(args.isaaclab_python, args.isaaclab_root)
     output_root = Path(str(policy["output_root"]))
@@ -1538,115 +4600,661 @@ def _execute(
         if not policy["allow_kit_map_bootstrap"]:
             raise GpuError(f"trusted Kit GPU map is missing: {map_path}")
         bootstrap_kit_gpu_map(map_path, gpus, host, driver, isaac_version, kit_build, args)
-    physical_bindings, kit_digest = load_kit_gpu_map(map_path, gpus, host, driver, isaac_version, kit_build)
-    worker_bindings = expand_worker_bindings(physical_bindings, int(policy["workers_per_gpu"]))
+    physical_bindings, kit_digest = load_kit_gpu_map(
+        map_path, gpus, host, driver, isaac_version, kit_build
+    )
+    worker_bindings = expand_worker_bindings(
+        physical_bindings, int(policy["workers_per_gpu"])
+    )
     executable = build_executable_contract(static_plan, worker_bindings, kit_digest)
     contract_hash = executable["contract_hash"]
+    source_digest = str(source_inventory["source_inventory_digest"])
     checkpoint_label = f"{checkpoint.checkpoint_task}-{checkpoint.checkpoint_dir.name}"
     contract_dir = output_root / task.cli_task / checkpoint_label / contract_hash[:16]
     contract_dir.mkdir(parents=True, exist_ok=True)
     contract_path = contract_dir / "contract.json"
     contract_bytes = canonical_json_bytes(executable["contract"])
-    if contract_path.is_file() and canonical_json_bytes(_json_object(contract_path, label="executable contract")) != contract_bytes:
+    if (
+        contract_path.is_file()
+        and canonical_json_bytes(_json_object(contract_path, label="executable contract"))
+        != contract_bytes
+    ):
         raise ConfigError("existing contract bytes do not match the newly computed contract")
     if not contract_path.exists():
         atomic_write_json(contract_path, executable["contract"])
         atomic_write_json(contract_dir / "source_inventory.json", source_inventory)
     else:
-        stored_inventory = _json_object(contract_dir / "source_inventory.json", label="contract source inventory")
+        stored_inventory = _json_object(
+            contract_dir / "source_inventory.json", label="contract source inventory"
+        )
         if canonical_json_bytes(stored_inventory) != canonical_json_bytes(source_inventory):
             raise ConfigError("stored source inventory does not match the executable contract")
+
     with ContractLock(contract_dir / "contract.lock", contract_hash):
         attempt = select_or_create_attempt(
-            contract_dir / "attempts", contract_hash, resume=bool(policy["resume"]), force_new=bool(policy["force_new"])
+            contract_dir / "attempts",
+            contract_hash,
+            resume=bool(policy["resume"]),
+            force_new=bool(policy["force_new"]),
         )
         run_id = attempt.name
+        if (
+            (attempt / "_SUCCESS").exists()
+            or (attempt / _COMPLETED_WITH_FAILURES_MARKER).exists()
+        ):
+            execution_failed = _verify_completed_attempt(
+                attempt, jobs, contract_hash, source_digest
+            )
+            return EXIT_SIM if execution_failed else 0
+        try:
+            _cleanup_persisted_runtime(
+                attempt,
+                jobs,
+                shutdown_grace_sec=float(policy["shutdown_grace_sec"]),
+            )
+        except Exception as exc:
+            _write_manifest(
+                attempt,
+                contract_hash,
+                "unsafe_cleanup",
+                cleanup_errors=[f"{type(exc).__name__}: {exc}"],
+            )
+            raise
         completed = {
-            job.result_identity: (
-                _read_existing_episode(attempt, job) or validate_and_publish_completion(attempt, job)
+            job.result_identity: _load_reusable_episode_result(
+                attempt,
+                job,
+                max_retries=int(policy["episode_max_retries"]),
             )
             for job in jobs
         }
         reused = sum(value is not None for value in completed.values())
-        if (attempt / "_SUCCESS").is_file():
-            _verify_success_attempt(
-                attempt, jobs, contract_hash, str(source_inventory["source_inventory_digest"])
+        initially_pending = [
+            job for job in jobs if completed[job.result_identity] is None
+        ]
+        for job in initially_pending:
+            _reconcile_unfinished_episode_attempts(attempt, job)
+            records = _episode_attempt_records(attempt, job)
+            if len(records) > int(policy["episode_max_retries"]) + 1:
+                raise SimulationError(
+                    f"episode retry ledger exceeds configured budget: {job.result_identity}"
+                )
+            if _episode_retry_exhausted(
+                attempt,
+                job,
+                max_retries=int(policy["episode_max_retries"]),
+            ):
+                last = records[-1]
+                _publish_execution_failed_completion(
+                    attempt,
+                    job,
+                    worker_id=str(last["worker_id"]),
+                    attempt_count=len(records),
+                    last_reason=str(last.get("reason", "orchestrator_restarted")),
+                    last_error=str(last.get("error", "")),
+                )
+                completed[job.result_identity] = validate_and_publish_completion(
+                    attempt, job
+                )
+                if completed[job.result_identity] is None:
+                    raise SimulationError(
+                        f"cannot recover exhausted episode retry ledger: {job.result_identity}"
+                    )
+
+        completed_identities = {
+            result_identity
+            for result_identity, result in completed.items()
+            if result is not None
+        }
+        remaining_by_worker = partition_remaining_jobs(
+            jobs,
+            len(worker_bindings),
+            completed_identities,
+        )
+        if not remaining_by_worker:
+            execution_failed = _finalize(
+                attempt, jobs, contract_hash, source_digest, reused
             )
-            return 0
-        pending = [job for job in jobs if completed[job.result_identity] is None]
-        shards = partition_pending_jobs(pending, len(worker_bindings))
-        if not shards:
-            _finalize(attempt, jobs, contract_hash, str(source_inventory["source_inventory_digest"]), reused)
-            return 0
-        active_bindings = worker_bindings[: len(shards)]
-        reservations = _reserve_ports(int(policy["base_port"]), len(shards))
-        children: list[ChildProcess] = []
-        servers: list[ChildProcess] = []
-        shadows: list[ChildProcess] = []
-        shms: list[OwnedShm] = []
+            return EXIT_SIM if execution_failed else 0
+
+        worker_specs = [
+            (worker_index, worker_bindings[worker_index], deque(shard))
+            for worker_index, shard in remaining_by_worker
+        ]
+        active_bindings = [binding for _, binding, _ in worker_specs]
+        _record_gpu_admission(
+            attempt,
+            contract_hash,
+            threshold_gib=float(policy["min_free_gpu_memory_gib"]),
+            captured_at=gpu_snapshot_captured_at,
+            gpus=gpus,
+        )
+        reservations = _reserve_ports(
+            int(policy["base_port"]), len(worker_specs)
+        )
         runtime_env = _runtime_environment(task, static_plan["yaml"], policy)
-        exit_code = EXIT_SIM
+        workers: list[WorkerRuntime] = []
+        cleanup_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(worker_specs)),
+            thread_name_prefix="huge-eval-cleanup",
+        )
+        frozen = False
+        interrupted = False
+        failure: Exception | None = None
+        interrupted_failure: Exception | None = None
         try:
-            _write_manifest(attempt, contract_hash, "starting", bindings=[asdict(binding) for binding in active_bindings])
+            _write_manifest(
+                attempt,
+                contract_hash,
+                "starting",
+                bindings=[asdict(binding) for binding in active_bindings],
+            )
             atomic_write_json(attempt / "plan.json", executable["contract"])
-            worker_rows = []
-            for index, (binding, shard, reservation) in enumerate(zip(active_bindings, shards, reservations)):
-                worker_id = f"w{index:02d}"
+            worker_rows: list[dict[str, Any]] = []
+            for (worker_index, binding, pending), reservation in zip(
+                worker_specs, reservations
+            ):
+                worker_id = f"w{worker_index:02d}"
                 port = reservation.getsockname()[1]
-                shm = _make_shm(run_id, worker_id)
-                shms.append(shm)
-                shard_path = attempt / "shards" / f"worker-{worker_id}.json"
-                _write_shard(shard_path, shard, attempt, checkpoint, policy, worker_id)
-                server_command = _server_command(args, task, checkpoint, binding, run_id, worker_id, attempt, port)
                 reservation.close()
-                server = _launch_child(
-                    "server", worker_id, server_command, attempt / "logs" / f"server-{worker_id}.log",
-                    _server_environment(args.repo, binding.gpu.cuda_uuid), args.repo,
+                worker = WorkerRuntime(
+                    worker_id=worker_id,
+                    binding=binding,
+                    server=None,
+                    port=port,
+                    pending=pending,
                 )
-                servers.append(server)
-                children.append(server)
-                expected_health = {
-                    "status": "ready", "protocol_version": PROTOCOL_VERSION,
-                    "checkpoint_sha256": checkpoint.checkpoint_sha256, "task": task.cli_task,
-                    "cuda_uuid": binding.gpu.cuda_uuid, "state_dim": 34, "action_dim": 66,
-                    "motion_token_dim": 64, "action_horizon": 50, "control_hz": 50,
-                }
-                _health(port, expected_health, float(policy["server_ready_timeout"]), server)
-                shadow_env = _isaac_environment(args, run_id=run_id, worker_id=worker_id, gpu_uuid=binding.gpu.cuda_uuid)
-                shadow_env.update(runtime_env)
-                shadow_env["ISAAC_MULTI_IMAGE_SHM_NAME"] = shm.name
-                shadow_command = _shadow_command(
-                    args, task, checkpoint, binding, run_id, worker_id, attempt, shard_path, shard,
-                    port, shm, policy, static_plan["yaml"],
+                workers.append(worker)
+                worker_rows.append(
+                    {
+                        "worker_id": worker_id,
+                        "port": port,
+                        "binding": asdict(binding),
+                    }
                 )
-                shadow = _launch_child(
-                    "shadow", worker_id, shadow_command, attempt / "logs" / f"sim-{worker_id}.log",
-                    shadow_env, attempt,
-                )
-                shadows.append(shadow)
-                children.append(shadow)
-                worker_rows.append({"worker_id": worker_id, "port": port, "shm": shm.name, "binding": asdict(binding)})
             _write_manifest(attempt, contract_hash, "running", workers=worker_rows)
-            exit_code = _monitor(shadows, servers, shms, attempt, run_id)
-            if exit_code == EXIT_INTERRUPTED:
-                return exit_code
+
+            while True:
+                if _CANCEL_REQUESTED:
+                    frozen = True
+                    interrupted = True
+
+                for worker in workers:
+                    cleanup_result = _finish_worker_cleanup(
+                        worker,
+                        attempt=attempt,
+                        run_id=run_id,
+                        max_retries=int(policy["episode_max_retries"]),
+                        backoff_sec=float(policy["retry_backoff_sec"]),
+                    )
+                    if cleanup_result is not None:
+                        reason, attempt_number, exhausted = cleanup_result
+                        print(
+                            f"[eval_orchestrator] {worker.worker_id} cleanup completed "
+                            f"reason={reason} attempt={attempt_number} "
+                            f"exhausted={'' if exhausted is None else int(exhausted)}",
+                            file=sys.stderr,
+                        )
+
+                for worker in workers:
+                    if worker.cleanup is not None:
+                        continue
+                    shadow = worker.active_shadow
+                    if shadow is None:
+                        continue
+                    job = worker.active_job
+                    attempt_number = worker.active_attempt_number
+                    status_path = worker.active_status_path
+                    session_id = worker.active_session_id
+                    if (
+                        job is None
+                        or attempt_number is None
+                        or status_path is None
+                        or session_id is None
+                        or worker.active_shm is None
+                    ):
+                        raise SimulationError(
+                            f"worker {worker.worker_id} has incomplete active retry state"
+                        )
+                    worker.active_shm.observe()
+                    returncode = shadow.process.poll()
+                    if returncode is not None:
+                        try:
+                            _finish_worker_shadow(
+                                worker,
+                                attempt=attempt,
+                                run_id=run_id,
+                                returncode=returncode,
+                            )
+                        except UnsafeCleanupError:
+                            raise
+                        except Exception as exc:
+                            server_to_stop = (
+                                worker.server if isinstance(exc, ServerError) else None
+                            )
+                            cleanup_children = [shadow]
+                            if server_to_stop is not None:
+                                cleanup_children.append(server_to_stop)
+                            reason = (
+                                "server_or_inference_failure"
+                                if isinstance(exc, ServerError)
+                                else "shadow_abnormal_exit"
+                            )
+                            _start_worker_cleanup(
+                                worker,
+                                cleanup_executor,
+                                children=cleanup_children,
+                                shadow=shadow,
+                                server=server_to_stop,
+                                job=job,
+                                attempt_number=attempt_number,
+                                reason=reason,
+                                error=f"{type(exc).__name__}: {exc}",
+                                consume_attempt=True,
+                                shutdown_grace_sec=float(
+                                    policy["shutdown_grace_sec"]
+                                ),
+                            )
+                            print(
+                                f"[eval_orchestrator] {worker.worker_id} episode "
+                                f"{job.episode_index} attempt {attempt_number} failed "
+                                f"after shadow exit; cleanup started",
+                                file=sys.stderr,
+                            )
+                        continue
+
+                    watchdog_reason: str | None = None
+                    watchdog_error = ""
+                    try:
+                        _observe_shadow_binding(worker, run_id=run_id)
+                        watchdog_reason = _shadow_watchdog_reason(
+                            worker,
+                            now=time.monotonic(),
+                            startup_timeout_sec=float(
+                                policy["shadow_startup_timeout_sec"]
+                            ),
+                            episode_timeout_sec=float(policy["episode_timeout_sec"]),
+                        )
+                    except UnsafeCleanupError:
+                        raise
+                    except Exception as exc:
+                        watchdog_reason = "shadow_status_invalid"
+                        watchdog_error = f"{type(exc).__name__}: {exc}"
+                    if watchdog_reason is not None:
+                        _update_episode_attempt(
+                            attempt,
+                            job,
+                            attempt_number,
+                            state="terminating",
+                            termination_reason=watchdog_reason,
+                        )
+                        server_to_stop = (
+                            worker.server if watchdog_reason == "episode_timeout" else None
+                        )
+                        cleanup_children = [shadow]
+                        if server_to_stop is not None:
+                            cleanup_children.append(server_to_stop)
+                        _start_worker_cleanup(
+                            worker,
+                            cleanup_executor,
+                            children=cleanup_children,
+                            shadow=shadow,
+                            server=server_to_stop,
+                            job=job,
+                            attempt_number=attempt_number,
+                            reason=watchdog_reason,
+                            error=watchdog_error or watchdog_reason,
+                            consume_attempt=True,
+                            shutdown_grace_sec=float(policy["shutdown_grace_sec"]),
+                        )
+                        print(
+                            f"[eval_orchestrator] {worker.worker_id} episode "
+                            f"{job.episode_index} attempt {attempt_number} watchdog="
+                            f"{watchdog_reason}; cleanup started",
+                            file=sys.stderr,
+                        )
+
+                for worker in workers:
+                    if (
+                        worker.cleanup is not None
+                        or worker.server is None
+                        or worker.server_starting_attempt_number is not None
+                        or (
+                            not worker.pending and worker.active_shadow is None
+                        )
+                    ):
+                        continue
+                    try:
+                        _validate_live_server(worker, attempt=attempt, run_id=run_id)
+                    except (ServerError, SimulationError, ConfigError) as exc:
+                        reason = (
+                            "server_or_inference_failure"
+                            if isinstance(exc, ServerError)
+                            else "server_status_invalid"
+                        )
+                        server = worker.server
+                        if server is None:
+                            raise SimulationError(
+                                f"worker {worker.worker_id} lost server cleanup ownership"
+                            )
+                        shadow_to_stop: ChildProcess | None = None
+                        consume_attempt = False
+                        if worker.active_shadow is not None:
+                            job = worker.active_job
+                            attempt_number = worker.active_attempt_number
+                            if job is None or attempt_number is None:
+                                raise SimulationError(
+                                    f"worker {worker.worker_id} has incomplete server-failure state"
+                                )
+                            _update_episode_attempt(
+                                attempt,
+                                job,
+                                attempt_number,
+                                state="terminating",
+                                termination_reason=reason,
+                            )
+                            shadow_to_stop = worker.active_shadow
+                            consume_attempt = True
+                        else:
+                            if not worker.pending:
+                                raise SimulationError(
+                                    f"worker {worker.worker_id} lost its server without pending work"
+                                )
+                            job = worker.pending[0]
+                            attempt_number = worker.prepared_attempt_number
+                            consume_attempt = attempt_number is not None
+                        cleanup_children = (
+                            [shadow_to_stop, server]
+                            if shadow_to_stop is not None
+                            else [server]
+                        )
+                        _start_worker_cleanup(
+                            worker,
+                            cleanup_executor,
+                            children=cleanup_children,
+                            shadow=shadow_to_stop,
+                            server=server,
+                            job=job if consume_attempt else None,
+                            attempt_number=attempt_number,
+                            reason=reason,
+                            error=f"{type(exc).__name__}: {exc}",
+                            consume_attempt=consume_attempt,
+                            shutdown_grace_sec=float(policy["shutdown_grace_sec"]),
+                        )
+                        print(
+                            f"[eval_orchestrator] failed server cleanup started in fixed "
+                            f"slot {worker.worker_id}; attempt={attempt_number}; "
+                            f"consume_attempt={int(consume_attempt)}: {exc}",
+                            file=sys.stderr,
+                        )
+
+                if not frozen:
+                    for worker in workers:
+                        if _CANCEL_REQUESTED:
+                            frozen = True
+                            interrupted = True
+                            break
+                        if (
+                            worker.cleanup is not None
+                            or worker.active_shadow is not None
+                            or not worker.pending
+                            or time.monotonic() < worker.retry_not_before_monotonic
+                        ):
+                            continue
+                        if worker.server is None:
+                            try:
+                                _restart_worker_server(
+                                    worker,
+                                    args=args,
+                                    task=task,
+                                    checkpoint=checkpoint,
+                                    run_id=run_id,
+                                    attempt=attempt,
+                                    policy=policy,
+                                    contract_hash=contract_hash,
+                                    source_inventory_digest=source_digest,
+                                )
+                            except EpisodeAttemptError as exc:
+                                exhausted = _schedule_episode_failure(
+                                    worker,
+                                    attempt=attempt,
+                                    job=exc.job,
+                                    attempt_number=exc.attempt_number,
+                                    max_retries=int(policy["episode_max_retries"]),
+                                    backoff_sec=float(policy["retry_backoff_sec"]),
+                                    reason="server_restart_failed",
+                                    error=str(exc),
+                                    returncode=None,
+                                    now=time.monotonic(),
+                                )
+                                print(
+                                    f"[eval_orchestrator] {worker.worker_id} server restart "
+                                    f"attempt {exc.attempt_number} failed; "
+                                    f"exhausted={int(exhausted)}",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            continue
+                        if worker.server_starting_attempt_number is not None:
+                            try:
+                                server_ready = _advance_worker_server_startup(
+                                    worker,
+                                    attempt=attempt,
+                                    run_id=run_id,
+                                    expected_health=_expected_server_health(
+                                        task, checkpoint, worker.binding
+                                    ),
+                                    ready_timeout_sec=float(
+                                        policy["server_ready_timeout"]
+                                    ),
+                                )
+                            except EpisodeAttemptError as exc:
+                                server = worker.server
+                                if server is None:
+                                    raise SimulationError(
+                                        f"worker {worker.worker_id} lost startup cleanup ownership"
+                                    )
+                                _start_worker_cleanup(
+                                    worker,
+                                    cleanup_executor,
+                                    children=[server],
+                                    shadow=None,
+                                    server=server,
+                                    job=exc.job,
+                                    attempt_number=exc.attempt_number,
+                                    reason="server_restart_failed",
+                                    error=str(exc),
+                                    consume_attempt=True,
+                                    shutdown_grace_sec=float(
+                                        policy["shutdown_grace_sec"]
+                                    ),
+                                )
+                                print(
+                                    f"[eval_orchestrator] {worker.worker_id} server startup "
+                                    f"attempt {exc.attempt_number} failed; "
+                                    f"cleanup started",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            if not server_ready:
+                                continue
+                        try:
+                            _launch_worker_shadow(
+                                worker,
+                                args=args,
+                                task=task,
+                                checkpoint=checkpoint,
+                                run_id=run_id,
+                                attempt=attempt,
+                                policy=policy,
+                                yaml_config=static_plan["yaml"],
+                                runtime_env=runtime_env,
+                            )
+                        except EpisodeAttemptError as exc:
+                            exhausted = _schedule_episode_failure(
+                                worker,
+                                attempt=attempt,
+                                job=exc.job,
+                                attempt_number=exc.attempt_number,
+                                max_retries=int(policy["episode_max_retries"]),
+                                backoff_sec=float(policy["retry_backoff_sec"]),
+                                reason="shadow_launch_failed",
+                                error=str(exc),
+                                returncode=None,
+                                now=time.monotonic(),
+                            )
+                            print(
+                                f"[eval_orchestrator] {worker.worker_id} shadow launch "
+                                f"attempt {exc.attempt_number} failed; "
+                                f"exhausted={int(exhausted)}",
+                                file=sys.stderr,
+                            )
+
+                if interrupted:
+                    break
+                if all(
+                    not worker.pending
+                    and worker.active_shadow is None
+                    and worker.cleanup is None
+                    for worker in workers
+                ):
+                    if _CANCEL_REQUESTED:
+                        frozen = True
+                        interrupted = True
+                    break
+                time.sleep(0.1)
+        except Exception as exc:
+            frozen = True
+            if _CANCEL_REQUESTED:
+                interrupted = True
+                interrupted_failure = exc
+            else:
+                failure = exc
         finally:
             for reservation in reservations:
                 reservation.close()
-            _terminate_children(children, float(policy["shutdown_grace_sec"]))
-            unsafe_shm = [shm.name for shm in shms if not shm.cleanup()]
-            if unsafe_shm and exit_code == 0:
-                raise SimulationError(f"SHM cleanup identity failed for: {unsafe_shm}")
-        for job in pending:
+            cleanup_executor.shutdown(wait=True, cancel_futures=False)
+            active_children = [
+                worker.active_shadow
+                for worker in workers
+                if worker.active_shadow is not None
+            ]
+            server_children = list(
+                {
+                    id(child): child
+                    for child in (
+                        worker.server for worker in workers if worker.server is not None
+                    )
+                }.values()
+            )
+            cleanup_errors: list[str] = []
+            cleanup_failure: Exception | None = None
+            if interrupted_failure is not None:
+                cleanup_failure = interrupted_failure
+                cleanup_errors.append(
+                    "interrupted execution failed: "
+                    f"{type(interrupted_failure).__name__}: {interrupted_failure}"
+                )
+            try:
+                _terminate_children(
+                    [*active_children, *server_children],
+                    float(policy["shutdown_grace_sec"]),
+                )
+            except Exception as exc:
+                cleanup_failure = exc
+                cleanup_errors.append(
+                    f"child termination failed: {type(exc).__name__}: {exc}"
+                )
+            unsafe_shm: list[str] = []
+            for worker in workers:
+                if (
+                    worker.active_status_path is not None
+                    and worker.active_session_id is not None
+                ):
+                    try:
+                        _remove_owned_shutdown_guard(
+                            worker.active_status_path,
+                            run_id=run_id,
+                            worker_id=worker.worker_id,
+                            session_id=worker.active_session_id,
+                        )
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"shutdown guard cleanup failed for {worker.worker_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        if cleanup_failure is None:
+                            cleanup_failure = exc
+                shm = worker.active_shm
+                if shm is not None:
+                    try:
+                        shm.observe()
+                        if not shm.cleanup():
+                            unsafe_shm.append(shm.name)
+                    except Exception:
+                        unsafe_shm.append(shm.name)
+                _clear_worker_shadow_state(worker)
+            if unsafe_shm:
+                shm_failure = UnsafeCleanupError(
+                    f"SHM cleanup identity failed for: {unsafe_shm}"
+                )
+                cleanup_errors.append(str(shm_failure))
+                if cleanup_failure is None:
+                    cleanup_failure = shm_failure
+            if _CANCEL_REQUESTED:
+                frozen = True
+                interrupted = True
+            if cleanup_errors:
+                _write_manifest(
+                    attempt,
+                    contract_hash,
+                    "unsafe_cleanup",
+                    interrupted=interrupted,
+                    cleanup_errors=cleanup_errors,
+                )
+                for cleanup_error in cleanup_errors:
+                    print(
+                        f"[eval_orchestrator] unsafe cleanup: {cleanup_error}",
+                        file=sys.stderr,
+                    )
+                if failure is None and not interrupted:
+                    failure = cleanup_failure or SimulationError(
+                        "cleanup failed without a captured exception"
+                    )
+            elif failure is not None:
+                _write_manifest(
+                    attempt,
+                    contract_hash,
+                    "failed",
+                    error=f"{type(failure).__name__}: {failure}",
+                )
+            elif interrupted:
+                _write_manifest(attempt, contract_hash, "interrupted")
+
+        if failure is not None:
+            raise failure
+        if interrupted:
+            return EXIT_INTERRUPTED
+
+        for job in initially_pending:
             if validate_and_publish_completion(attempt, job) is None:
-                raise SimulationError(f"worker completed without a valid completion envelope: {job.result_identity}")
+                raise SimulationError(
+                    f"worker completed without a valid completion envelope: {job.result_identity}"
+                )
         fresh_inventory = build_source_inventory(
-            args.repo, args.humanoidarena_root, Path(static_plan["yaml"]["path"]), checkpoint
+            args.repo,
+            args.humanoidarena_root,
+            Path(static_plan["yaml"]["path"]),
+            checkpoint,
         )
-        if fresh_inventory["source_inventory_digest"] != source_inventory["source_inventory_digest"]:
-            raise ConfigError("source inventory changed during evaluation; refusing finalization")
-        _finalize(attempt, jobs, contract_hash, str(source_inventory["source_inventory_digest"]), reused)
-        return 0
+        if fresh_inventory["source_inventory_digest"] != source_digest:
+            raise ConfigError(
+                "source inventory changed during evaluation; refusing finalization"
+            )
+        execution_failed = _finalize(
+            attempt, jobs, contract_hash, source_digest, reused
+        )
+        return EXIT_SIM if execution_failed else 0
 
 
 def _signal_handler(_signum: int, _frame: Any) -> None:

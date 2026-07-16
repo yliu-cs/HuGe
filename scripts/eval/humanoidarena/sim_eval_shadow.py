@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import types
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,7 @@ from typing import Any, Mapping, Sequence
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
 COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 WORKER_STATUS_SCHEMA_VERSION = "huge_ha_worker_status_v1"
+TRACE_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
 SERVER_FATAL_EXIT = 40
 SIM_FATAL_EXIT = 50
 LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "sim_stopped", "max_steps"}
@@ -56,7 +58,33 @@ FORBIDDEN_UPSTREAM_HELPERS = (
 )
 _SHM_RE = re.compile(r"^huge_ha_([a-z0-9]{8})_(w[0-9]{2})_([a-f0-9]{16,32})$")
 _WORKER_RE = re.compile(r"^w[0-9]{2}$")
+_SHADOW_SESSION_RE = re.compile(r"^[a-f0-9]{16,32}$")
+_RESULT_IDENTITY_RE = re.compile(r"^[a-f0-9]{64}$")
 _UUID_CLEAN_RE = re.compile(r"[^0-9a-f]")
+_PROCESS_STARTED_AT = time.time()
+_SINGLE_EPISODE_INTEGER_FIELDS = (
+    "seed",
+    "repeat_idx",
+    "episode_seed",
+    "episode_index",
+)
+_SINGLE_EPISODE_PATH_FIELDS = (
+    "result_json",
+    "success_video_dir",
+    "failure_video_dir",
+    "recording_save_dir",
+)
+_RESULT_IDENTITY_FIELDS = (
+    "task_cli",
+    "isaac_task_name",
+    "test_mode",
+    "seed",
+    "repeat_idx",
+    "episode_seed",
+    "episode_index",
+    "instruction",
+    "env_config_yaml_sha256",
+)
 
 
 try:
@@ -556,6 +584,220 @@ def _validate_runtime_paths(args: argparse.Namespace, episode_specs: list[dict[s
     return worker_status, server_status, completion_dir
 
 
+def _strict_int_field(payload: Mapping[str, Any], key: str, *, label: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} {key} must be an integer")
+    return value
+
+
+def _validate_shadow_identity_args(args: argparse.Namespace) -> None:
+    result_identity = str(getattr(args, "result_identity", ""))
+    if _RESULT_IDENTITY_RE.fullmatch(result_identity) is None:
+        raise ValueError("result identity must contain 64 lowercase hex characters")
+    shadow_session_id = str(getattr(args, "shadow_session_id", ""))
+    if _SHADOW_SESSION_RE.fullmatch(shadow_session_id) is None:
+        raise ValueError("shadow session id must contain 16..32 lowercase hex characters")
+    expected_episode_seed = getattr(args, "expected_episode_seed", None)
+    if (
+        isinstance(expected_episode_seed, bool)
+        or not isinstance(expected_episode_seed, int)
+        or expected_episode_seed < 0
+        or expected_episode_seed > 0x7FFFFFFF
+    ):
+        raise ValueError("expected episode seed must be an integer in 0..2147483647")
+
+
+def _validate_single_episode_contract(
+    args: argparse.Namespace,
+    episode_specs: Sequence[Mapping[str, Any]],
+) -> tuple[Path, Path, Path, dict[str, Any], dict[str, Any]]:
+    _validate_shadow_identity_args(args)
+    if len(episode_specs) != 1:
+        raise ValueError(f"single-episode shadow requires exactly one normalized episode, got {len(episode_specs)}")
+    normalized_spec = episode_specs[0]
+    if not isinstance(normalized_spec, Mapping):
+        raise ValueError("normalized episode spec must be an object")
+    normalized = dict(normalized_spec)
+    worker_status, server_status, completion_dir = _validate_runtime_paths(args, [normalized])
+
+    attempt = Path(args.attempt_dir).expanduser().resolve()
+    shard_path = _validate_attempt_path(args.episode_batch_json, attempt, label="episode batch")
+    raw_shard = _read_json_object(shard_path, label="episode batch")
+    if raw_shard.get("schema_version") != "huge_humanoidarena_shard_v1":
+        raise ValueError("episode batch schema version is incompatible")
+    if raw_shard.get("worker_id") != args.worker_id:
+        raise ValueError("episode batch worker identity does not match the shadow")
+    raw_episodes = raw_shard.get("episodes")
+    if not isinstance(raw_episodes, list) or len(raw_episodes) != 1:
+        count = len(raw_episodes) if isinstance(raw_episodes, list) else 0
+        raise ValueError(f"single-episode shadow requires exactly one raw episode, got {count}")
+    raw_spec = raw_episodes[0]
+    if not isinstance(raw_spec, dict):
+        raise ValueError("raw episode spec must be an object")
+
+    normalized_values: dict[str, int] = {}
+    for key in _SINGLE_EPISODE_INTEGER_FIELDS:
+        raw_value = _strict_int_field(raw_spec, key, label="raw episode")
+        normalized_value = _strict_int_field(normalized, key, label="normalized episode")
+        if raw_value != normalized_value:
+            raise ValueError(f"raw/normalized episode {key} mismatch: {raw_value} != {normalized_value}")
+        normalized_values[key] = normalized_value
+    if normalized_values["episode_seed"] != int(args.expected_episode_seed):
+        raise ValueError(
+            "normalized episode seed does not match --expected-episode-seed: "
+            f"{normalized_values['episode_seed']} != {args.expected_episode_seed}"
+        )
+    if normalized_values["seed"] != int(args.seed):
+        raise ValueError(f"normalized group seed does not match --seed: {normalized_values['seed']} != {args.seed}")
+
+    for key in _SINGLE_EPISODE_PATH_FIELDS:
+        raw_path = _validate_attempt_path(raw_spec.get(key, ""), attempt, label=f"raw episode {key}")
+        normalized_path = _validate_attempt_path(normalized.get(key, ""), attempt, label=f"normalized episode {key}")
+        if raw_path != normalized_path:
+            raise ValueError(f"raw/normalized episode {key} mismatch: {raw_path} != {normalized_path}")
+
+    raw_eval_model_path = raw_spec.get("eval_model_path")
+    normalized_eval_model_path = normalized.get("eval_model_path")
+    if (
+        not isinstance(raw_eval_model_path, str)
+        or not raw_eval_model_path.strip()
+        or not isinstance(normalized_eval_model_path, str)
+        or not normalized_eval_model_path.strip()
+    ):
+        raise ValueError("raw and normalized eval_model_path must be non-empty strings")
+    raw_eval_model = Path(raw_eval_model_path).expanduser().resolve()
+    normalized_eval_model = Path(normalized_eval_model_path).expanduser().resolve()
+    if raw_eval_model != normalized_eval_model:
+        raise ValueError(
+            f"raw/normalized episode eval_model_path mismatch: {raw_eval_model} != {normalized_eval_model}"
+        )
+
+    plan = _read_json_object(attempt / "plan.json", label="attempt plan")
+    if plan.get("schema_version") != "huge_humanoidarena_contract_v1":
+        raise ValueError("attempt plan schema version is incompatible")
+    static_plan = plan.get("static_plan")
+    if not isinstance(static_plan, dict):
+        raise ValueError("attempt plan static_plan must be an object")
+    plan_episodes = static_plan.get("episodes")
+    if not isinstance(plan_episodes, list):
+        raise ValueError("attempt plan episodes must be a list")
+
+    stable_tuple = (
+        str(args.task),
+        normalized_values["seed"],
+        normalized_values["repeat_idx"],
+        normalized_values["episode_seed"],
+        normalized_values["episode_index"],
+    )
+    matches: list[dict[str, Any]] = []
+    for entry in plan_episodes:
+        if not isinstance(entry, dict):
+            raise ValueError("attempt plan episode must be an object")
+        entry_tuple = (
+            str(entry.get("isaac_task_name", "")),
+            _strict_int_field(entry, "seed", label="attempt plan episode"),
+            _strict_int_field(entry, "repeat_idx", label="attempt plan episode"),
+            _strict_int_field(entry, "episode_seed", label="attempt plan episode"),
+            _strict_int_field(entry, "episode_index", label="attempt plan episode"),
+        )
+        if entry_tuple == stable_tuple:
+            matches.append(entry)
+    if len(matches) != 1:
+        raise ValueError(f"attempt plan must contain exactly one matching stable episode tuple, got {len(matches)}")
+
+    plan_episode = matches[0]
+    if any(key not in plan_episode for key in _RESULT_IDENTITY_FIELDS):
+        raise ValueError("matching attempt plan episode is missing result identity fields")
+    identity_payload = {key: plan_episode[key] for key in _RESULT_IDENTITY_FIELDS}
+    plan_result_identity = str(plan_episode.get("result_identity", ""))
+    recomputed_result_identity = hashlib.sha256(_canonical_json_bytes(identity_payload)).hexdigest()
+    if plan_result_identity != recomputed_result_identity:
+        raise ValueError("attempt plan episode result identity does not match its canonical stable payload")
+    if plan_result_identity != args.result_identity:
+        raise ValueError("required result identity does not match the attempt plan episode")
+
+    episode_identity = {
+        "result_identity": plan_result_identity,
+        "task": str(args.task),
+        "seed": normalized_values["seed"],
+        "repeat_idx": normalized_values["repeat_idx"],
+        "episode_seed": normalized_values["episode_seed"],
+        "episode_index": normalized_values["episode_index"],
+    }
+    return worker_status, server_status, completion_dir, normalized, episode_identity
+
+
+def _unavailable_model_io_result(
+    *,
+    result_identity: str,
+    episode_seed: int,
+    outcome_sha256: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "trace_status": "incomplete",
+        "result_identity": result_identity,
+        "episode_seed": int(episode_seed),
+        "outcome_sha256": outcome_sha256,
+        "error": error,
+    }
+
+
+def finish_model_io_trace(
+    server_url: str,
+    *,
+    result_identity: str,
+    episode_seed: int,
+    outcome_sha256: str,
+    timeout_sec: float,
+) -> dict[str, Any]:
+    try:
+        if _RESULT_IDENTITY_RE.fullmatch(str(result_identity)) is None:
+            raise ValueError("result identity must contain 64 lowercase hex characters")
+        if _RESULT_IDENTITY_RE.fullmatch(str(outcome_sha256)) is None:
+            raise ValueError("outcome SHA-256 must contain 64 lowercase hex characters")
+        if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
+            raise ValueError("episode seed must be an integer")
+        timeout = float(timeout_sec)
+        if timeout <= 0:
+            raise ValueError("finish timeout must be positive")
+        body = {
+            "result_identity": result_identity,
+            "episode_seed": episode_seed,
+            "outcome_sha256": outcome_sha256,
+        }
+        request = urllib.request.Request(
+            f"{str(server_url).rstrip('/')}/finish_episode",
+            data=_canonical_json_bytes(body),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("finish response must be a JSON object")
+        if payload.get("schema_version") != TRACE_RECEIPT_SCHEMA_VERSION:
+            raise ValueError("finish response schema version is incompatible")
+        if payload.get("result_identity") != result_identity:
+            raise ValueError("finish response result identity mismatch")
+        if payload.get("episode_seed") != episode_seed:
+            raise ValueError("finish response episode seed mismatch")
+        if payload.get("outcome_sha256") != outcome_sha256:
+            raise ValueError("finish response outcome SHA-256 mismatch")
+        if payload.get("trace_status") not in {"complete", "degraded", "incomplete"}:
+            raise ValueError("finish response trace status is invalid")
+        return payload
+    except Exception as exc:
+        return _unavailable_model_io_result(
+            result_identity=str(result_identity),
+            episode_seed=int(episode_seed) if isinstance(episode_seed, int) and not isinstance(episode_seed, bool) else -1,
+            outcome_sha256=str(outcome_sha256),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _run_probe(args: argparse.Namespace) -> int:
     launcher_args = {
         "headless": True,
@@ -612,16 +854,52 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
     upstream._normalize_control_routing(args)
     upstream.apply_task_runtime_profile(args)
     episode_specs = upstream._load_episode_specs(args)
-    if not episode_specs:
-        raise ValueError("episode batch contains no episodes")
-    worker_status_path, server_status_path, completion_dir = _validate_runtime_paths(args, episode_specs)
-    _write_worker_status(
+    (
         worker_status_path,
-        run_id=args.run_id,
-        worker_id=args.worker_id,
-        state="starting",
-        episode_count=len(episode_specs),
+        server_status_path,
+        completion_dir,
+        episode_spec,
+        episode_identity,
+    ) = _validate_single_episode_contract(args, episode_specs)
+    model_io_result: dict[str, Any] = {
+        "status": "pending",
+        "trace_status": "incomplete",
+        "result_identity": args.result_identity,
+        "episode_seed": args.expected_episode_seed,
+        "outcome_sha256": "",
+        "error": None,
+    }
+    cleanup_errors: list[dict[str, str]] = []
+    status_extra: dict[str, Any] = {"completed_count": 0}
+    final_state = "sim_runtime_fatal"
+    exit_code = SIM_FATAL_EXIT
+
+    def write_status(state: str, **extra: Any) -> None:
+        _write_worker_status(
+            worker_status_path,
+            run_id=args.run_id,
+            worker_id=args.worker_id,
+            state=state,
+            shadow_session_id=args.shadow_session_id,
+            process_started_at=_PROCESS_STARTED_AT,
+            simulator_pid=os.getpid(),
+            episode_identity=dict(episode_identity),
+            model_io=dict(model_io_result),
+            cleanup_errors=list(cleanup_errors),
+            **extra,
+        )
+
+    shutdown_guard_path = worker_status_path.with_name(
+        f".{worker_status_path.name}.shutdown_guard"
     )
+    if os.path.lexists(shutdown_guard_path):
+        raise ValueError(f"shadow shutdown guard already exists: {shutdown_guard_path}")
+    with shutdown_guard_path.open("x", encoding="ascii") as stream:
+        stream.write(f"{args.run_id} {args.worker_id} {args.shadow_session_id}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    write_status("starting", episode_count=1)
 
     launcher = None
     env = None
@@ -635,13 +913,7 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
             expected_cuda_uuid=args.expected_cuda_uuid,
             expected_pci_bus_id=args.expected_pci_bus_id,
         )
-        _write_worker_status(
-            worker_status_path,
-            run_id=args.run_id,
-            worker_id=args.worker_id,
-            state="binding_verified",
-            binding=binding_report,
-        )
+        write_status("binding_verified", binding=binding_report)
 
         import gymnasium as gym
 
@@ -653,7 +925,6 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
         from tasks.common_runtime import apply_optional_runtime_augments, setup_vision_test_light
 
         SimpleVideoRecorder = upstream._load_simple_video_recorder()
-        first_spec = episode_specs[0]
         env_cfg = parse_env_cfg(args.task, device="cuda:0", num_envs=1)
         env_cfg.env_name = args.task
         apply_env_config_yaml(
@@ -662,13 +933,13 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
             task_name=args.task,
             route_name=args.gmt_backend or args.action_source,
         )
-        upstream._seed_runtime_rngs(int(first_spec["episode_seed"]))
-        upstream._configure_episode_seed_state(env_cfg, int(first_spec["episode_seed"]))
+        upstream._seed_runtime_rngs(int(episode_spec["episode_seed"]))
+        upstream._configure_episode_seed_state(env_cfg, int(episode_spec["episode_seed"]))
         env = gym.make(args.task, cfg=env_cfg).unwrapped
         upstream._initialize_task_scene(env, env_cfg, args, apply_optional_runtime_augments)
         if os.getenv("VISION_RANDOMIZATION"):
             setup_vision_test_light()
-        upstream._reset_environment_for_episode(env, env_cfg, int(first_spec["episode_seed"]))
+        upstream._reset_environment_for_episode(env, env_cfg, int(episode_spec["episode_seed"]))
         physics_dt = getattr(env, "physics_dt", None) or env_cfg.sim.dt
         control_hz = int(round(1.0 / (physics_dt * env_cfg.decimation)))
         control_config = ControlConfig(step_hz=control_hz, replay_mode=False, use_rl_action_mode=True)
@@ -682,106 +953,144 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
         controller = RobotController(env, control_config)
         controller.set_action_provider(action_provider)
 
-        for completed_count, spec in enumerate(episode_specs, start=1):
-            payload = upstream._run_episode_once(
-                simulation_app,
-                env,
-                env_cfg,
-                action_provider,
-                controller,
-                args,
-                spec,
-                SimpleVideoRecorder,
+        payload = upstream._run_episode_once(
+            simulation_app,
+            env,
+            env_cfg,
+            action_provider,
+            controller,
+            args,
+            episode_spec,
+            SimpleVideoRecorder,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("upstream episode helper returned a non-object payload")
+        outcome_sha256 = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+        try:
+            model_io_result = finish_model_io_trace(
+                args.lerobot_server_url,
+                result_identity=args.result_identity,
+                episode_seed=args.expected_episode_seed,
+                outcome_sha256=outcome_sha256,
+                timeout_sec=args.lerobot_server_timeout,
             )
-            if not isinstance(payload, dict):
-                raise ValueError("upstream episode helper returned a non-object payload")
-            server_status = _read_json_object(server_status_path, label="server status")
-            classification = classify_episode_result(
+            if not isinstance(model_io_result, dict):
+                raise ValueError("finish helper returned a non-object result")
+        except Exception as exc:
+            model_io_result = _unavailable_model_io_result(
+                result_identity=args.result_identity,
+                episode_seed=args.expected_episode_seed,
+                outcome_sha256=outcome_sha256,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        print(
+            "[sim_eval_shadow] model_io="
+            + json.dumps(model_io_result, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        )
+
+        server_status = _read_json_object(server_status_path, label="server status")
+        classification = classify_episode_result(
+            payload,
+            server_status,
+            run_id=args.run_id,
+            worker_id=args.worker_id,
+            episode_seed=int(episode_spec["episode_seed"]),
+        )
+        status_extra = {
+            "current_episode": dict(episode_identity),
+            "completed_count": int(classification == "completed"),
+            "classification": classification,
+            "upstream_payload_sha256": outcome_sha256,
+            "server_status_sha256": hashlib.sha256(_canonical_json_bytes(server_status)).hexdigest(),
+        }
+        if classification == "completed":
+            completion = publish_completion_atomic(
                 payload,
-                server_status,
+                raw_result_path=episode_spec["result_json"],
+                completion_dir=completion_dir,
+                attempt_dir=args.attempt_dir,
                 run_id=args.run_id,
                 worker_id=args.worker_id,
-                episode_seed=int(spec["episode_seed"]),
             )
-            status_extra = {
-                "current_episode": {
-                    "seed": int(spec["seed"]),
-                    "repeat_idx": int(spec["repeat_idx"]),
-                    "episode_seed": int(spec["episode_seed"]),
-                    "episode_index": int(spec["episode_index"]),
-                },
-                "completed_count": completed_count - (classification != "completed"),
-                "classification": classification,
-                "upstream_payload_sha256": hashlib.sha256(_canonical_json_bytes(payload)).hexdigest(),
-                "server_status_sha256": hashlib.sha256(_canonical_json_bytes(server_status)).hexdigest(),
-            }
-            if classification == "completed":
-                completion = publish_completion_atomic(
-                    payload,
-                    raw_result_path=spec["result_json"],
-                    completion_dir=completion_dir,
-                    attempt_dir=args.attempt_dir,
-                    run_id=args.run_id,
-                    worker_id=args.worker_id,
-                )
-                _write_worker_status(
-                    worker_status_path,
-                    run_id=args.run_id,
-                    worker_id=args.worker_id,
-                    state="running",
-                    completion=str(completion),
-                    **status_extra,
-                )
-                continue
-            _write_worker_status(
-                worker_status_path,
-                run_id=args.run_id,
-                worker_id=args.worker_id,
-                state=classification,
-                **status_extra,
-            )
-            return SERVER_FATAL_EXIT if classification == "server_or_infer_fatal" else SIM_FATAL_EXIT
-        _write_worker_status(
-            worker_status_path,
-            run_id=args.run_id,
-            worker_id=args.worker_id,
-            state="complete",
-            completed_count=len(episode_specs),
-        )
-        return 0
+            status_extra["completion"] = str(completion)
+            final_state = "complete"
+            exit_code = 0
+        else:
+            final_state = classification
+            exit_code = SERVER_FATAL_EXIT if classification == "server_or_infer_fatal" else SIM_FATAL_EXIT
     except KeyboardInterrupt:
-        _write_worker_status(
-            worker_status_path,
-            run_id=args.run_id,
-            worker_id=args.worker_id,
-            state="interrupted",
-        )
-        return 130
+        final_state = "interrupted"
+        exit_code = 130
+        status_extra["error"] = "KeyboardInterrupt"
     except Exception as exc:
-        _write_worker_status(
-            worker_status_path,
-            run_id=args.run_id,
-            worker_id=args.worker_id,
-            state="sim_runtime_fatal",
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        return SIM_FATAL_EXIT
+        final_state = "sim_runtime_fatal"
+        exit_code = SIM_FATAL_EXIT
+        status_extra["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         try:
             if controller is not None:
                 controller.cleanup()
         except Exception as exc:
+            cleanup_errors.append(
+                {"resource": "controller", "error": f"{type(exc).__name__}: {exc}"}
+            )
             print(f"[sim_eval_shadow] controller cleanup failed: {exc}", file=sys.stderr)
         try:
             if env is not None:
                 env.close()
         except Exception as exc:
+            cleanup_errors.append(
+                {"resource": "env", "error": f"{type(exc).__name__}: {exc}"}
+            )
             print(f"[sim_eval_shadow] env cleanup failed: {exc}", file=sys.stderr)
-        try:
-            if launcher is not None:
+
+        if cleanup_errors:
+            status_extra["state_before_cleanup"] = final_state
+            status_extra.setdefault("error", "one or more simulator cleanup operations failed")
+            final_state = "sim_runtime_fatal"
+            if exit_code == 0:
+                exit_code = SIM_FATAL_EXIT
+
+        if launcher is not None:
+            try:
+                write_status(
+                    "shutdown_ready",
+                    planned_state=final_state,
+                    planned_exit_code=exit_code,
+                    **status_extra,
+                )
+                shutdown_guard_path.unlink()
+            except Exception as exc:
+                print(f"[sim_eval_shadow] shutdown-ready status write failed: {exc}", file=sys.stderr)
+                status_extra.setdefault("state_before_cleanup", final_state)
+                status_extra.setdefault(
+                    "error",
+                    f"shutdown-ready status write failed: {type(exc).__name__}: {exc}",
+                )
+                final_state = "sim_runtime_fatal"
+                exit_code = SIM_FATAL_EXIT
+            try:
                 launcher.app.close()
+            except Exception as exc:
+                cleanup_errors.append(
+                    {"resource": "app", "error": f"{type(exc).__name__}: {exc}"}
+                )
+                print(f"[sim_eval_shadow] SimulationApp cleanup failed: {exc}", file=sys.stderr)
+
+        if cleanup_errors:
+            status_extra.setdefault("state_before_cleanup", final_state)
+            status_extra.setdefault("error", "one or more simulator cleanup operations failed")
+            final_state = "sim_runtime_fatal"
+            if exit_code == 0:
+                exit_code = SIM_FATAL_EXIT
+        status_extra["exit_code"] = exit_code
+        try:
+            write_status(final_state, **status_extra)
         except Exception as exc:
-            print(f"[sim_eval_shadow] SimulationApp cleanup failed: {exc}", file=sys.stderr)
+            print(f"[sim_eval_shadow] final status write failed: {exc}", file=sys.stderr)
+            if exit_code == 0:
+                exit_code = SIM_FATAL_EXIT
+    return exit_code
 
 
 def _add_common_adapter_args(parser: argparse.ArgumentParser, *, required: bool) -> None:
@@ -814,6 +1123,9 @@ def build_parser(upstream: types.ModuleType) -> argparse.ArgumentParser:
     parser.add_argument("--attempt-dir", required=True)
     parser.add_argument("--server-status-json", required=True)
     parser.add_argument("--worker-status-json", required=True)
+    parser.add_argument("--result-identity", required=True)
+    parser.add_argument("--expected-episode-seed", required=True, type=int)
+    parser.add_argument("--shadow-session-id", required=True)
     parser.add_argument("--completion-dir", required=True)
     parser.add_argument("--memory-limit-percent", type=int, default=None)
     return parser
@@ -867,6 +1179,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     if not _WORKER_RE.fullmatch(args.worker_id):
         parser.error("worker-id must match wNN")
+    try:
+        _validate_shadow_identity_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not args.expected_cuda_uuid or not args.expected_pci_bus_id:
         parser.error("expected CUDA UUID and PCI bus id are required")
     return run_persistent_shard(args, upstream)
