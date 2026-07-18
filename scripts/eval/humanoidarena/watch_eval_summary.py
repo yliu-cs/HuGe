@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
 import stat
 import statistics
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,7 @@ MANIFEST_SCHEMA_VERSION = "huge_humanoidarena_attempt_v1"
 COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
 SUMMARY_SCHEMA_VERSION = "huge_humanoidarena_summary_v1"
+SUMMARY_ROW_SCHEMA_VERSION = "huge_humanoidarena_summary_row_v1"
 
 _LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "max_steps", "sim_stopped"}
 _EXECUTION_FAILED = "execution_failed"
@@ -58,6 +61,9 @@ class EvalRow:
     seed_rates: str
     error: str | None = None
     execution_failed: str = "0"
+    checkpoint_relative_path: str | None = None
+    accepted_contract_path: str | None = None
+    accepted_contract_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +176,7 @@ def _integer(value: object, *, label: str) -> int:
 
 def _checkpoint_identity(
     contract: dict[str, Any],
-) -> tuple[str, str, str, str, int, int]:
+) -> tuple[str, str, str, str, int, int, str]:
     static_plan = _mapping(contract.get("static_plan"), label="static_plan")
     checkpoint = _mapping(static_plan.get("checkpoint"), label="static_plan.checkpoint")
     task_config = _mapping(static_plan.get("task"), label="static_plan.task")
@@ -195,7 +201,7 @@ def _checkpoint_identity(
     episodes = static_plan.get("episodes")
     if not isinstance(episodes, list):
         raise SummaryError("static_plan.episodes must be a list")
-    return task, architecture, mode, run_id, step, len(episodes)
+    return task, architecture, mode, run_id, step, len(episodes), relative_path
 
 
 def _contract_episodes(
@@ -867,20 +873,38 @@ def _validate_terminal_manifest(
         )
 
 
-def _error_identity(contract_path: Path, eval_root: Path) -> tuple[str, int]:
+def _error_identity(
+    contract_path: Path, eval_root: Path
+) -> tuple[str, int, str | None]:
+    checkpoint_relative_path: str | None = None
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        static_plan = contract.get("static_plan") if isinstance(contract, dict) else None
+        checkpoint = (
+            static_plan.get("checkpoint") if isinstance(static_plan, dict) else None
+        )
+        candidate = (
+            checkpoint.get("relative_path") if isinstance(checkpoint, dict) else None
+        )
+        if isinstance(candidate, str) and candidate:
+            checkpoint_relative_path = candidate
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
     try:
         relative_parts = contract_path.relative_to(eval_root).parts
     except ValueError:
         relative_parts = contract_path.parts
     task = relative_parts[0] if relative_parts else "?"
-    match = re.search(r"step_(\d+)", str(contract_path))
-    return task, int(match.group(1)) if match else -1
+    match = re.search(r"step_(\d+)", checkpoint_relative_path or str(contract_path))
+    return task, int(match.group(1)) if match else -1, checkpoint_relative_path
 
 
 def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
     try:
         contract = _json_object(contract_path, label="contract.json")
-        task, architecture, mode, run_id, step, expected = _checkpoint_identity(contract)
+        (
+            task, architecture, mode, run_id, step, expected, checkpoint_relative_path
+        ) = _checkpoint_identity(contract)
         episodes, expected_seed_counts = _contract_episodes(contract)
         if len(episodes) != expected:
             raise SummaryError("contract episode count is inconsistent")
@@ -897,6 +921,7 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
                 f"0/{expected}",
                 "-",
                 "-",
+                checkpoint_relative_path=checkpoint_relative_path,
             )
 
         summary_path = attempt / "summary.json"
@@ -968,6 +993,7 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
                 success,
                 seed_rates,
                 execution_failed=str(execution_failed),
+                checkpoint_relative_path=checkpoint_relative_path,
             )
         progress, execution_failed = _running_metrics(attempt, episodes)
         return EvalRow(
@@ -981,9 +1007,10 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
             "-",
             "-",
             execution_failed=execution_failed,
+            checkpoint_relative_path=checkpoint_relative_path,
         )
     except (SummaryError, OSError) as exc:
-        task, step = _error_identity(contract_path, eval_root)
+        task, step, checkpoint_relative_path = _error_identity(contract_path, eval_root)
         return EvalRow(
             task,
             "?",
@@ -996,11 +1023,419 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
             "-",
             str(exc),
             execution_failed="-",
+            checkpoint_relative_path=checkpoint_relative_path,
         )
 
 
-def collect_rows(eval_root: Path) -> list[EvalRow]:
-    rows = [_row_from_contract(path, eval_root) for path in eval_root.rglob("contract.json")]
+def _selector_module() -> Any:
+    module_name = (
+        f"{__package__}.shard_checkpoints"
+        if __package__
+        else "shard_checkpoints"
+    )
+    return importlib.import_module(module_name)
+
+
+def _strict_checkpoint_relative_path(value: object, selector: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise SummaryError("checkpoint.relative_path must be a non-empty string")
+    path = Path(value)
+    parts = path.parts
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in parts)
+        or len(parts) != 8
+        or parts[0] != ".runs"
+        or parts[1] not in selector.ALLOWED_TRAINING_ROOT_NAMES
+        or parts[2] != selector.EXPECTED_CHECKPOINT_TASK
+        or parts[4] != "full"
+        or parts[5] != "stage3"
+        or selector._SAFE_COMPONENT_RE.fullmatch(parts[6]) is None
+    ):
+        raise SummaryError(
+            "strict checkpoint.relative_path must be the canonical optimized "
+            "HOI_pp_box/<architecture>/full/stage3/<run_id>/step_N path"
+        )
+    architecture = parts[3]
+    expected_steps = dict(selector.EXPECTED_RUN_MATRIX)
+    step_match = selector.STEP_RE.fullmatch(parts[7])
+    if (
+        architecture not in expected_steps
+        or step_match is None
+        or int(step_match.group(1)) not in expected_steps[architecture]
+    ):
+        raise SummaryError(
+            "strict checkpoint.relative_path architecture/step is outside the "
+            f"frozen {selector.EXPECTED_CHECKPOINT_COUNT}-checkpoint matrix"
+        )
+    return value
+
+
+def _strict_identity_row(relative_path: str, *, error: str) -> EvalRow:
+    parts = Path(relative_path).parts
+    step_match = re.fullmatch(r"step_(\d+)", parts[-1])
+    return EvalRow(
+        task="pp_box",
+        architecture=parts[3],
+        mode=parts[4],
+        run_id=parts[6],
+        step=int(step_match.group(1)) if step_match else -1,
+        status=ERROR,
+        progress="-",
+        success="-",
+        seed_rates="-",
+        error=error,
+        execution_failed="-",
+        checkpoint_relative_path=relative_path,
+    )
+
+
+def _strict_contract_groups(
+    eval_root: Path, selector: Any
+) -> tuple[dict[str, list[Path]], list[EvalRow]]:
+    groups: dict[str, list[Path]] = {}
+    diagnostics: dict[str, EvalRow] = {}
+    seen_paths: set[Path] = set()
+    for raw_path in sorted(eval_root.glob("**/contract.json")):
+        safe_contract_path: Path | None = None
+        try:
+            contract_path = raw_path.resolve(strict=True)
+            if not _is_relative_to(contract_path, eval_root):
+                raise SummaryError(f"evaluation contract escapes {eval_root}: {raw_path}")
+            safe_contract_path = contract_path
+            if contract_path in seen_paths:
+                continue
+            seen_paths.add(contract_path)
+            contract = _json_object(contract_path, label="contract.json")
+            static_plan = _mapping(contract.get("static_plan"), label="static_plan")
+            checkpoint = _mapping(
+                static_plan.get("checkpoint"), label="static_plan.checkpoint"
+            )
+            relative_path = _strict_checkpoint_relative_path(
+                checkpoint.get("relative_path"), selector
+            )
+        except (OSError, SummaryError) as exc:
+            row = (
+                _row_from_contract(safe_contract_path, eval_root)
+                if safe_contract_path is not None
+                else EvalRow(
+                    task="?",
+                    architecture="?",
+                    mode="?",
+                    run_id="?",
+                    step=-1,
+                    status=ERROR,
+                    progress="-",
+                    success="-",
+                    seed_rates="-",
+                    execution_failed="-",
+                )
+            )
+            error = f"strict contract discovery rejected {raw_path}: {exc}"
+            key = row.checkpoint_relative_path or f"@contract:{raw_path}"
+            existing = diagnostics.get(key)
+            if existing is not None:
+                error = f"{existing.error}; {error}"
+                row = existing
+            diagnostics[key] = replace(
+                row,
+                status=ERROR,
+                error=error,
+                accepted_contract_path=None,
+                accepted_contract_hash=None,
+            )
+            continue
+        groups.setdefault(relative_path, []).append(contract_path)
+    return groups, list(diagnostics.values())
+
+
+def _strict_current_contracts(
+    selector: Any,
+    contract_paths: list[Path],
+    *,
+    eval_root: Path,
+    repo_root: Path,
+    relative_path: str,
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    current: list[tuple[Path, str, dict[str, Any]]] = []
+    for contract_path in contract_paths:
+        contract = selector._json_object(contract_path)
+        if contract is None:
+            continue
+        try:
+            if not selector._matches_full_pp_box_contract(
+                contract, relative_path, repo_root=repo_root
+            ):
+                continue
+            static_plan = contract["static_plan"]
+            policy = static_plan["policy"]
+            if Path(policy["output_root"]).expanduser().resolve() != eval_root:
+                continue
+            contract_hash = selector._canonical_sha256(contract)
+            expected_label = (
+                f"{selector.EXPECTED_CHECKPOINT_TASK}-{Path(relative_path).name}"
+            )
+            if (
+                contract_path.parent.name != contract_hash[:16]
+                or contract_path.parent.parent.name != expected_label
+                or contract_path.parent.parent.parent.name != "pp_box"
+                or selector._json_object(
+                    contract_path.parent / "source_inventory.json"
+                )
+                != static_plan.get("source_inventory")
+            ):
+                continue
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            continue
+        current.append((contract_path, contract_hash, contract))
+    return sorted(current, key=lambda item: (item[1], str(item[0])))
+
+
+def _strict_success_candidates(
+    selector: Any,
+    current_contracts: list[tuple[Path, str, dict[str, Any]]],
+    *,
+    eval_root: Path,
+    repo_root: Path,
+    relative_path: str,
+) -> list[tuple[Path, str, Path]]:
+    successes: list[tuple[Path, str, Path]] = []
+    for contract_path, contract_hash, contract in current_contracts:
+        try:
+            attempts_root = (contract_path.parent / "attempts").resolve()
+            if (
+                not attempts_root.is_dir()
+                or not _is_relative_to(attempts_root, eval_root)
+            ):
+                continue
+            attempt = selector._select_resumable_attempt(
+                attempts_root, contract_hash
+            )
+            if attempt is None:
+                continue
+            manifest = selector._json_object(attempt / "manifest.json")
+            present_markers = [
+                marker_name
+                for marker_name in selector.TERMINAL_MARKER_STATES
+                if os.path.lexists(attempt / marker_name)
+            ]
+            marker = attempt / SUCCESS_MARKER
+            if (
+                manifest is None
+                or manifest.get("state") != "success"
+                or present_markers != [SUCCESS_MARKER]
+                or not selector._is_owned_attempt_path(
+                    attempt, marker, directory=False
+                )
+                or not selector._valid_terminal_attempt(
+                    contract_path.parent,
+                    attempt,
+                    marker,
+                    contract,
+                    relative_path,
+                    repo_root=repo_root,
+                    contract_prevalidated=True,
+                )
+            ):
+                continue
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        successes.append((contract_path, contract_hash, attempt.resolve()))
+    return sorted(successes, key=lambda item: (item[1], str(item[0])))
+
+
+def _strict_error_from_base(
+    base: EvalRow, *, relative_path: str, error: str
+) -> EvalRow:
+    detail = error if base.error is None else f"{error}; row_error={base.error}"
+    return replace(
+        base,
+        status=ERROR,
+        error=detail,
+        checkpoint_relative_path=relative_path,
+        accepted_contract_path=None,
+        accepted_contract_hash=None,
+    )
+
+
+def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
+    selector = _selector_module()
+    groups, rows = _strict_contract_groups(eval_root, selector)
+    if not groups:
+        return _sort_rows(rows)
+    try:
+        statuses = selector.checkpoint_contract_statuses(
+            eval_root,
+            set(groups),
+            allowed_root=repo_root / ".runs",
+            repo_root=repo_root,
+        )
+    except selector.ShardConfigError as exc:
+        rows.extend(
+            _strict_identity_row(
+                relative_path,
+                error=f"strict current-source validation failed: {exc}",
+            )
+            for relative_path in sorted(groups)
+        )
+        return _sort_rows(rows)
+
+    for relative_path, contract_paths in sorted(groups.items()):
+        status = statuses[relative_path]
+        current_contracts = _strict_current_contracts(
+            selector,
+            contract_paths,
+            eval_root=eval_root,
+            repo_root=repo_root,
+            relative_path=relative_path,
+        )
+        successes = _strict_success_candidates(
+            selector,
+            current_contracts,
+            eval_root=eval_root,
+            repo_root=repo_root,
+            relative_path=relative_path,
+        )
+        if status.state == "completed":
+            accepted = [
+                candidate
+                for candidate in successes
+                if status.contract_path == str(candidate[0])
+                and status.contract_hash == candidate[1]
+                and status.attempt_path == str(candidate[2])
+            ]
+            if len(accepted) != 1:
+                rows.append(
+                    _strict_identity_row(
+                        relative_path,
+                        error=(
+                            "selector accepted provenance does not uniquely match "
+                            "a legal current-source `_SUCCESS` contract"
+                        ),
+                    )
+                )
+                continue
+            contract_path, contract_hash, _attempt = accepted[0]
+            if re.fullmatch(r"[0-9a-f]{64}", contract_hash) is None:
+                rows.append(
+                    _strict_identity_row(
+                        relative_path,
+                        error="selector accepted provenance disagrees with strict scan",
+                    )
+                )
+                continue
+            row = _row_from_contract(contract_path, eval_root)
+            if row.status != DONE or row.execution_failed != "0":
+                rows.append(
+                    _strict_error_from_base(
+                        row,
+                        relative_path=relative_path,
+                        error="accepted `_SUCCESS` did not produce a clean DONE row",
+                    )
+                )
+                continue
+            rows.append(
+                replace(
+                    row,
+                    checkpoint_relative_path=relative_path,
+                    accepted_contract_path=str(contract_path),
+                    accepted_contract_hash=contract_hash,
+                )
+            )
+            continue
+
+        if successes:
+            rows.append(
+                _strict_identity_row(
+                    relative_path,
+                    error=(
+                        "strict scan found `_SUCCESS` but selector did not report "
+                        "the checkpoint completed"
+                    ),
+                )
+            )
+            continue
+
+        if status.contract_path is not None:
+            base = _row_from_contract(Path(status.contract_path), eval_root)
+            rows.append(
+                replace(
+                    base,
+                    checkpoint_relative_path=relative_path,
+                    accepted_contract_path=None,
+                    accepted_contract_hash=None,
+                )
+            )
+            continue
+
+        if len(current_contracts) == 1:
+            contract_path, _contract_hash, _contract = current_contracts[0]
+            base = _row_from_contract(contract_path, eval_root)
+            if base.status == DONE:
+                rows.append(
+                    _strict_error_from_base(
+                        base,
+                        relative_path=relative_path,
+                        error=(
+                            "current-source row is DONE but no legal `_SUCCESS` "
+                            "was accepted"
+                        ),
+                    )
+                )
+            else:
+                rows.append(
+                    replace(
+                        base,
+                        checkpoint_relative_path=relative_path,
+                        accepted_contract_path=None,
+                        accepted_contract_hash=None,
+                    )
+                )
+            continue
+
+        if len(current_contracts) > 1:
+            provenance = ", ".join(
+                f"{path}#{contract_hash}"
+                for path, contract_hash, _contract in current_contracts
+            )
+            rows.append(
+                _strict_identity_row(
+                    relative_path,
+                    error=(
+                        "multiple current-source contracts exist without one "
+                        f"accepted `_SUCCESS`: {provenance}"
+                    ),
+                )
+            )
+            continue
+
+        latest = max(contract_paths, key=str)
+        base = _row_from_contract(latest, eval_root)
+        rows.append(
+            _strict_error_from_base(
+                base,
+                relative_path=relative_path,
+                error=(
+                    "no legal current-source contract is selectable; "
+                    f"discovered_contracts={len(contract_paths)}"
+                ),
+            )
+        )
+
+    relative_paths = [
+        row.checkpoint_relative_path
+        for row in rows
+        if row.checkpoint_relative_path is not None
+    ]
+    if len(relative_paths) != len(set(relative_paths)):
+        raise SummaryError(
+            "strict summary produced duplicate checkpoint relative paths"
+        )
+    return _sort_rows(rows)
+
+
+def _sort_rows(rows: list[EvalRow]) -> list[EvalRow]:
     return sorted(
         rows,
         key=lambda row: (
@@ -1009,8 +1444,30 @@ def collect_rows(eval_root: Path) -> list[EvalRow]:
             row.mode,
             row.run_id,
             row.step,
+            row.checkpoint_relative_path or "",
         ),
     )
+
+
+def collect_rows(
+    eval_root: Path,
+    *,
+    strict_current_source: bool = False,
+    repo_root: Path | None = None,
+) -> list[EvalRow]:
+    if strict_current_source:
+        resolved_repo = (
+            repo_root.expanduser().resolve()
+            if repo_root is not None
+            else Path(__file__).resolve().parents[3]
+        )
+        resolved_eval = eval_root.expanduser().resolve()
+        return _collect_strict_rows(resolved_eval, resolved_repo)
+    rows = [
+        _row_from_contract(path, eval_root)
+        for path in eval_root.rglob("contract.json")
+    ]
+    return _sort_rows(rows)
 
 
 def _table(rows: list[EvalRow]) -> str:
@@ -1024,6 +1481,9 @@ def _table(rows: list[EvalRow]) -> str:
         "PROGRESS",
         "EXEC_FAILED",
         "SUCCESS RATE ± STD",
+        "CHECKPOINT_RELATIVE_PATH",
+        "ACCEPTED_CONTRACT_PATH",
+        "ACCEPTED_CONTRACT_HASH",
     )
     values = [
         (
@@ -1036,6 +1496,9 @@ def _table(rows: list[EvalRow]) -> str:
             row.progress,
             row.execution_failed,
             row.success,
+            row.checkpoint_relative_path or "-",
+            row.accepted_contract_path or "-",
+            row.accepted_contract_hash or "-",
         )
         for row in rows
     ]
@@ -1073,6 +1536,36 @@ def render(eval_root: Path, rows: list[EvalRow]) -> str:
     return "\n".join(lines)
 
 
+def render_jsonl(rows: list[EvalRow]) -> str:
+    payloads = []
+    for row in rows:
+        payload = {
+            "schema_version": SUMMARY_ROW_SCHEMA_VERSION,
+            **asdict(row),
+            "relative_path": row.checkpoint_relative_path,
+        }
+        payloads.append(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
+    return "\n".join(payloads)
+
+
+def _strict_rows_complete(rows: list[EvalRow]) -> bool:
+    return bool(rows) and all(
+        row.status == DONE
+        and row.execution_failed == "0"
+        and row.accepted_contract_path is not None
+        and row.accepted_contract_hash is not None
+        and re.fullmatch(r"[0-9a-f]{64}", row.accepted_contract_hash) is not None
+        for row in rows
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1082,14 +1575,56 @@ def build_parser() -> argparse.ArgumentParser:
         default=repo_root / ".runs/eval/humanoidarena",
         help="HumanoidArena evaluation result root (default: %(default)s)",
     )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=repo_root,
+        help="repository root used for strict current-source validation",
+    )
+    parser.add_argument(
+        "--strict-current-source",
+        "--strict",
+        action="store_true",
+        help=(
+            "group by checkpoint relative path and accept exactly one legal "
+            "current-source _SUCCESS contract per discovered checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=("table", "jsonl"),
+        default="table",
+        help="human-readable table or one canonical JSON object per row",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     eval_root = args.eval_root.expanduser().resolve()
-    rows = collect_rows(eval_root) if eval_root.is_dir() else []
-    print(render(eval_root, rows))
+    repo_root = args.repo_root.expanduser().resolve()
+    try:
+        rows = (
+            collect_rows(
+                eval_root,
+                strict_current_source=args.strict_current_source,
+                repo_root=repo_root,
+            )
+            if eval_root.is_dir()
+            else []
+        )
+    except (OSError, SummaryError) as exc:
+        print(f"[watch_eval_summary] validation error: {exc}", file=sys.stderr)
+        return 2
+    output = (
+        render(eval_root, rows)
+        if args.output_format == "table"
+        else render_jsonl(rows)
+    )
+    if output:
+        print(output)
+    if args.strict_current_source and not _strict_rows_complete(rows):
+        return 2
     return 0
 
 

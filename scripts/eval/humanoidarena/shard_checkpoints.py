@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
@@ -18,6 +19,7 @@ from typing import Any, Mapping, Sequence
 
 
 STEP_RE = re.compile(r"^step_([0-9]+)$")
+_SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 SUMMARY_SCHEMA_VERSION = "huge_humanoidarena_summary_v1"
 ATTEMPT_SCHEMA_VERSION = "huge_humanoidarena_attempt_v1"
 EXPECTED_SEEDS = [0, 1, 2]
@@ -29,9 +31,45 @@ EXPECTED_CHECKPOINT_TASK = "HOI_pp_box"
 EXPECTED_ISAAC_TASK = "Isaac-Move-PickPlace-Box-G129-Dex3-Wholedoby"
 EXPECTED_INSTRUCTION = "pick up the box and place it"
 EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
+MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
+MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
+MODEL_IO_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
+MODEL_IO_TRACE_POLICY = "require_complete_v1"
+ROOT_SOFTWARE_SCHEMA_VERSION = "huge_root_software_v1"
+ROOT_SOFTWARE_PACKAGES = (
+    "torch",
+    "torchvision",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "qwen-vl-utils",
+    "flash-attn",
+    "peft",
+    "onnxruntime-gpu",
+    "opencv-python",
+    "psutil",
+)
 STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v1"
 CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
+SELECTION_SCHEMA_VERSION = "huge_humanoidarena_shard_selection_v1"
+CHECKPOINT_MANIFEST_VERSION = 1
+PORTABLE_CHECKPOINT_KIND = "huge_portable_model"
+_PUBLICATION_FILES = frozenset({"manifest.json", "_SUCCESS"})
+EXPECTED_RUN_MATRIX = (
+    ("qwenpi_v3", (6000, 12000, 18000, 24000, 30000)),
+    ("qwengr00t", (6000, 12000, 18000, 24000, 30000)),
+    ("qwenoft", (6000, 12000, 18000, 24000, 30000)),
+)
+EXPECTED_CHECKPOINT_COUNT = sum(
+    len(steps) for _architecture, steps in EXPECTED_RUN_MATRIX
+)
+ALLOWED_TRAINING_ROOT_NAMES = (
+    "stage3_humanoidarena_full_optimized",
+)
 _WORKER_RE = re.compile(r"^w[0-9]{2}$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[a-f0-9]{8}$")
 _LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "max_steps", "sim_stopped"}
@@ -60,11 +98,14 @@ EXPECTED_HUGE_SOURCE_PATHS = (
     "src/huge/models/action_heads/starvla_oft_head.py",
     "src/huge/models/action_heads/starvla_pi_head.py",
     "scripts/eval/humanoidarena/eval_orchestrator.py",
+    "scripts/eval/run_ha_eval.sh",
     "scripts/eval/humanoidarena/watch_eval_summary.py",
     "scripts/eval/humanoidarena/shard_checkpoints.py",
     "scripts/eval/humanoidarena/sim_eval_shadow.py",
     "scripts/eval/humanoidarena/run_eval.sh",
     "scripts/eval/humanoidarena/env.sh",
+    "pyproject.toml",
+    "uv.lock",
 )
 TERMINAL_MARKER_STATES = {
     "_SUCCESS": "success",
@@ -83,6 +124,27 @@ class ShardTarget:
     path: Path
     relative_path: str
     step: int
+
+
+@dataclass(frozen=True)
+class ContractCandidate:
+    attempt_name: str
+    contract_path: Path
+    contract_hash: str
+    attempt_path: Path
+    state: str
+
+    @property
+    def sort_key(self) -> tuple[str, str, str]:
+        return (self.attempt_name, self.contract_hash, str(self.contract_path))
+
+
+@dataclass(frozen=True)
+class CheckpointContractStatus:
+    state: str
+    contract_path: str | None = None
+    contract_hash: str | None = None
+    attempt_path: str | None = None
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -136,6 +198,16 @@ def _json_object(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def _canonical_sha256(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         payload,
@@ -177,6 +249,165 @@ def _sha256_file(path: Path) -> str:
     value = digest.hexdigest()
     _FILE_HASH_CACHE[resolved] = (signature, value)
     return value
+
+
+def _validate_portable_checkpoint_publication(
+    checkpoint: Path,
+    *,
+    architecture: str,
+    step: int,
+    run_id: str,
+) -> dict[str, Any]:
+    marker_path = checkpoint / "_SUCCESS"
+    manifest_path = checkpoint / "manifest.json"
+    for path in (marker_path, manifest_path):
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ShardConfigError(
+                f"portable checkpoint publication is incomplete: "
+                f"{checkpoint}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size <= 0
+        ):
+            raise ShardConfigError(
+                f"portable checkpoint publication metadata is unsafe: {path}"
+            )
+    marker = _json_object(marker_path)
+    manifest = _json_object(manifest_path)
+    if marker is None or manifest is None:
+        raise ShardConfigError(
+            f"portable checkpoint publication metadata is invalid: {checkpoint}"
+        )
+    if (
+        set(marker)
+        != {"schema_version", "kind", "manifest_sha256"}
+        or marker.get("schema_version") != CHECKPOINT_MANIFEST_VERSION
+        or marker.get("kind") != PORTABLE_CHECKPOINT_KIND
+        or marker.get("manifest_sha256") != _sha256_file(manifest_path)
+        or manifest.get("schema_version") != CHECKPOINT_MANIFEST_VERSION
+        or manifest.get("kind") != PORTABLE_CHECKPOINT_KIND
+    ):
+        raise ShardConfigError(
+            f"portable checkpoint marker/manifest contract mismatch: "
+            f"{checkpoint}"
+        )
+
+    metadata = manifest.get("metadata")
+    publication = metadata if isinstance(metadata, dict) else manifest
+    if (
+        publication.get("global_step") != step
+        or publication.get("model_architecture") != architecture
+        or publication.get("tuning_mode") != "full"
+        or publication.get("run_id") != run_id
+    ):
+        raise ShardConfigError(
+            f"portable checkpoint manifest identity mismatch: {checkpoint}"
+        )
+
+    entries = manifest.get("files")
+    if not isinstance(entries, list) or not entries:
+        raise ShardConfigError(
+            f"portable checkpoint manifest has no file inventory: {manifest_path}"
+        )
+    expected_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "path",
+            "size",
+            "sha256",
+        }:
+            raise ShardConfigError(
+                f"invalid portable checkpoint manifest entry: {entry!r}"
+            )
+        relative_raw = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if (
+            not isinstance(relative_raw, str)
+            or not relative_raw
+            or relative_raw in expected_paths
+            or relative_raw in _PUBLICATION_FILES
+            or type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ShardConfigError(
+                f"invalid portable checkpoint manifest entry: {entry!r}"
+            )
+        relative = Path(relative_raw)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != relative_raw
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ShardConfigError(
+                f"unsafe portable checkpoint manifest path: {relative_raw!r}"
+            )
+        file_path = checkpoint / relative
+        try:
+            info = file_path.lstat()
+            resolved = file_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ShardConfigError(
+                f"portable checkpoint manifest file is unavailable: "
+                f"{file_path}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or not _is_relative_to(resolved, checkpoint)
+            or info.st_size != size
+            or _sha256_file(file_path) != digest
+        ):
+            raise ShardConfigError(
+                f"portable checkpoint manifest digest/size mismatch: "
+                f"{file_path}"
+            )
+        expected_paths.add(relative_raw)
+
+    actual_paths: set[str] = set()
+    for entry in checkpoint.rglob("*"):
+        relative = entry.relative_to(checkpoint).as_posix()
+        if relative in _PUBLICATION_FILES:
+            continue
+        try:
+            info = entry.lstat()
+        except OSError as exc:
+            raise ShardConfigError(
+                f"cannot inspect portable checkpoint inventory: {entry}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ShardConfigError(
+                f"portable checkpoint may not contain symlinks: {entry}"
+            )
+        if stat.S_ISREG(info.st_mode):
+            actual_paths.add(relative)
+    if actual_paths != expected_paths:
+        raise ShardConfigError(
+            f"portable checkpoint file inventory mismatch: "
+            f"missing={sorted(expected_paths - actual_paths)}, "
+            f"extra={sorted(actual_paths - expected_paths)}, "
+            f"checkpoint={checkpoint}"
+        )
+    if not set(REQUIRED_CHECKPOINT_FILES).issubset(actual_paths):
+        raise ShardConfigError(
+            f"portable checkpoint manifest lacks required evaluator files: "
+            f"{checkpoint}"
+        )
+    return {
+        "schema_version": CHECKPOINT_MANIFEST_VERSION,
+        "kind": PORTABLE_CHECKPOINT_KIND,
+        "manifest_relative_path": "manifest.json",
+        "manifest_sha256": _sha256_file(manifest_path),
+        "success_marker_relative_path": "_SUCCESS",
+        "success_marker_sha256": _sha256_file(marker_path),
+        "file_count": len(entries),
+    }
 
 
 def _directory_inventory(path: Path) -> dict[str, str] | None:
@@ -236,34 +467,250 @@ def validate_shard(*, index: int, count: int) -> None:
         raise ShardConfigError(f"shard index must be in [0, {count - 1}]")
 
 
+def _resolve_training_run_root(
+    repo: Path,
+    raw_root: Path,
+    architecture: str,
+) -> tuple[Path, Path]:
+    lexical = raw_root.expanduser()
+    if not lexical.is_absolute():
+        lexical = repo / lexical
+    try:
+        entry_stat = lexical.lstat()
+        root = lexical.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ShardConfigError(
+            f"{architecture} run root is unavailable: {lexical}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(entry_stat.st_mode):
+        raise ShardConfigError(
+            f"{architecture} run root must be a real directory: {lexical}"
+        )
+
+    matched_base: Path | None = None
+    relative: Path | None = None
+    for base_name in ALLOWED_TRAINING_ROOT_NAMES:
+        base = (repo / ".runs" / base_name).resolve()
+        if _is_relative_to(root, base):
+            matched_base = base
+            relative = root.relative_to(base)
+            break
+    if matched_base is None or relative is None:
+        allowed_text = ", ".join(
+            str((repo / ".runs" / name).resolve())
+            for name in ALLOWED_TRAINING_ROOT_NAMES
+        )
+        raise ShardConfigError(
+            f"{architecture} run root must be inside one allowed training root: "
+            f"{allowed_text}: {root}"
+        )
+
+    expected_prefix = ("HOI_pp_box", architecture, "full", "stage3")
+    if (
+        len(relative.parts) != 5
+        or tuple(relative.parts[:4]) != expected_prefix
+        or not _SAFE_COMPONENT_RE.fullmatch(relative.parts[4])
+        or relative.parts[4] in {".", "..", "_resume_states"}
+    ):
+        raise ShardConfigError(
+            f"{architecture} root must name one exact "
+            f"HOI_pp_box/{architecture}/full/stage3/<run_id> run: {root}"
+        )
+    cursor = matched_base
+    for component in relative.parts:
+        cursor = cursor / component
+        info = cursor.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ShardConfigError(
+                f"{architecture} run path contains a non-directory or symlink: {cursor}"
+            )
+    return root, matched_base
+
+
+def _active_training_writer(repo: Path, root: Path) -> int | None:
+    root_tokens = {
+        str(root).encode("utf-8"),
+        root.relative_to(repo).as_posix().encode("utf-8"),
+    }
+    training_tokens = (
+        b"train_huge.sh",
+        b"run_huge.sh",
+        b"train_stage",
+        b"accelerate",
+        b"deepspeed",
+        b"torchrun",
+    )
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        try:
+            raw = (proc / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = tuple(token for token in raw.split(b"\0") if token)
+        if (
+            argv
+            and any(root_token in argument for root_token in root_tokens for argument in argv)
+            and any(token in raw for token in training_tokens)
+        ):
+            return int(proc.name)
+    return None
+
+
+def _validate_training_completion_barrier(
+    repo: Path,
+    root: Path,
+    training_base: Path,
+    architecture: str,
+    expected_steps: Sequence[int],
+) -> list[tuple[Path, str, int]]:
+    trainer_lock = root / ".trainer.lock"
+    if os.path.lexists(trainer_lock):
+        raise ShardConfigError(
+            f"training writer lock is still present for {architecture}: "
+            f"{trainer_lock}"
+        )
+    writer_pid = _active_training_writer(repo, root)
+    if writer_pid is not None:
+        raise ShardConfigError(
+            f"active training writer pid={writer_pid} still references {root}"
+        )
+    active_locks = sorted(training_base.glob("run_huge*.flag"))
+    if active_locks:
+        raise ShardConfigError(
+            f"training matrix lock is still present for {architecture}: "
+            + ", ".join(str(path) for path in active_locks)
+        )
+    for entry in root.rglob("*"):
+        lowered = entry.name.lower()
+        if "staging" in lowered or lowered in {"running", "_running", "writer.lock"}:
+            raise ShardConfigError(
+                f"training staging/writer artifact remains under {root}: {entry}"
+            )
+
+    observed: dict[int, Path] = {}
+    for lexical in root.iterdir():
+        match = STEP_RE.fullmatch(lexical.name)
+        if match is None:
+            continue
+        try:
+            info = lexical.lstat()
+            resolved = lexical.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ShardConfigError(
+                f"cannot inspect portable checkpoint {lexical}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or not _is_relative_to(resolved, root)
+        ):
+            raise ShardConfigError(
+                f"portable checkpoint must be a real child directory: {lexical}"
+            )
+        step = int(match.group(1))
+        if step in observed:
+            raise ShardConfigError(
+                f"duplicate portable checkpoint step {step} under {root}"
+            )
+        observed[step] = resolved
+
+    expected = set(expected_steps)
+    actual = set(observed)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ShardConfigError(
+            f"{architecture} checkpoint barrier expected exactly "
+            f"{list(expected_steps)}; missing={missing}, extra={extra}, root={root}"
+        )
+
+    local: list[tuple[Path, str, int]] = []
+    for step in expected_steps:
+        checkpoint = observed[step]
+        _validate_portable_checkpoint_publication(
+            checkpoint,
+            architecture=architecture,
+            step=step,
+            run_id=root.name,
+        )
+        for name in REQUIRED_CHECKPOINT_FILES:
+            path = checkpoint / name
+            try:
+                info = path.lstat()
+                resolved = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ShardConfigError(
+                    f"incomplete checkpoint {checkpoint}: missing {name}: {exc}"
+                ) from exc
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_size <= 0
+                or not _is_relative_to(resolved, checkpoint)
+            ):
+                raise ShardConfigError(
+                    f"checkpoint file must be a non-empty real file: {path}"
+                )
+
+        payload = _json_object(checkpoint / "config.json")
+        config = payload.get("config") if isinstance(payload, dict) else None
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if (
+            not isinstance(config, dict)
+            or not isinstance(metadata, dict)
+            or config.get("model_architecture") != architecture
+            or metadata.get("model_architecture") != architecture
+            or metadata.get("global_step") != step
+            or config.get("freeze_qwen") is not False
+            or config.get("qwen_lora") is not False
+            or config.get("train_qwen_lora") is not False
+            or metadata.get("tuning_mode", "full") != "full"
+            or metadata.get("run_id", root.name) != root.name
+        ):
+            raise ShardConfigError(
+                f"checkpoint config does not match {architecture}/full step {step}: "
+                f"{checkpoint}"
+            )
+        local.append((checkpoint, checkpoint.relative_to(repo).as_posix(), step))
+    return local
+
+
 def discover_targets(repo_root: Path, checkpoint_roots: Sequence[Path]) -> list[ShardTarget]:
     repo = repo_root.expanduser().resolve()
-    allowed = (repo / ".runs/stage3_humanoidarena").resolve()
+    if len(checkpoint_roots) != len(EXPECTED_RUN_MATRIX):
+        raise ShardConfigError(
+            "exactly three run-specific roots are required in "
+            "qwenpi_v3, qwengr00t, qwenoft order"
+        )
     ordered: list[tuple[Path, str, int]] = []
-    seen: set[Path] = set()
-    for raw_root in checkpoint_roots:
-        root = raw_root.expanduser().resolve()
-        if not root.is_dir():
-            raise ShardConfigError(f"checkpoint root is not a directory: {root}")
-        if not _is_relative_to(root, allowed):
-            raise ShardConfigError(f"checkpoint root escapes {allowed}: {root}")
-        local: list[tuple[Path, str, int]] = []
-        for lexical_path in root.rglob("step_*"):
-            match = STEP_RE.fullmatch(lexical_path.name)
-            if match is None or not lexical_path.is_dir():
-                continue
-            resolved = lexical_path.resolve()
-            if not _is_relative_to(resolved, root) or not _is_relative_to(resolved, allowed):
-                raise ShardConfigError(f"checkpoint escapes its root: {lexical_path}")
-            if resolved in seen:
-                raise ShardConfigError(f"duplicate checkpoint directory: {resolved}")
-            seen.add(resolved)
-            relative = lexical_path.relative_to(repo).as_posix()
-            local.append((resolved, relative, int(match.group(1))))
-        local.sort(key=lambda item: (str(Path(item[1]).parent), item[2], item[1]))
+    seen_roots: set[Path] = set()
+    seen_checkpoints: set[Path] = set()
+    for raw_root, (architecture, expected_steps) in zip(
+        checkpoint_roots, EXPECTED_RUN_MATRIX
+    ):
+        root, training_base = _resolve_training_run_root(
+            repo, raw_root, architecture
+        )
+        if root in seen_roots:
+            raise ShardConfigError(f"duplicate run-specific root: {root}")
+        seen_roots.add(root)
+        local = _validate_training_completion_barrier(
+            repo, root, training_base, architecture, expected_steps
+        )
+        for checkpoint, _relative, _step in local:
+            if checkpoint in seen_checkpoints:
+                raise ShardConfigError(
+                    f"duplicate portable checkpoint directory: {checkpoint}"
+                )
+            seen_checkpoints.add(checkpoint)
         ordered.extend(local)
-    if not ordered:
-        raise ShardConfigError("no step_<number> checkpoint directories were discovered")
+
+    expected_total = EXPECTED_CHECKPOINT_COUNT
+    if len(ordered) != expected_total:
+        raise ShardConfigError(
+            f"checkpoint barrier expected {expected_total} targets, got {len(ordered)}"
+        )
     return [
         ShardTarget(ordinal, path, relative, step)
         for ordinal, (path, relative, step) in enumerate(ordered)
@@ -361,10 +808,16 @@ def _matches_current_checkpoint_and_yaml(
         return False
     repo = repo_root.expanduser().resolve()
     checkpoint = (repo / relative_path).resolve()
-    allowed_checkpoint_root = (repo / ".runs/stage3_humanoidarena").resolve()
+    allowed_checkpoint_roots = tuple(
+        (repo / ".runs" / name).resolve()
+        for name in ALLOWED_TRAINING_ROOT_NAMES
+    )
     if (
         not checkpoint.is_dir()
-        or not _is_relative_to(checkpoint, allowed_checkpoint_root)
+        or not any(
+            _is_relative_to(checkpoint, allowed_root)
+            for allowed_root in allowed_checkpoint_roots
+        )
         or checkpoint_payload.get("relative_path") != relative_path
     ):
         return False
@@ -375,19 +828,48 @@ def _matches_current_checkpoint_and_yaml(
             if (checkpoint / name).is_file()
             and _is_relative_to((checkpoint / name).resolve(), checkpoint)
         }
-    except OSError:
+        current_publication = _validate_portable_checkpoint_publication(
+            checkpoint,
+            architecture=checkpoint.parts[-5],
+            step=int(checkpoint.name.removeprefix("step_")),
+            run_id=checkpoint.parent.name,
+        )
+    except (OSError, ShardConfigError, ValueError):
         return False
     if (
         set(current_files) != set(REQUIRED_CHECKPOINT_FILES)
         or checkpoint_payload.get("files") != current_files
         or checkpoint_payload.get("checkpoint_sha256")
         != _canonical_sha256(current_files)
+        or checkpoint_payload.get("portable_publication")
+        != current_publication
     ):
         return False
     config_payload = _json_object(checkpoint / "config.json")
     config = config_payload.get("config") if isinstance(config_payload, dict) else None
     metadata = config_payload.get("metadata") if isinstance(config_payload, dict) else None
     if not isinstance(config, dict) or not isinstance(metadata, dict):
+        return False
+    expected_architecture = checkpoint.parts[-5]
+    current_architecture = str(
+        config.get("model_architecture", "qwenpi_v3") or "qwenpi_v3"
+    )
+    current_action_horizon = config.get("action_horizon", 50)
+    current_num_inference_steps = config.get("num_inference_steps", 4)
+    if (
+        checkpoint_payload.get("model_architecture")
+        != current_architecture
+        or checkpoint_payload.get("model_architecture") != expected_architecture
+        or checkpoint_payload.get("action_horizon")
+        != current_action_horizon
+        or checkpoint_payload.get("action_horizon") != 50
+        or checkpoint_payload.get("num_inference_steps")
+        != current_num_inference_steps
+        or type(current_num_inference_steps) is not int
+        or current_num_inference_steps <= 0
+        or type(checkpoint_payload.get("num_inference_steps")) is not int
+        or checkpoint_payload["num_inference_steps"] <= 0
+    ):
         return False
     qwen_raw = config.get("base_vlm_path") or metadata.get("model_name_or_path")
     if not isinstance(qwen_raw, str) or not qwen_raw or "://" in qwen_raw:
@@ -442,8 +924,9 @@ def _matches_current_source_inventory(
             "wrapper_semantics_digest",
             "huge_sources",
             "task_yaml",
-            "checkpoint_files",
-            "sonic_assets",
+                "checkpoint_files",
+                "checkpoint_publication",
+                "sonic_assets",
             "qwen_assets",
             "qwen_assets_digest",
         }
@@ -472,6 +955,10 @@ def _matches_current_source_inventory(
     if files.get("task_yaml") != {
         yaml_payload.get("path"): yaml_payload.get("sha256")
     } or files.get("checkpoint_files") != checkpoint_payload.get("files"):
+        return False
+    if files.get("checkpoint_publication") != checkpoint_payload.get(
+        "portable_publication"
+    ):
         return False
     qwen_raw = checkpoint_payload.get("qwen_path")
     if not isinstance(qwen_raw, str):
@@ -515,6 +1002,220 @@ def _matches_current_source_inventory(
     )
 
 
+def _requested_gpu_topology() -> tuple[tuple[int, ...], int, float] | None:
+    raw_count = os.environ.get("HUGE_EVAL_GPU_COUNT", "")
+    raw_ids = os.environ.get("HUGE_EVAL_GPU_LOGICAL_IDS", "")
+    if raw_count and raw_ids:
+        return None
+    try:
+        if raw_count:
+            count = int(raw_count)
+            if count < 1:
+                return None
+            ordinals = tuple(range(count))
+        elif raw_ids:
+            parsed = tuple(
+                int(token.strip())
+                for token in raw_ids.split(",")
+                if token.strip()
+            )
+            if (
+                not parsed
+                or len(set(parsed)) != len(parsed)
+                or any(ordinal < 0 for ordinal in parsed)
+            ):
+                return None
+            ordinals = parsed
+        else:
+            ordinals = tuple(range(8))
+        workers_per_gpu = int(
+            os.environ.get("HUGE_EVAL_WORKERS_PER_GPU", "1")
+        )
+        min_free_gib = float(
+            os.environ.get("HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB", "0")
+        )
+    except ValueError:
+        return None
+    if (
+        workers_per_gpu not in {1, 2}
+        or not math.isfinite(min_free_gib)
+        or min_free_gib < 0.0
+        or (workers_per_gpu == 2 and min_free_gib <= 0.0)
+    ):
+        return None
+    return ordinals, workers_per_gpu, min_free_gib
+
+
+def _matches_requested_gpu_bindings(
+    bindings: Any,
+    ordinals: Sequence[int],
+    workers_per_gpu: int,
+) -> bool:
+    if (
+        not isinstance(bindings, list)
+        or len(bindings) != len(ordinals) * workers_per_gpu
+    ):
+        return False
+    expected_gpu_keys = {
+        "parent_logical_ordinal",
+        "child_cuda_visible_token",
+        "cuda_uuid",
+        "pci_bus_id",
+        "device_name",
+        "total_memory_bytes",
+        "compute_capability",
+        "free_memory_bytes",
+    }
+    per_parent: dict[int, list[tuple[int, int, dict[str, Any]]]] = {}
+    for binding in bindings:
+        if not isinstance(binding, dict) or set(binding) != {
+            "gpu",
+            "renderer_ordinal",
+            "worker_slot",
+        }:
+            return False
+        gpu = binding.get("gpu")
+        renderer = binding.get("renderer_ordinal")
+        worker_slot = binding.get("worker_slot")
+        if (
+            not isinstance(gpu, dict)
+            or set(gpu) != expected_gpu_keys
+            or type(renderer) is not int
+            or renderer < 0
+            or type(worker_slot) is not int
+            or not 0 <= worker_slot < workers_per_gpu
+        ):
+            return False
+        ordinal = gpu.get("parent_logical_ordinal")
+        uuid = gpu.get("cuda_uuid")
+        if (
+            type(ordinal) is not int
+            or ordinal not in ordinals
+            or not isinstance(uuid, str)
+            or re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid, re.IGNORECASE)
+            is None
+            or gpu.get("child_cuda_visible_token") != uuid
+            or not isinstance(gpu.get("pci_bus_id"), str)
+            or not gpu["pci_bus_id"]
+            or not isinstance(gpu.get("device_name"), str)
+            or not gpu["device_name"]
+            or type(gpu.get("total_memory_bytes")) is not int
+            or gpu["total_memory_bytes"] <= 0
+            or not isinstance(gpu.get("compute_capability"), str)
+            or re.fullmatch(r"[0-9]+[.][0-9]+", gpu["compute_capability"])
+            is None
+            or gpu.get("free_memory_bytes") is not None
+        ):
+            return False
+        per_parent.setdefault(ordinal, []).append(
+            (worker_slot, renderer, gpu)
+        )
+
+    if set(per_parent) != set(ordinals):
+        return False
+    physical_uuids: set[str] = set()
+    physical_pcis: set[str] = set()
+    physical_renderers: set[int] = set()
+    for ordinal in ordinals:
+        rows = per_parent[ordinal]
+        if len(rows) != workers_per_gpu:
+            return False
+        first_gpu = rows[0][2]
+        renderer_values = {renderer for _slot, renderer, _gpu in rows}
+        if (
+            {slot for slot, _renderer, _gpu in rows}
+            != set(range(workers_per_gpu))
+            or len(renderer_values) != 1
+            or any(
+                not _strict_json_equal(gpu, first_gpu)
+                for _slot, _renderer, gpu in rows[1:]
+            )
+        ):
+            return False
+        uuid = str(first_gpu["cuda_uuid"]).upper()
+        pci = str(first_gpu["pci_bus_id"]).upper()
+        renderer = next(iter(renderer_values))
+        if (
+            uuid in physical_uuids
+            or pci in physical_pcis
+            or renderer in physical_renderers
+        ):
+            return False
+        physical_uuids.add(uuid)
+        physical_pcis.add(pci)
+        physical_renderers.add(renderer)
+    return (
+        len(physical_uuids)
+        == len(physical_pcis)
+        == len(physical_renderers)
+        == len(ordinals)
+    )
+
+
+def _current_host_fingerprint() -> str:
+    machine_id = ""
+    try:
+        machine_id = Path("/etc/machine-id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        pass
+    return _canonical_sha256(
+        {
+            "hostname": platform.node(),
+            "machine_id": machine_id,
+            "machine": platform.machine(),
+        }
+    )
+
+
+def _current_root_software(repo_root: Path) -> dict[str, Any] | None:
+    repo = repo_root.expanduser().resolve()
+    try:
+        if Path(sys.prefix).resolve(strict=True) != (repo / ".venv").resolve():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    packages: dict[str, str | None] = {}
+    for distribution in ROOT_SOFTWARE_PACKAGES:
+        try:
+            packages[distribution] = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError:
+            packages[distribution] = None
+    return {
+        "schema_version": ROOT_SOFTWARE_SCHEMA_VERSION,
+        "interpreter": ".venv/bin/python",
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "packages": packages,
+    }
+
+
+def _contract_execution_host_is_current(
+    contract: Mapping[str, Any],
+) -> bool:
+    static_plan = contract.get("static_plan")
+    policy = (
+        static_plan.get("policy")
+        if isinstance(static_plan, dict)
+        else None
+    )
+    kit_path_raw = (
+        policy.get("kit_gpu_map_file")
+        if isinstance(policy, dict)
+        else None
+    )
+    if not isinstance(kit_path_raw, str):
+        return False
+    kit_payload = _json_object(Path(kit_path_raw).expanduser().resolve())
+    return (
+        isinstance(kit_payload, dict)
+        and kit_payload.get("host_fingerprint")
+        == _current_host_fingerprint()
+    )
+
+
 def _matches_current_executable_contract(
     contract: Mapping[str, Any],
     repo_root: Path,
@@ -540,6 +1241,7 @@ def _matches_current_executable_contract(
             "policy",
             "protocol",
             "episode_seed_algorithm",
+            "model_noise_seed_algorithm",
             "episodes",
             "source_inventory",
             "upstream_contract",
@@ -574,6 +1276,10 @@ def _matches_current_executable_contract(
             "checkpoint_sha256",
             "files",
             "qwen_path",
+            "model_architecture",
+            "action_horizon",
+            "num_inference_steps",
+            "portable_publication",
         }
         or not isinstance(yaml_config, dict)
         or set(yaml_config)
@@ -599,7 +1305,11 @@ def _matches_current_executable_contract(
         "effective_persistent_sim": False,
         "simulator_process_scope": "per_episode_v1",
         "model_io_schema": "huge_humanoidarena_model_io_trace_v1",
+        "model_io_trace_policy": MODEL_IO_TRACE_POLICY,
         "max_steps": EXPECTED_MAX_STEPS,
+        "post_termination_record_steps": 10,
+        "record_video_every_n": 1,
+        "episode_max_retries": 1,
         "headless": True,
         "enable_depth": False,
         "robot_type": "unitree_g1_refpose_v3_1",
@@ -612,15 +1322,15 @@ def _matches_current_executable_contract(
     }
     if any(policy.get(key) != value for key, value in required_policy.items()):
         return False
+    requested_topology = _requested_gpu_topology()
+    if requested_topology is None:
+        return False
+    requested_ordinals, requested_workers_per_gpu, requested_min_free_gib = (
+        requested_topology
+    )
     try:
         current_policy = {
             "video_fps": int(os.environ.get("VIDEO_FPS", "30")),
-            "post_termination_record_steps": int(
-                os.environ.get("POST_TERMINATION_RECORD_STEPS", "10")
-            ),
-            "record_video_every_n": int(
-                os.environ.get("HUGE_EVAL_RECORD_VIDEO_EVERY_N", "1")
-            ),
             "step_log_every_n": int(
                 os.environ.get("HUGE_EVAL_STEP_LOG_EVERY_N", "100")
             ),
@@ -633,32 +1343,36 @@ def _matches_current_executable_contract(
             "episode_timeout_sec": float(
                 os.environ.get("HUGE_EVAL_EPISODE_TIMEOUT_SEC", "900")
             ),
-            "episode_max_retries": int(
-                os.environ.get("HUGE_EVAL_EPISODE_MAX_RETRIES", "5")
-            ),
             "retry_backoff_sec": float(
                 os.environ.get("HUGE_EVAL_RETRY_BACKOFF_SEC", "5")
             ),
-            "workers_per_gpu": int(
-                os.environ.get("HUGE_EVAL_WORKERS_PER_GPU", "1")
+            "workers_per_gpu": requested_workers_per_gpu,
+            "max_concurrent_shadow_startups": int(
+                os.environ.get("HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS", "2")
             ),
+            "min_free_gpu_memory_gib": requested_min_free_gib,
         }
     except ValueError:
         return False
+    if current_policy["max_concurrent_shadow_startups"] < 1:
+        return False
     if any(policy.get(key) != value for key, value in current_policy.items()):
         return False
-    if static_plan.get("protocol") != {
-        "http": "huge_humanoidarena_http_v1",
-        "mapping": "humanoidarena_rotlocal_v31_to_huge_proprio_v1",
-        "action": [50, 66],
-        "latent": [50, 64],
-    } or static_plan.get("episode_seed_algorithm") != EPISODE_SEED_FORMULA:
+    if (
+        static_plan.get("protocol")
+        != {
+            "http": "huge_humanoidarena_http_v1",
+            "mapping": "humanoidarena_rotlocal_v31_to_huge_proprio_v1",
+            "action": [50, 66],
+            "latent": [50, 64],
+        }
+        or static_plan.get("episode_seed_algorithm") != EPISODE_SEED_FORMULA
+        or static_plan.get("model_noise_seed_algorithm")
+        != MODEL_NOISE_SEED_ALGORITHM
+    ):
         return False
     software = static_plan.get("software")
-    if software != {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-    }:
+    if software != _current_root_software(repo_root):
         return False
     repo = repo_root.expanduser().resolve()
     upstream_path = (
@@ -698,57 +1412,11 @@ def _matches_current_executable_contract(
             return False
     except OSError:
         return False
-    bindings = contract.get("gpu_bindings")
-    if not isinstance(bindings, list) or len(bindings) != 8:
-        return False
-    identities: set[tuple[int, int]] = set()
-    renderers: set[int] = set()
-    for binding in bindings:
-        if not isinstance(binding, dict) or set(binding) != {
-            "gpu",
-            "renderer_ordinal",
-            "worker_slot",
-        }:
-            return False
-        gpu = binding.get("gpu")
-        renderer = binding.get("renderer_ordinal")
-        worker_slot = binding.get("worker_slot")
-        if (
-            not isinstance(gpu, dict)
-            or set(gpu)
-            != {
-                "parent_logical_ordinal",
-                "child_cuda_visible_token",
-                "cuda_uuid",
-                "pci_bus_id",
-                "device_name",
-                "total_memory_bytes",
-                "compute_capability",
-                "free_memory_bytes",
-            }
-            or type(renderer) is not int
-            or renderer < 0
-            or worker_slot != 0
-        ):
-            return False
-        ordinal = gpu.get("parent_logical_ordinal")
-        if (
-            type(ordinal) is not int
-            or ordinal < 0
-            or not isinstance(gpu.get("cuda_uuid"), str)
-            or re.fullmatch(r"GPU-[A-Za-z0-9-]+", gpu["cuda_uuid"], re.IGNORECASE)
-            is None
-            or type(gpu.get("total_memory_bytes")) is not int
-            or gpu["total_memory_bytes"] <= 0
-            or (
-                gpu.get("free_memory_bytes") is not None
-                and type(gpu.get("free_memory_bytes")) is not int
-            )
-        ):
-            return False
-        identities.add((ordinal, worker_slot))
-        renderers.add(renderer)
-    return identities == {(ordinal, 0) for ordinal in range(8)} and len(renderers) == 8
+    return _matches_requested_gpu_bindings(
+        contract.get("gpu_bindings"),
+        requested_ordinals,
+        requested_workers_per_gpu,
+    )
 
 
 def _matches_full_pp_box_contract(
@@ -903,13 +1571,384 @@ def _matches_summary_totals(summary: Mapping[str, Any]) -> bool:
     return seed_successes == numerator
 
 
+def _valid_model_io_calls(
+    attempt: Path,
+    session_directory: Path,
+    manifest: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    trace_session_id: str,
+    episode_seed: int,
+    seeded_generation: int,
+    record_count: int,
+) -> int | None:
+    calls = manifest.get("calls")
+    if not isinstance(calls, list) or len(calls) != record_count:
+        return None
+    if not _is_owned_attempt_path(attempt, session_directory, directory=True):
+        return None
+    expected_names = {"manifest.json", "_SUCCESS"}
+    expected_names.update(
+        f"call-{index:06d}.{suffix}"
+        for index in range(1, record_count + 1)
+        for suffix in ("json", "npz")
+    )
+    try:
+        if {entry.name for entry in session_directory.iterdir()} != expected_names:
+            return None
+    except OSError:
+        return None
+    call_keys = {
+        "trace_call_index",
+        "http_response_sequence",
+        "reset_generation",
+        "json_relative_path",
+        "json_bytes",
+        "json_sha256",
+        "npz_relative_path",
+        "npz_bytes",
+        "npz_sha256",
+    }
+    call_payload_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "task",
+        "checkpoint_sha256",
+        "contract_hash",
+        "source_inventory_digest",
+        "model_architecture",
+        "action_horizon",
+        "num_inference_steps",
+        "mapping_version",
+        "trace_session_id",
+        "episode_seed",
+        "seeded_reset_generation",
+        "reset_generation",
+        "trace_call_index",
+        "http_response_sequence",
+        "model_inputs",
+        "model_output",
+        "preprocessing_provenance",
+        "wire_provenance",
+        "compatibility_only_excluded",
+        "npz_relative_path",
+        "npz_bytes",
+        "npz_sha256",
+        "created_at",
+    }
+    total_call_bytes = 0
+    previous_http_sequence = 0
+    for expected_index, entry in enumerate(calls, start=1):
+        expected_json_name = f"call-{expected_index:06d}.json"
+        expected_npz_name = f"call-{expected_index:06d}.npz"
+        if not isinstance(entry, dict) or set(entry) != call_keys:
+            return None
+        http_sequence = entry.get("http_response_sequence")
+        reset_generation = entry.get("reset_generation")
+        json_size = entry.get("json_bytes")
+        npz_size = entry.get("npz_bytes")
+        json_digest = entry.get("json_sha256")
+        npz_digest = entry.get("npz_sha256")
+        if (
+            entry.get("trace_call_index") != expected_index
+            or type(http_sequence) is not int
+            or http_sequence <= previous_http_sequence
+            or type(reset_generation) is not int
+            or reset_generation < 1
+            or entry.get("json_relative_path") != expected_json_name
+            or entry.get("npz_relative_path") != expected_npz_name
+            or type(json_size) is not int
+            or json_size <= 0
+            or type(npz_size) is not int
+            or npz_size <= 0
+            or not isinstance(json_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", json_digest) is None
+            or not isinstance(npz_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", npz_digest) is None
+        ):
+            return None
+        previous_http_sequence = http_sequence
+        json_path = session_directory / expected_json_name
+        npz_path = session_directory / expected_npz_name
+        if (
+            not _is_owned_attempt_path(attempt, json_path, directory=False)
+            or not _is_owned_attempt_path(attempt, npz_path, directory=False)
+        ):
+            return None
+        try:
+            raw_json = json_path.read_bytes()
+            call_payload = json.loads(raw_json)
+            if (
+                json_path.stat().st_size != json_size
+                or npz_path.stat().st_size != npz_size
+                or _sha256_file(json_path) != json_digest
+                or _sha256_file(npz_path) != npz_digest
+            ):
+                return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(call_payload, dict)
+            or set(call_payload) != call_payload_keys
+            or raw_json != _canonical_json_bytes(call_payload) + b"\n"
+            or call_payload.get("schema_version") != MODEL_IO_TRACE_SCHEMA_VERSION
+            or any(call_payload.get(key) != value for key, value in context.items())
+            or call_payload.get("trace_session_id") != trace_session_id
+            or call_payload.get("episode_seed") != episode_seed
+            or call_payload.get("seeded_reset_generation") != seeded_generation
+            or call_payload.get("trace_call_index") != expected_index
+            or call_payload.get("http_response_sequence") != http_sequence
+            or call_payload.get("reset_generation") != reset_generation
+            or call_payload.get("npz_relative_path") != expected_npz_name
+            or call_payload.get("npz_bytes") != npz_size
+            or call_payload.get("npz_sha256") != npz_digest
+            or not isinstance(call_payload.get("created_at"), str)
+            or not call_payload["created_at"]
+        ):
+            return None
+        total_call_bytes += json_size + npz_size
+    expected_last_sequence = previous_http_sequence if calls else 0
+    if manifest.get("last_http_response_sequence") != expected_last_sequence:
+        return None
+    return total_call_bytes
+
+
+def _valid_model_io_artifact(
+    attempt: Path,
+    contract: Mapping[str, Any],
+    job: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    worker_id: str,
+    artifact: Any,
+) -> bool:
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "receipt",
+        "manifest",
+        "success_marker",
+    }:
+        return False
+    receipt = artifact.get("receipt")
+    receipt_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "trace_session_id",
+        "result_identity",
+        "episode_seed",
+        "seeded_reset_generation",
+        "outcome_sha256",
+        "record_count",
+        "last_trace_call_index",
+        "last_http_response_sequence",
+        "trace_status",
+        "manifest_relative_path",
+        "manifest_sha256",
+        "success_marker_relative_path",
+        "total_bytes",
+        "error",
+    }
+    outcome_sha256 = _canonical_sha256(payload)
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != receipt_keys
+        or receipt.get("schema_version") != MODEL_IO_RECEIPT_SCHEMA_VERSION
+        or receipt.get("run_id") != attempt.name
+        or receipt.get("worker_id") != worker_id
+        or receipt.get("result_identity") != job.get("result_identity")
+        or receipt.get("episode_seed") != job.get("episode_seed")
+        or receipt.get("outcome_sha256") != outcome_sha256
+        or receipt.get("trace_status") != "complete"
+        or receipt.get("error") is not None
+    ):
+        return False
+    trace_session_id = receipt.get("trace_session_id")
+    seeded_generation = receipt.get("seeded_reset_generation")
+    record_count = receipt.get("record_count")
+    last_trace_call_index = receipt.get("last_trace_call_index")
+    last_http_response_sequence = receipt.get("last_http_response_sequence")
+    total_bytes = receipt.get("total_bytes")
+    if (
+        not isinstance(trace_session_id, str)
+        or re.fullmatch(r"[a-f0-9]{32}", trace_session_id) is None
+        or type(seeded_generation) is not int
+        or seeded_generation < 1
+        or type(record_count) is not int
+        or record_count < 0
+        or type(last_trace_call_index) is not int
+        or last_trace_call_index != record_count
+        or type(last_http_response_sequence) is not int
+        or last_http_response_sequence < 0
+        or type(total_bytes) is not int
+        or total_bytes <= 0
+    ):
+        return False
+    manifest_relative = (
+        f"model_io/{worker_id}/session-{trace_session_id}/manifest.json"
+    )
+    marker_relative = f"model_io/{worker_id}/session-{trace_session_id}/_SUCCESS"
+    if (
+        receipt.get("manifest_relative_path") != manifest_relative
+        or receipt.get("success_marker_relative_path") != marker_relative
+    ):
+        return False
+    manifest_path = attempt / manifest_relative
+    marker_path = attempt / marker_relative
+    if (
+        not _is_owned_attempt_path(attempt, manifest_path, directory=False)
+        or not _is_owned_attempt_path(attempt, marker_path, directory=False)
+    ):
+        return False
+    try:
+        manifest_sha256 = _sha256_file(manifest_path)
+        marker_sha256 = _sha256_file(marker_path)
+    except OSError:
+        return False
+    if receipt.get("manifest_sha256") != manifest_sha256:
+        return False
+    expected_recorded_manifest = {
+        "path": str(manifest_path.resolve()),
+        "sha256": manifest_sha256,
+    }
+    expected_recorded_marker = {
+        "path": str(marker_path.resolve()),
+        "sha256": marker_sha256,
+    }
+    if (
+        artifact.get("manifest") != expected_recorded_manifest
+        or artifact.get("success_marker") != expected_recorded_marker
+    ):
+        return False
+    manifest = _json_object(manifest_path)
+    marker = _json_object(marker_path)
+    static_plan = contract.get("static_plan")
+    checkpoint = static_plan.get("checkpoint") if isinstance(static_plan, dict) else None
+    source_inventory = (
+        static_plan.get("source_inventory") if isinstance(static_plan, dict) else None
+    )
+    task = static_plan.get("task") if isinstance(static_plan, dict) else None
+    protocol = static_plan.get("protocol") if isinstance(static_plan, dict) else None
+    if (
+        manifest is None
+        or marker is None
+        or not isinstance(checkpoint, dict)
+        or not isinstance(source_inventory, dict)
+        or not isinstance(task, dict)
+        or not isinstance(protocol, dict)
+    ):
+        return False
+    context = {
+        "run_id": attempt.name,
+        "worker_id": worker_id,
+        "task": task.get("cli_task"),
+        "checkpoint_sha256": checkpoint.get("checkpoint_sha256"),
+        "contract_hash": _canonical_sha256(contract),
+        "source_inventory_digest": source_inventory.get(
+            "source_inventory_digest"
+        ),
+        "model_architecture": checkpoint.get("model_architecture"),
+        "action_horizon": checkpoint.get("action_horizon"),
+        "num_inference_steps": checkpoint.get("num_inference_steps"),
+        "mapping_version": protocol.get("mapping"),
+    }
+    manifest_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "task",
+        "checkpoint_sha256",
+        "contract_hash",
+        "source_inventory_digest",
+        "model_architecture",
+        "action_horizon",
+        "num_inference_steps",
+        "mapping_version",
+        "trace_session_id",
+        "episode_seed",
+        "seeded_reset_generation",
+        "result_identity",
+        "outcome_sha256",
+        "record_count",
+        "last_trace_call_index",
+        "last_http_response_sequence",
+        "trace_status",
+        "degraded_reasons",
+        "calls",
+        "error",
+        "created_at",
+    }
+    if (
+        set(manifest) != manifest_keys
+        or manifest.get("schema_version") != MODEL_IO_TRACE_SCHEMA_VERSION
+        or any(manifest.get(key) != value for key, value in context.items())
+        or manifest.get("trace_session_id") != trace_session_id
+        or manifest.get("episode_seed") != job.get("episode_seed")
+        or manifest.get("seeded_reset_generation") != seeded_generation
+        or manifest.get("result_identity") != job.get("result_identity")
+        or manifest.get("outcome_sha256") != outcome_sha256
+        or manifest.get("record_count") != record_count
+        or manifest.get("last_trace_call_index") != last_trace_call_index
+        or manifest.get("last_http_response_sequence")
+        != last_http_response_sequence
+        or manifest.get("trace_status") != "complete"
+        or manifest.get("degraded_reasons") != []
+        or manifest.get("error") is not None
+        or not isinstance(manifest.get("calls"), list)
+        or len(manifest["calls"]) != record_count
+        or not isinstance(manifest.get("created_at"), str)
+        or not manifest["created_at"]
+    ):
+        return False
+    expected_marker = {
+        "schema_version": MODEL_IO_RECEIPT_SCHEMA_VERSION,
+        "trace_session_id": trace_session_id,
+        "manifest_relative_path": manifest_relative,
+        "manifest_sha256": manifest_sha256,
+    }
+    if marker != expected_marker:
+        return False
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        marker_bytes = marker_path.read_bytes()
+        if (
+            manifest_bytes != _canonical_json_bytes(manifest) + b"\n"
+            or marker_bytes != _canonical_json_bytes(marker) + b"\n"
+        ):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    call_bytes = _valid_model_io_calls(
+        attempt,
+        manifest_path.parent,
+        manifest,
+        context,
+        trace_session_id=trace_session_id,
+        episode_seed=job.get("episode_seed"),
+        seeded_generation=seeded_generation,
+        record_count=record_count,
+    )
+    return (
+        call_bytes is not None
+        and total_bytes == call_bytes + len(manifest_bytes) + len(marker_bytes)
+    )
+
+
 def _canonical_episode_metrics(
     attempt: Path,
     contract: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     static_plan = contract.get("static_plan")
     jobs = static_plan.get("episodes") if isinstance(static_plan, dict) else None
-    if not isinstance(jobs, list) or not jobs:
+    policy = static_plan.get("policy") if isinstance(static_plan, dict) else None
+    record_video_every_n = (
+        policy.get("record_video_every_n") if isinstance(policy, dict) else None
+    )
+    if (
+        not isinstance(jobs, list)
+        or not jobs
+        or type(record_video_every_n) is not int
+        or record_video_every_n < 0
+    ):
         return None
     expected_job_keys = {
         "task_cli",
@@ -995,6 +2034,12 @@ def _canonical_episode_metrics(
             is None
         ):
             return None
+        completion_path = attempt / "completions" / filename
+        if (
+            not _is_owned_attempt_path(attempt, completion_path, directory=False)
+            or episode.get("completion_sha256") != _sha256_file(completion_path)
+        ):
+            return None
         payload = episode.get("payload")
         artifacts = episode.get("artifacts")
         if not isinstance(payload, dict) or not isinstance(artifacts, dict):
@@ -1046,31 +2091,53 @@ def _canonical_episode_metrics(
         video_path_raw = payload.get("video_path")
         if not isinstance(video_recorded, bool) or not isinstance(video_path_raw, str):
             return None
-        if video_recorded:
-            video = artifacts.get("video")
-            if not isinstance(video, dict) or set(artifacts) != {"video"} or set(video) != {
-                "path",
-                "sha256",
-            }:
+        if classification == "task_complete":
+            requires_video = (
+                record_video_every_n > 0
+                and job["episode_index"] % record_video_every_n == 0
+            )
+            expected_artifacts = (
+                {"video", "model_io"} if requires_video else {"model_io"}
+            )
+            if set(artifacts) != expected_artifacts:
                 return None
-            artifact_path_raw = video.get("path")
-            if not isinstance(artifact_path_raw, str):
+            if requires_video:
+                video = artifacts.get("video")
+                if (
+                    video_recorded is not True
+                    or not video_path_raw
+                    or not isinstance(video, dict)
+                    or set(video) != {"path", "sha256"}
+                ):
+                    return None
+                artifact_path_raw = video.get("path")
+                if not isinstance(artifact_path_raw, str):
+                    return None
+                try:
+                    video_path = Path(video_path_raw).expanduser().resolve()
+                    artifact_path = Path(artifact_path_raw).expanduser().resolve()
+                except (OSError, RuntimeError):
+                    return None
+                if (
+                    video_path != artifact_path
+                    or not _is_relative_to(video_path, attempt_root)
+                    or not video_path.is_file()
+                    or video_path.is_symlink()
+                    or video.get("sha256") != _sha256_file(video_path)
+                ):
+                    return None
+            elif video_recorded is not False or video_path_raw != "":
                 return None
-            try:
-                video_path = Path(video_path_raw).expanduser().resolve()
-                artifact_path = Path(artifact_path_raw).expanduser().resolve()
-            except (OSError, RuntimeError):
-                return None
-            if (
-                not video_path_raw
-                or video_path != artifact_path
-                or not _is_relative_to(video_path, attempt_root)
-                or not video_path.is_file()
-                or video_path.is_symlink()
-                or video.get("sha256") != _sha256_file(video_path)
+            if not _valid_model_io_artifact(
+                attempt,
+                contract,
+                job,
+                payload,
+                episode["worker_id"],
+                artifacts.get("model_io"),
             ):
                 return None
-        elif artifacts != {} or video_path_raw != "":
+        elif video_recorded is not False or artifacts != {} or video_path_raw != "":
             return None
         if success:
             successes += 1
@@ -1327,6 +2394,7 @@ def _select_resumable_attempt(
         "completed_with_failures",
         "failed",
         "interrupted",
+        "unsafe_cleanup",
     }
     if (
         manifest is None
@@ -1339,35 +2407,52 @@ def _select_resumable_attempt(
     return candidate
 
 
-def completed_checkpoint_paths(
+def checkpoint_contract_statuses(
     eval_root: Path,
     candidate_relative_paths: set[str],
     *,
     allowed_root: Path | None = None,
     repo_root: Path | None = None,
-) -> set[str]:
+) -> dict[str, CheckpointContractStatus]:
     root = eval_root.expanduser().resolve()
     if allowed_root is not None:
         allowed = allowed_root.expanduser().resolve()
         if not _is_relative_to(root, allowed):
             raise ShardConfigError(f"evaluation root escapes {allowed}: {root}")
+    statuses = {
+        relative: CheckpointContractStatus("pending")
+        for relative in candidate_relative_paths
+    }
     if not root.exists():
-        return set()
+        return statuses
     if not root.is_dir():
         raise ShardConfigError(f"evaluation root is not a directory: {root}")
-    selected_outcomes: dict[str, list[tuple[str, bool]]] = {}
-    blocked: set[str] = set()
+
+    candidates: dict[str, list[ContractCandidate]] = {}
     for raw_contract_path in root.glob("**/contract.json"):
         contract_path = raw_contract_path.resolve()
         if not _is_relative_to(contract_path, root):
-            raise ShardConfigError(f"evaluation contract escapes {root}: {raw_contract_path}")
+            raise ShardConfigError(
+                f"evaluation contract escapes {root}: {raw_contract_path}"
+            )
         contract = _json_object(contract_path)
         if contract is None:
             continue
         static_plan = contract.get("static_plan")
-        checkpoint = static_plan.get("checkpoint") if isinstance(static_plan, dict) else None
-        relative = checkpoint.get("relative_path") if isinstance(checkpoint, dict) else None
-        if not isinstance(relative, str) or relative not in candidate_relative_paths:
+        checkpoint = (
+            static_plan.get("checkpoint")
+            if isinstance(static_plan, dict)
+            else None
+        )
+        relative = (
+            checkpoint.get("relative_path")
+            if isinstance(checkpoint, dict)
+            else None
+        )
+        if (
+            not isinstance(relative, str)
+            or relative not in candidate_relative_paths
+        ):
             continue
         try:
             contract_matches = _matches_full_pp_box_contract(
@@ -1377,49 +2462,125 @@ def completed_checkpoint_paths(
             contract_matches = False
         if not contract_matches:
             continue
+        policy = (
+            static_plan.get("policy")
+            if isinstance(static_plan, dict)
+            else None
+        )
+        recorded_output_root = (
+            policy.get("output_root")
+            if isinstance(policy, dict)
+            else None
+        )
+        if (
+            not isinstance(recorded_output_root, str)
+            or Path(recorded_output_root).expanduser().resolve() != root
+        ):
+            raise ShardConfigError(
+                f"current contract output_root does not match its scan root: "
+                f"{contract_path}"
+            )
+
+        try:
+            contract_hash = _canonical_sha256(contract)
+        except (TypeError, ValueError) as exc:
+            raise ShardConfigError(
+                f"current evaluation contract is not canonical: {contract_path}"
+            ) from exc
+        expected_label = f"{EXPECTED_CHECKPOINT_TASK}-{Path(relative).name}"
+        if (
+            contract_path.parent.name != contract_hash[:16]
+            or contract_path.parent.parent.name != expected_label
+            or contract_path.parent.parent.parent.name != "pp_box"
+        ):
+            raise ShardConfigError(
+                f"current evaluation contract has an unsafe output identity: "
+                f"{contract_path}"
+            )
         if repo_root is not None:
-            expected_label = f"{EXPECTED_CHECKPOINT_TASK}-{Path(relative).name}"
-            if (
-                contract_path.parent.parent.name != expected_label
-                or contract_path.parent.parent.parent.name != "pp_box"
-            ):
-                blocked.add(relative)
-                continue
             recorded_inventory = _json_object(
                 contract_path.parent / "source_inventory.json"
             )
             if recorded_inventory != static_plan.get("source_inventory"):
-                blocked.add(relative)
-                continue
+                raise ShardConfigError(
+                    f"current contract source inventory sidecar drifted: "
+                    f"{contract_path}"
+                )
+
         attempts_root = (contract_path.parent / "attempts").resolve()
         if not _is_relative_to(attempts_root, root):
-            raise ShardConfigError(f"evaluation attempts escape {root}: {attempts_root}")
+            raise ShardConfigError(
+                f"evaluation attempts escape {root}: {attempts_root}"
+            )
+        if not attempts_root.exists():
+            continue
         if not attempts_root.is_dir():
-            blocked.add(relative)
-            continue
-        try:
-            contract_hash = _canonical_sha256(contract)
-        except (TypeError, ValueError):
-            continue
-        selected_attempt = _select_resumable_attempt(attempts_root, contract_hash)
+            raise ShardConfigError(
+                f"evaluation attempts path is not a directory: {attempts_root}"
+            )
+        selected_attempt = _select_resumable_attempt(
+            attempts_root, contract_hash
+        )
         if selected_attempt is None:
-            blocked.add(relative)
+            try:
+                entries = tuple(attempts_root.iterdir())
+            except OSError as exc:
+                raise ShardConfigError(
+                    f"cannot inspect evaluation attempts: {attempts_root}"
+                ) from exc
+            if entries:
+                raise ShardConfigError(
+                    f"latest attempt is not safely resumable: {attempts_root}"
+                )
             continue
+
+        manifest = _json_object(selected_attempt / "manifest.json")
+        if manifest is None:
+            raise ShardConfigError(
+                f"latest attempt manifest is invalid: {selected_attempt}"
+            )
+        manifest_state = manifest.get("state")
+        if manifest_state == "unsafe_cleanup":
+            raise ShardConfigError(
+                f"latest attempt requires manual unsafe-cleanup audit: "
+                f"{selected_attempt}"
+            )
         present_markers = [
             marker_name
             for marker_name in TERMINAL_MARKER_STATES
             if os.path.lexists(selected_attempt / marker_name)
         ]
-        if len(present_markers) != 1:
-            selected_outcomes.setdefault(relative, []).append(
-                (selected_attempt.name, False)
+        if len(present_markers) > 1:
+            raise ShardConfigError(
+                f"latest attempt has conflicting terminal markers: "
+                f"{selected_attempt}"
+            )
+        if not present_markers:
+            if manifest_state in {"success", "completed_with_failures"}:
+                raise ShardConfigError(
+                    f"latest terminal manifest lacks its marker: "
+                    f"{selected_attempt}"
+                )
+            candidates.setdefault(relative, []).append(
+                ContractCandidate(
+                    selected_attempt.name,
+                    contract_path,
+                    contract_hash,
+                    selected_attempt.resolve(),
+                    "pending",
+                )
             )
             continue
+
         marker = selected_attempt / present_markers[0]
-        if not _is_owned_attempt_path(selected_attempt, marker, directory=False):
+        if not _is_owned_attempt_path(
+            selected_attempt, marker, directory=False
+        ):
             raise ShardConfigError(
-                f"evaluation marker is unsafe for {selected_attempt.resolve()}: {marker}"
+                f"evaluation marker is unsafe for "
+                f"{selected_attempt.resolve()}: {marker}"
             )
+        expected_manifest_state = TERMINAL_MARKER_STATES[marker.name]
         terminal_valid = _valid_terminal_attempt(
             contract_path.parent,
             selected_attempt,
@@ -1429,17 +2590,80 @@ def completed_checkpoint_paths(
             repo_root=repo_root,
             contract_prevalidated=True,
         )
-        selected_outcomes.setdefault(relative, []).append(
-            (selected_attempt.name, terminal_valid)
+        if not terminal_valid or manifest_state != expected_manifest_state:
+            raise ShardConfigError(
+                f"latest terminal attempt is invalid: {selected_attempt}"
+            )
+        candidate_state = (
+            "success"
+            if marker.name == "_SUCCESS"
+            else (
+                "retry_required"
+                if _contract_execution_host_is_current(contract)
+                else "pending"
+            )
         )
-    completed: set[str] = set()
-    for relative, outcomes in selected_outcomes.items():
-        if relative in blocked:
+        candidates.setdefault(relative, []).append(
+            ContractCandidate(
+                selected_attempt.name,
+                contract_path,
+                contract_hash,
+                selected_attempt.resolve(),
+                candidate_state,
+            )
+        )
+
+    for relative, relative_candidates in candidates.items():
+        successful = [
+            candidate
+            for candidate in relative_candidates
+            if candidate.state == "success"
+        ]
+        if successful:
+            accepted = max(successful, key=lambda item: item.sort_key)
+            statuses[relative] = CheckpointContractStatus(
+                "completed",
+                str(accepted.contract_path),
+                accepted.contract_hash,
+                str(accepted.attempt_path),
+            )
             continue
-        _attempt_name, terminal_valid = max(outcomes, key=lambda item: item[0])
-        if terminal_valid:
-            completed.add(relative)
-    return completed
+        latest = max(relative_candidates, key=lambda item: item.sort_key)
+        if latest.state == "retry_required":
+            statuses[relative] = CheckpointContractStatus(
+                "retry_required",
+                str(latest.contract_path),
+                latest.contract_hash,
+                str(latest.attempt_path),
+            )
+        else:
+            statuses[relative] = CheckpointContractStatus(
+                "pending",
+                str(latest.contract_path),
+                latest.contract_hash,
+                str(latest.attempt_path),
+            )
+    return statuses
+
+
+def completed_checkpoint_paths(
+    eval_root: Path,
+    candidate_relative_paths: set[str],
+    *,
+    allowed_root: Path | None = None,
+    repo_root: Path | None = None,
+) -> set[str]:
+    statuses = checkpoint_contract_statuses(
+        eval_root,
+        candidate_relative_paths,
+        allowed_root=allowed_root,
+        repo_root=repo_root,
+    )
+    return {
+        relative
+        for relative, status in statuses.items()
+        if status.state == "completed"
+    }
 
 
 def select_pending_shard(
@@ -1462,6 +2686,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-root", required=True, type=Path)
     parser.add_argument("--shard-index", required=True, type=int)
     parser.add_argument("--shard-count", required=True, type=int)
+    parser.add_argument(
+        "--output-format",
+        choices=("paths", "actions", "jsonl"),
+        default="paths",
+    )
     parser.add_argument("checkpoint_roots", nargs="+", type=Path)
     return parser
 
@@ -1471,26 +2700,111 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         validate_shard(index=args.shard_index, count=args.shard_count)
         targets = discover_targets(args.repo_root, args.checkpoint_roots)
-        completed = completed_checkpoint_paths(
+        statuses = checkpoint_contract_statuses(
             args.eval_root, {target.relative_path for target in targets},
             allowed_root=args.repo_root / ".runs",
             repo_root=args.repo_root,
         )
+        completed = {
+            relative
+            for relative, status in statuses.items()
+            if status.state == "completed"
+        }
         selected = select_pending_shard(
             targets, completed, args.shard_index, args.shard_count
         )
     except ShardConfigError as exc:
         print(f"[run_ha_eval] configuration error: {exc}", file=sys.stderr)
         return 2
+    retry_required = {
+        relative
+        for relative, status in statuses.items()
+        if status.state == "retry_required"
+    }
     print(
         f"[run_ha_eval] shard={args.shard_index}/{args.shard_count} "
         f"total={len(targets)} completed={len(completed)} "
+        f"retry_required={len(retry_required)} "
         f"pending={len(targets) - len(completed)} assigned={len(selected)}",
         file=sys.stderr,
         flush=True,
     )
+    for target in targets:
+        status = statuses[target.relative_path]
+        if status.state == "completed":
+            print(
+                f"[run_ha_eval] accepted checkpoint={target.relative_path} "
+                f"contract_path={status.contract_path} "
+                f"contract_hash={status.contract_hash}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if args.output_format == "jsonl":
+        selected_ordinals = {target.ordinal for target in selected}
+        for target in targets:
+            status = statuses[target.relative_path]
+            payload = {
+                "schema_version": SELECTION_SCHEMA_VERSION,
+                "ordinal": target.ordinal,
+                "shard_index": args.shard_index,
+                "shard_count": args.shard_count,
+                "assigned": target.ordinal in selected_ordinals,
+                "path": str(target.path),
+                "relative_path": target.relative_path,
+                "step": target.step,
+                "status": status.state,
+                "accepted_contract_path": (
+                    status.contract_path
+                    if status.state == "completed"
+                    else None
+                ),
+                "accepted_contract_hash": (
+                    status.contract_hash
+                    if status.state == "completed"
+                    else None
+                ),
+                "retry_required_contract_path": (
+                    status.contract_path
+                    if status.state == "retry_required"
+                    else None
+                ),
+                "retry_required_contract_hash": (
+                    status.contract_hash
+                    if status.state == "retry_required"
+                    else None
+                ),
+                "attempt_path": status.attempt_path,
+            }
+            print(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        return 0
+
     for target in selected:
-        print(target.path, flush=True)
+        status = statuses[target.relative_path]
+        if args.output_format == "paths":
+            print(target.path, flush=True)
+        elif status.state == "retry_required":
+            print(
+                "\t".join(
+                    (
+                        "retry_required",
+                        str(target.path),
+                        str(status.contract_hash),
+                        str(status.contract_path),
+                    )
+                ),
+                flush=True,
+            )
+        else:
+            print(f"run\t{target.path}\t\t", flush=True)
     return 0
 
 

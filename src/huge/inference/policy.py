@@ -227,12 +227,22 @@ class HugePolicy:
         }
 
     @torch.no_grad()
-    def get_action(self, observation: dict[str, Any]) -> dict[str, np.ndarray]:
-        action, _ = self.get_action_with_trace(observation)
+    def get_action(
+        self,
+        observation: dict[str, Any],
+        *,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, np.ndarray]:
+        action, _ = self.get_action_with_trace(observation, generator=generator)
         return action
 
     @torch.no_grad()
-    def get_action_with_trace(self, observation: dict[str, Any]) -> tuple[dict[str, np.ndarray], PolicyTrace]:
+    def get_action_with_trace(
+        self,
+        observation: dict[str, Any],
+        *,
+        generator: torch.Generator | None = None,
+    ) -> tuple[dict[str, np.ndarray], PolicyTrace]:
         inputs = self._prepare_model_inputs(observation)
         action = self.model.predict_action(
             input_ids=inputs["input_ids"],
@@ -241,6 +251,7 @@ class HugePolicy:
             state_mask=inputs["state_mask"],
             qwen_inputs=inputs["qwen_inputs"],
             action_token_mask=inputs["action_token_mask"],
+            generator=generator,
         )
         arr = action.detach().cpu().numpy().astype(np.float32)
         if arr.shape[-1] != ACTION_DIM:

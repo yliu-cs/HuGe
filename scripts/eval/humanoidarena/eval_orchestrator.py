@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 import errno
 import fcntl
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
@@ -54,11 +55,37 @@ COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
 SUMMARY_SCHEMA_VERSION = "huge_humanoidarena_summary_v1"
 RETRY_ATTEMPT_SCHEMA_VERSION = "huge_humanoidarena_retry_attempt_v1"
-GPU_ADMISSION_SCHEMA_VERSION = "huge_ha_gpu_admission_v1"
+ROOT_SOFTWARE_SCHEMA_VERSION = "huge_root_software_v1"
+ROOT_SOFTWARE_PACKAGES = (
+    "torch",
+    "torchvision",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "qwen-vl-utils",
+    "flash-attn",
+    "peft",
+    "onnxruntime-gpu",
+    "opencv-python",
+    "psutil",
+)
+GPU_ADMISSION_SCHEMA_VERSION = "huge_ha_gpu_admission_v2"
 KIT_MAP_SCHEMA_VERSION = "huge_kit_gpu_map_v1"
 WORKER_STATUS_SCHEMA_VERSION = "huge_ha_worker_status_v1"
 MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
+MODEL_IO_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
+MODEL_IO_TRACE_POLICY = "require_complete_v1"
+CHECKPOINT_MANIFEST_VERSION = 1
+PORTABLE_CHECKPOINT_KIND = "huge_portable_model"
 EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
+MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
+ALLOWED_TRAINING_ROOT_NAMES = (
+    "stage3_humanoidarena_full_optimized",
+    "stage3_humanoidarena",
+)
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
 SONIC_ENCODER_SHA256 = "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
 SONIC_DECODER_SHA256 = "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
@@ -591,11 +618,76 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
             raise ConfigError("HUGE_EVAL_GPU_LOGICAL_IDS must be comma-separated integers") from exc
         if not logical_ids or len(set(logical_ids)) != len(logical_ids) or any(value < 0 for value in logical_ids):
             raise ConfigError("HUGE_EVAL_GPU_LOGICAL_IDS must be non-empty, unique, non-negative integers")
+
+    workers_per_gpu = _parse_int(
+        "HUGE_EVAL_WORKERS_PER_GPU",
+        environ.get(
+            "HUGE_EVAL_WORKERS_PER_GPU",
+            str(DEFAULT_WORKERS_PER_GPU),
+        ),
+        minimum=1,
+        maximum=MAX_WORKERS_PER_GPU,
+    )
+    max_concurrent_shadow_startups = _parse_int(
+        "HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS",
+        environ.get("HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS", "2"),
+        minimum=1,
+    )
+    min_free_raw = environ.get("HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB", "0")
+    min_free_gpu_memory_gib = _parse_float(
+        "HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB",
+        min_free_raw,
+        minimum=0.0,
+    )
+    if (
+        workers_per_gpu == 2
+        and (
+            "HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB" not in environ
+            or not str(min_free_raw).strip()
+            or min_free_gpu_memory_gib <= 0.0
+        )
+    ):
+        raise ConfigError(
+            "WPG2 requires an explicit positive "
+            "HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB before GPU discovery"
+        )
+
+    resume = _parse_bool(
+        "HUGE_EVAL_RESUME", environ.get("HUGE_EVAL_RESUME", "1")
+    )
+    force_new = _parse_bool(
+        "HUGE_EVAL_FORCE_NEW_RUN",
+        environ.get("HUGE_EVAL_FORCE_NEW_RUN", "0"),
+    )
+    retry_required_contract_hash = environ.get(
+        "HUGE_EVAL_RETRY_REQUIRED_CONTRACT_HASH", ""
+    ).strip()
+    if (
+        retry_required_contract_hash
+        and re.fullmatch(r"[0-9a-f]{64}", retry_required_contract_hash) is None
+    ):
+        raise ConfigError(
+            "HUGE_EVAL_RETRY_REQUIRED_CONTRACT_HASH must be a full lowercase SHA256"
+        )
+    if retry_required_contract_hash and not (resume and force_new):
+        raise ConfigError(
+            "controlled retry requires HUGE_EVAL_RESUME=1 and "
+            "HUGE_EVAL_FORCE_NEW_RUN=1"
+        )
+    trace_policy = environ.get(
+        "HUGE_EVAL_MODEL_IO_TRACE_POLICY", MODEL_IO_TRACE_POLICY
+    )
+    if trace_policy != MODEL_IO_TRACE_POLICY:
+        raise ConfigError(
+            "HUGE_EVAL_MODEL_IO_TRACE_POLICY is frozen to "
+            f"{MODEL_IO_TRACE_POLICY}"
+        )
     return {
         "test_mode": test_mode,
         "effective_persistent_sim": False,
         "simulator_process_scope": "per_episode_v1",
         "model_io_schema": MODEL_IO_TRACE_SCHEMA_VERSION,
+        "model_io_trace_policy": trace_policy,
         "seeds_override": environ.get("SEEDS_OVERRIDE", ""),
         "repeats_override": environ.get("REPEATS_PER_SEED", ""),
         "max_steps": _parse_int("MAX_STEPS", environ.get("MAX_STEPS", str(task.default_max_steps)), minimum=1),
@@ -636,26 +728,19 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
             environ.get("HUGE_EVAL_RETRY_BACKOFF_SEC", "5"),
             minimum=0.0,
         ),
-        "min_free_gpu_memory_gib": _parse_float(
-            "HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB",
-            environ.get("HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB", "0"),
-            minimum=0.0,
-        ),
+        "min_free_gpu_memory_gib": min_free_gpu_memory_gib,
         "base_port": _parse_int("HUGE_EVAL_BASE_PORT", environ.get("HUGE_EVAL_BASE_PORT", "18080"), minimum=1024, maximum=65535),
         "dry_run": _parse_bool("HUGE_EVAL_DRY_RUN", environ.get("HUGE_EVAL_DRY_RUN", "0")),
-        "resume": _parse_bool("HUGE_EVAL_RESUME", environ.get("HUGE_EVAL_RESUME", "1")),
-        "force_new": _parse_bool("HUGE_EVAL_FORCE_NEW_RUN", environ.get("HUGE_EVAL_FORCE_NEW_RUN", "0")),
+        "resume": resume,
+        "force_new": force_new,
+        "retry_required_contract_hash": retry_required_contract_hash,
         "allow_kit_map_bootstrap": _parse_bool(
             "HUGE_ALLOW_KIT_MAP_BOOTSTRAP", environ.get("HUGE_ALLOW_KIT_MAP_BOOTSTRAP", "0")
         ),
         "gpu_count": raw_count,
         "gpu_logical_ids": raw_ids,
-        "workers_per_gpu": _parse_int(
-            "HUGE_EVAL_WORKERS_PER_GPU",
-            environ.get("HUGE_EVAL_WORKERS_PER_GPU", str(DEFAULT_WORKERS_PER_GPU)),
-            minimum=1,
-            maximum=MAX_WORKERS_PER_GPU,
-        ),
+        "workers_per_gpu": workers_per_gpu,
+        "max_concurrent_shadow_startups": max_concurrent_shadow_startups,
         "headless": True,
         "enable_depth": False,
         "robot_type": "unitree_g1_refpose_v3_1",
@@ -707,14 +792,77 @@ def parse_gpu_selection(visible_count: int, count_raw: str, ids_raw: str) -> lis
     return list(range(visible_count))
 
 
+def _allowed_checkpoint_root(
+    repo: Path,
+    checkpoint: Path,
+    checkpoint_task: str,
+) -> Path:
+    checkpoint = checkpoint.expanduser().resolve()
+    matched_base: Path | None = None
+    relative: Path | None = None
+    for name in ALLOWED_TRAINING_ROOT_NAMES:
+        base = (repo / ".runs" / name).resolve()
+        if _is_relative_to(checkpoint, base):
+            matched_base = base
+            relative = checkpoint.relative_to(base)
+            break
+    if matched_base is None or relative is None:
+        allowed = ", ".join(
+            str((repo / ".runs" / name).resolve())
+            for name in ALLOWED_TRAINING_ROOT_NAMES
+        )
+        raise ConfigError(
+            f"checkpoint must resolve inside an allowed training root "
+            f"({allowed}): {checkpoint}"
+        )
+
+    architectures = {"qwenpi_v3", "qwengr00t", "qwenoft"}
+    tuning_modes = {"full", "lora", "frozen_vlm"}
+    if (
+        not _SAFE_COMPONENT_RE.fullmatch(checkpoint_task)
+        or checkpoint_task in {".", ".."}
+        or len(relative.parts) != 6
+        or relative.parts[0] != checkpoint_task
+        or relative.parts[1] not in architectures
+        or relative.parts[2] not in tuning_modes
+        or relative.parts[3] != "stage3"
+        or not _SAFE_COMPONENT_RE.fullmatch(relative.parts[4])
+        or relative.parts[4] in {".", "..", "_resume_states"}
+        or re.fullmatch(r"step_[0-9]+", relative.parts[5]) is None
+    ):
+        raise ConfigError(
+            "checkpoint must have the exact "
+            "<task>/<architecture>/<tuning_mode>/stage3/<run_id>/step_N "
+            f"shape for task {checkpoint_task}: {checkpoint}"
+        )
+    cursor = matched_base
+    for component in relative.parts[:-1]:
+        cursor = cursor / component
+        try:
+            info = cursor.lstat()
+        except OSError as exc:
+            raise ConfigError(
+                f"checkpoint run path is unavailable: {cursor}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ConfigError(
+                f"checkpoint run path must contain only real directories: "
+                f"{cursor}"
+            )
+    return matched_base
+
+
 def validate_checkpoint(checkpoint: str | Path, repo_root: str | Path, task: TaskSpec) -> CheckpointContract:
     repo = Path(repo_root).resolve()
     raw = Path(checkpoint).expanduser()
     candidate = (repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    allowed_root = _allowed_checkpoint_root(
+        repo, candidate, task.checkpoint_task
+    )
     try:
         return resolve_checkpoint_contract(
             candidate,
-            allowed_root=repo / ".runs/stage3_humanoidarena",
+            allowed_root=allowed_root,
             checkpoint_task=task.checkpoint_task,
             repo_root=repo,
         )
@@ -862,6 +1010,130 @@ def _directory_inventory(path: Path) -> dict[str, str]:
     return inventory
 
 
+def _portable_checkpoint_publication(
+    checkpoint: Path,
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Validate and bind the complete portable publication manifest."""
+    root = checkpoint.resolve()
+    manifest_path = checkpoint / "manifest.json"
+    marker_path = checkpoint / "_SUCCESS"
+    if not manifest_path.exists() and not marker_path.exists() and not required:
+        return None
+    for path, label in (
+        (manifest_path, "portable checkpoint manifest"),
+        (marker_path, "portable checkpoint success marker"),
+    ):
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ConfigError(f"missing {label}: {path}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ConfigError(f"{label} must be a real file: {path}")
+    manifest = _json_object(manifest_path, label="portable checkpoint manifest")
+    marker = _json_object(marker_path, label="portable checkpoint success marker")
+    manifest_sha256 = sha256_file(manifest_path)
+    if (
+        set(marker) != {"schema_version", "kind", "manifest_sha256"}
+        or marker.get("schema_version") != CHECKPOINT_MANIFEST_VERSION
+        or marker.get("kind") != PORTABLE_CHECKPOINT_KIND
+        or marker.get("manifest_sha256") != manifest_sha256
+        or manifest.get("schema_version") != CHECKPOINT_MANIFEST_VERSION
+        or manifest.get("kind") != PORTABLE_CHECKPOINT_KIND
+    ):
+        raise ConfigError(
+            f"portable checkpoint marker/manifest contract mismatch: {checkpoint}"
+        )
+    publication_metadata = manifest.get("metadata")
+    publication_identity = (
+        publication_metadata if isinstance(publication_metadata, dict) else manifest
+    )
+    step_match = re.fullmatch(r"step_([0-9]+)", checkpoint.name)
+    if required and (
+        step_match is None
+        or publication_identity.get("global_step") != int(step_match.group(1))
+        or publication_identity.get("model_architecture")
+        != checkpoint.parents[3].name
+        or publication_identity.get("tuning_mode") != "full"
+        or publication_identity.get("run_id") != checkpoint.parent.name
+    ):
+        raise ConfigError(
+            f"portable checkpoint manifest identity mismatch: {checkpoint}"
+        )
+    entries = manifest.get("files")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(
+            f"portable checkpoint manifest has no file inventory: {manifest_path}"
+        )
+    expected_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
+            raise ConfigError(f"invalid portable checkpoint manifest entry: {entry!r}")
+        relative_raw = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        relative = Path(relative_raw) if isinstance(relative_raw, str) else Path()
+        if (
+            not isinstance(relative_raw, str)
+            or not relative_raw
+            or relative_raw in expected_paths
+            or relative_raw in {"manifest.json", "_SUCCESS"}
+            or relative.is_absolute()
+            or relative.as_posix() != relative_raw
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ConfigError(f"invalid portable checkpoint manifest entry: {entry!r}")
+        file_path = checkpoint / relative
+        try:
+            info = file_path.lstat()
+            resolved = file_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ConfigError(
+                f"portable checkpoint manifest file is unavailable: {file_path}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or not _is_relative_to(resolved, root)
+            or info.st_size != size
+            or sha256_file(file_path) != digest
+        ):
+            raise ConfigError(
+                f"portable checkpoint manifest digest/size mismatch: {file_path}"
+            )
+        expected_paths.add(relative_raw)
+    actual_paths: set[str] = set()
+    for entry in checkpoint.rglob("*"):
+        relative = entry.relative_to(checkpoint).as_posix()
+        if relative in {"manifest.json", "_SUCCESS"}:
+            continue
+        info = entry.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ConfigError(f"portable checkpoint may not contain symlinks: {entry}")
+        if stat.S_ISREG(info.st_mode):
+            actual_paths.add(relative)
+    if actual_paths != expected_paths:
+        raise ConfigError(
+            "portable checkpoint file inventory mismatch: "
+            f"missing={sorted(expected_paths - actual_paths)}, "
+            f"extra={sorted(actual_paths - expected_paths)}, checkpoint={checkpoint}"
+        )
+    return {
+        "schema_version": CHECKPOINT_MANIFEST_VERSION,
+        "kind": PORTABLE_CHECKPOINT_KIND,
+        "manifest_relative_path": "manifest.json",
+        "manifest_sha256": manifest_sha256,
+        "success_marker_relative_path": "_SUCCESS",
+        "success_marker_sha256": sha256_file(marker_path),
+        "file_count": len(entries),
+    }
+
+
 def build_source_inventory(
     repo: Path, humanoidarena: Path, yaml_path: Path, checkpoint: CheckpointContract
 ) -> dict[str, Any]:
@@ -890,11 +1162,14 @@ def build_source_inventory(
         "src/huge/models/action_heads/starvla_oft_head.py",
         "src/huge/models/action_heads/starvla_pi_head.py",
         "scripts/eval/humanoidarena/eval_orchestrator.py",
+        "scripts/eval/run_ha_eval.sh",
         "scripts/eval/humanoidarena/watch_eval_summary.py",
         "scripts/eval/humanoidarena/shard_checkpoints.py",
         "scripts/eval/humanoidarena/sim_eval_shadow.py",
         "scripts/eval/humanoidarena/run_eval.sh",
         "scripts/eval/humanoidarena/env.sh",
+        "pyproject.toml",
+        "uv.lock",
     )
     huge: dict[str, str] = {}
     for relative in huge_paths:
@@ -911,6 +1186,11 @@ def build_source_inventory(
     _verify_hash(upstream_encoder, SONIC_ENCODER_SHA256, label="HumanoidArena SONIC encoder")
     _verify_hash(upstream_decoder, SONIC_DECODER_SHA256, label="HumanoidArena SONIC decoder")
     qwen_inventory = _directory_inventory(checkpoint.base_vlm_path)
+    optimized_root = (repo / ".runs/stage3_humanoidarena_full_optimized").resolve()
+    checkpoint_publication = _portable_checkpoint_publication(
+        checkpoint.checkpoint_dir,
+        required=_is_relative_to(checkpoint.checkpoint_dir, optimized_root),
+    )
     payload = {
         "upstream_compatibility": upstream,
         "wrapper_semantics": wrappers,
@@ -918,6 +1198,7 @@ def build_source_inventory(
         "huge_sources": huge,
         "task_yaml": {str(yaml_path): sha256_file(yaml_path)},
         "checkpoint_files": dict(checkpoint.file_sha256),
+        "checkpoint_publication": checkpoint_publication,
         "sonic_assets": {
             "huge_encoder": SONIC_ENCODER_SHA256, "huge_decoder": SONIC_DECODER_SHA256,
             "humanoidarena_encoder": SONIC_ENCODER_SHA256, "humanoidarena_decoder": SONIC_DECODER_SHA256,
@@ -952,6 +1233,36 @@ def inspect_upstream_contract(
     return report
 
 
+def root_software_contract(repo: Path) -> dict[str, Any]:
+    """Bind the evaluator to the repository root interpreter and key packages."""
+    expected_prefix = (repo / ".venv").resolve()
+    try:
+        current_prefix = Path(sys.prefix).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(
+            f"cannot resolve the evaluator Python prefix: {exc}"
+        ) from exc
+    if current_prefix != expected_prefix:
+        raise ConfigError(
+            "evaluation software fingerprint must run from the Huge root virtual "
+            f"environment: observed={current_prefix}, expected={expected_prefix}"
+        )
+    packages: dict[str, str | None] = {}
+    for distribution in ROOT_SOFTWARE_PACKAGES:
+        try:
+            packages[distribution] = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError:
+            packages[distribution] = None
+    return {
+        "schema_version": ROOT_SOFTWARE_SCHEMA_VERSION,
+        "interpreter": ".venv/bin/python",
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "packages": packages,
+    }
+
+
 def build_static_plan(
     task: TaskSpec, checkpoint: CheckpointContract, yaml_config: Mapping[str, Any],
     jobs: Sequence[EpisodeJob], policy: Mapping[str, Any], source_inventory: Mapping[str, Any],
@@ -962,8 +1273,15 @@ def build_static_plan(
         "dry_run", "allow_kit_map_bootstrap", "resume", "force_new", "gpu_count",
         "gpu_logical_ids", "base_port", "server_ready_timeout", "shutdown_grace_sec",
         "seeds_override", "repeats_override",
+        "retry_required_contract_hash",
     ):
         safe_policy.pop(execution_only, None)
+    source_files = source_inventory.get("files")
+    checkpoint_publication = (
+        source_files.get("checkpoint_publication")
+        if isinstance(source_files, Mapping)
+        else None
+    )
     return {
         "schema_version": STATIC_PLAN_SCHEMA_VERSION,
         "task": asdict(task),
@@ -972,15 +1290,25 @@ def build_static_plan(
             "step": checkpoint.step, "checkpoint_task": checkpoint.checkpoint_task,
             "checkpoint_sha256": checkpoint.checkpoint_sha256, "files": dict(checkpoint.file_sha256),
             "qwen_path": str(checkpoint.base_vlm_path.relative_to(repo)),
+            "model_architecture": str(
+                checkpoint.config.get("model_architecture", "qwenpi_v3")
+                or "qwenpi_v3"
+            ),
+            "action_horizon": int(checkpoint.config.get("action_horizon", 50)),
+            "num_inference_steps": int(
+                checkpoint.config.get("num_inference_steps", 4)
+            ),
+            "portable_publication": copy.deepcopy(checkpoint_publication),
         },
         "yaml": dict(yaml_config),
         "policy": safe_policy,
         "protocol": {"http": PROTOCOL_VERSION, "mapping": MAPPING_VERSION, "action": [50, 66], "latent": [50, 64]},
         "episode_seed_algorithm": EPISODE_SEED_FORMULA,
+        "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
         "episodes": [asdict(job) for job in jobs],
         "source_inventory": dict(source_inventory),
         "upstream_contract": dict(upstream_contract),
-        "software": {"python": platform.python_version(), "platform": platform.platform()},
+        "software": root_software_contract(repo),
     }
 
 
@@ -1146,6 +1474,158 @@ def discover_visible_gpus(
                     f"required={threshold_gib:.6f} GiB ({required_bytes} bytes)"
                 )
     return identities, driver, captured_at
+
+
+def fresh_gpu_admission_snapshot(
+    selected_gpus: Sequence[GpuIdentity],
+    *,
+    threshold_gib: float,
+    allowed_pid: int | None = None,
+) -> tuple[list[GpuIdentity], float, list[dict[str, Any]]]:
+    """Query fresh free memory and compute PIDs immediately before child startup."""
+    if not selected_gpus:
+        raise GpuError("fresh GPU admission requires at least one selected GPU")
+    if isinstance(threshold_gib, bool) or not math.isfinite(threshold_gib) or threshold_gib < 0.0:
+        raise GpuError("fresh GPU admission threshold must be finite and non-negative")
+    allowed_pid = os.getpid() if allowed_pid is None else allowed_pid
+    if type(allowed_pid) is not int or allowed_pid < 1:
+        raise GpuError("fresh GPU admission allowed PID is invalid")
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        raise GpuError("nvidia-smi is required for fresh GPU admission")
+
+    selected_by_uuid: dict[str, GpuIdentity] = {}
+    for gpu in selected_gpus:
+        normalized = _normalize_uuid(gpu.cuda_uuid)
+        if normalized in selected_by_uuid:
+            raise GpuError("selected GPU UUIDs are ambiguous")
+        selected_by_uuid[normalized] = gpu
+
+    memory_command = [
+        executable,
+        "--query-gpu=uuid,memory.total,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        memory_result = subprocess.run(
+            memory_command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GpuError(f"fresh GPU memory query failed: {exc}") from exc
+    memory_rows: dict[str, tuple[str, int, int]] = {}
+    for raw_line in memory_result.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        parts = [part.strip() for part in raw_line.split(",")]
+        if len(parts) != 3:
+            raise GpuError(f"ambiguous fresh GPU memory row: {raw_line!r}")
+        raw_uuid, raw_total_mib, raw_free_mib = parts
+        normalized = _normalize_uuid(raw_uuid)
+        if normalized in memory_rows:
+            raise GpuError(f"duplicate fresh GPU memory UUID: {raw_uuid!r}")
+        try:
+            total_mib = float(raw_total_mib)
+            free_mib = float(raw_free_mib)
+        except ValueError as exc:
+            raise GpuError(f"invalid fresh GPU memory row: {raw_line!r}") from exc
+        if (
+            not math.isfinite(total_mib)
+            or not math.isfinite(free_mib)
+            or total_mib <= 0.0
+            or free_mib < 0.0
+            or free_mib > total_mib
+        ):
+            raise GpuError(f"invalid fresh GPU memory row: {raw_line!r}")
+        memory_rows[normalized] = (
+            raw_uuid,
+            int(total_mib * 1024 * 1024),
+            int(free_mib * 1024 * 1024),
+        )
+    if set(selected_by_uuid) - set(memory_rows):
+        raise GpuError(
+            "fresh GPU memory query omitted selected UUIDs: "
+            f"{sorted(set(selected_by_uuid) - set(memory_rows))}"
+        )
+
+    app_command = [
+        executable,
+        "--query-compute-apps=gpu_uuid,pid",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        app_result = subprocess.run(
+            app_command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GpuError(f"fresh GPU compute-app query failed: {exc}") from exc
+    app_pairs: set[tuple[str, int]] = set()
+    for raw_line in app_result.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        parts = [part.strip() for part in raw_line.split(",")]
+        if len(parts) != 2:
+            raise GpuError(f"ambiguous GPU compute-app row: {raw_line!r}")
+        normalized = _normalize_uuid(parts[0])
+        try:
+            pid = int(parts[1])
+        except ValueError as exc:
+            raise GpuError(f"invalid GPU compute-app PID: {raw_line!r}") from exc
+        if pid < 1 or (normalized, pid) in app_pairs:
+            raise GpuError(f"invalid or duplicate GPU compute-app row: {raw_line!r}")
+        app_pairs.add((normalized, pid))
+
+    selected_apps = sorted(
+        (normalized, pid)
+        for normalized, pid in app_pairs
+        if normalized in selected_by_uuid
+    )
+    foreign = [
+        (selected_by_uuid[normalized].cuda_uuid, pid)
+        for normalized, pid in selected_apps
+        if pid != allowed_pid
+    ]
+    if foreign:
+        raise GpuError(f"selected GPUs have foreign compute PIDs: {foreign}")
+
+    required_bytes = math.ceil(threshold_gib * 1024**3)
+    refreshed: list[GpuIdentity] = []
+    for gpu in selected_gpus:
+        normalized = _normalize_uuid(gpu.cuda_uuid)
+        raw_uuid, total_bytes, free_bytes = memory_rows[normalized]
+        if free_bytes < required_bytes:
+            raise GpuError(
+                f"GPU {gpu.cuda_uuid} fresh free-memory admission failed: "
+                f"observed={free_bytes} bytes, required={required_bytes} bytes"
+            )
+        refreshed.append(
+            GpuIdentity(
+                parent_logical_ordinal=gpu.parent_logical_ordinal,
+                child_cuda_visible_token=gpu.child_cuda_visible_token,
+                cuda_uuid=raw_uuid,
+                pci_bus_id=gpu.pci_bus_id,
+                device_name=gpu.device_name,
+                total_memory_bytes=total_bytes,
+                compute_capability=gpu.compute_capability,
+                free_memory_bytes=free_bytes,
+            )
+        )
+    compute_apps = [
+        {
+            "cuda_uuid": selected_by_uuid[normalized].cuda_uuid,
+            "pid": pid,
+            "allowed": pid == allowed_pid,
+        }
+        for normalized, pid in selected_apps
+    ]
+    return refreshed, float(time.time()), compute_apps
 
 
 def host_fingerprint() -> str:
@@ -1905,7 +2385,445 @@ def classify_existing_result(job: EpisodeJob, completion: Mapping[str, Any] | No
     return "pending_integrity"
 
 
-def validate_completion_envelope(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
+def _model_io_contract_context(
+    attempt: Path,
+    job: EpisodeJob,
+    worker_id: str,
+) -> dict[str, Any]:
+    contract_path = attempt.parent.parent / "contract.json"
+    contract = _json_object(contract_path, label="model I/O executable contract")
+    static_plan = contract.get("static_plan")
+    checkpoint = static_plan.get("checkpoint") if isinstance(static_plan, dict) else None
+    source_inventory = (
+        static_plan.get("source_inventory") if isinstance(static_plan, dict) else None
+    )
+    task = static_plan.get("task") if isinstance(static_plan, dict) else None
+    protocol = static_plan.get("protocol") if isinstance(static_plan, dict) else None
+    contract_hash = canonical_sha256(contract)
+    source_digest = (
+        source_inventory.get("source_inventory_digest")
+        if isinstance(source_inventory, dict)
+        else None
+    )
+    if (
+        not isinstance(static_plan, dict)
+        or contract.get("schema_version") != CONTRACT_SCHEMA_VERSION
+        or contract.get("static_plan_hash") != canonical_sha256(static_plan)
+        or attempt.parent.parent.name != contract_hash[:16]
+        or not isinstance(checkpoint, dict)
+        or not isinstance(task, dict)
+        or not isinstance(protocol, dict)
+        or task.get("cli_task") != job.task_cli
+        or task.get("isaac_task") != job.isaac_task_name
+        or not isinstance(source_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
+        or not isinstance(checkpoint.get("checkpoint_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", checkpoint["checkpoint_sha256"])
+        is None
+        or not isinstance(checkpoint.get("model_architecture"), str)
+        or not checkpoint["model_architecture"]
+        or type(checkpoint.get("action_horizon")) is not int
+        or checkpoint["action_horizon"] <= 0
+        or type(checkpoint.get("num_inference_steps")) is not int
+        or checkpoint["num_inference_steps"] <= 0
+        or not isinstance(protocol.get("mapping"), str)
+        or not protocol["mapping"]
+    ):
+        raise ConfigError("model I/O executable contract provenance is invalid")
+    if _WORKER_RE.fullmatch(worker_id) is None:
+        raise ConfigError(f"invalid model I/O worker identity: {worker_id!r}")
+    return {
+        "run_id": attempt.name,
+        "worker_id": worker_id,
+        "task": job.task_cli,
+        "checkpoint_sha256": checkpoint["checkpoint_sha256"],
+        "contract_hash": contract_hash,
+        "source_inventory_digest": source_digest,
+        "model_architecture": checkpoint["model_architecture"],
+        "action_horizon": checkpoint["action_horizon"],
+        "num_inference_steps": checkpoint["num_inference_steps"],
+        "mapping_version": protocol["mapping"],
+    }
+
+
+def _validate_model_io_call_inventory(
+    attempt: Path,
+    session_directory: Path,
+    manifest: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    trace_session_id: str,
+    episode_seed: int,
+    seeded_generation: int,
+    record_count: int,
+) -> int:
+    """Re-validate every terminal trace call and its exact session inventory."""
+    calls = manifest.get("calls")
+    if not isinstance(calls, list) or len(calls) != record_count:
+        raise ConfigError("model I/O manifest call inventory is invalid")
+    _require_owned_attempt_path(
+        attempt,
+        session_directory,
+        label="model I/O session directory",
+        directory=True,
+    )
+    expected_names = {"manifest.json", "_SUCCESS"}
+    expected_names.update(
+        f"call-{index:06d}.{suffix}"
+        for index in range(1, record_count + 1)
+        for suffix in ("json", "npz")
+    )
+    try:
+        actual_names = {entry.name for entry in session_directory.iterdir()}
+    except OSError as exc:
+        raise ConfigError(f"cannot enumerate model I/O session: {exc}") from exc
+    if actual_names != expected_names:
+        raise ConfigError(
+            "model I/O session inventory mismatch: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"extra={sorted(actual_names - expected_names)}"
+        )
+
+    call_keys = {
+        "trace_call_index",
+        "http_response_sequence",
+        "reset_generation",
+        "json_relative_path",
+        "json_bytes",
+        "json_sha256",
+        "npz_relative_path",
+        "npz_bytes",
+        "npz_sha256",
+    }
+    call_payload_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "task",
+        "checkpoint_sha256",
+        "contract_hash",
+        "source_inventory_digest",
+        "model_architecture",
+        "action_horizon",
+        "num_inference_steps",
+        "mapping_version",
+        "trace_session_id",
+        "episode_seed",
+        "seeded_reset_generation",
+        "reset_generation",
+        "trace_call_index",
+        "http_response_sequence",
+        "model_inputs",
+        "model_output",
+        "preprocessing_provenance",
+        "wire_provenance",
+        "compatibility_only_excluded",
+        "npz_relative_path",
+        "npz_bytes",
+        "npz_sha256",
+        "created_at",
+    }
+    total_call_bytes = 0
+    previous_http_sequence = 0
+    for expected_index, entry in enumerate(calls, start=1):
+        expected_json_name = f"call-{expected_index:06d}.json"
+        expected_npz_name = f"call-{expected_index:06d}.npz"
+        if not isinstance(entry, dict) or set(entry) != call_keys:
+            raise ConfigError("model I/O manifest call schema is invalid")
+        http_sequence = entry.get("http_response_sequence")
+        reset_generation = entry.get("reset_generation")
+        json_size = entry.get("json_bytes")
+        npz_size = entry.get("npz_bytes")
+        json_digest = entry.get("json_sha256")
+        npz_digest = entry.get("npz_sha256")
+        if (
+            entry.get("trace_call_index") != expected_index
+            or type(http_sequence) is not int
+            or http_sequence <= previous_http_sequence
+            or type(reset_generation) is not int
+            or reset_generation < 1
+            or entry.get("json_relative_path") != expected_json_name
+            or entry.get("npz_relative_path") != expected_npz_name
+            or type(json_size) is not int
+            or json_size <= 0
+            or type(npz_size) is not int
+            or npz_size <= 0
+            or not isinstance(json_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", json_digest) is None
+            or not isinstance(npz_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", npz_digest) is None
+        ):
+            raise ConfigError("model I/O manifest call values are invalid")
+        previous_http_sequence = http_sequence
+
+        json_path = session_directory / expected_json_name
+        npz_path = session_directory / expected_npz_name
+        _require_owned_attempt_path(
+            attempt, json_path, label="model I/O call JSON", directory=False
+        )
+        _require_owned_attempt_path(
+            attempt, npz_path, label="model I/O call NPZ", directory=False
+        )
+        json_info = json_path.stat()
+        npz_info = npz_path.stat()
+        if (
+            json_info.st_size != json_size
+            or npz_info.st_size != npz_size
+            or sha256_file(json_path) != json_digest
+            or sha256_file(npz_path) != npz_digest
+        ):
+            raise ConfigError("model I/O call size/digest mismatch")
+        try:
+            raw_json = json_path.read_bytes()
+            call_payload = json.loads(raw_json)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"invalid model I/O call JSON: {json_path}: {exc}") from exc
+        if (
+            not isinstance(call_payload, dict)
+            or set(call_payload) != call_payload_keys
+            or raw_json != canonical_json_bytes(call_payload) + b"\n"
+            or call_payload.get("schema_version") != MODEL_IO_TRACE_SCHEMA_VERSION
+            or any(call_payload.get(key) != value for key, value in context.items())
+            or call_payload.get("trace_session_id") != trace_session_id
+            or call_payload.get("episode_seed") != episode_seed
+            or call_payload.get("seeded_reset_generation") != seeded_generation
+            or call_payload.get("trace_call_index") != expected_index
+            or call_payload.get("http_response_sequence") != http_sequence
+            or call_payload.get("reset_generation") != reset_generation
+            or call_payload.get("npz_relative_path") != expected_npz_name
+            or call_payload.get("npz_bytes") != npz_size
+            or call_payload.get("npz_sha256") != npz_digest
+            or not isinstance(call_payload.get("created_at"), str)
+            or not call_payload["created_at"]
+        ):
+            raise ConfigError("model I/O call provenance/schema is invalid")
+        total_call_bytes += json_size + npz_size
+    expected_last_sequence = previous_http_sequence if calls else 0
+    if manifest.get("last_http_response_sequence") != expected_last_sequence:
+        raise ConfigError("model I/O manifest last response sequence is invalid")
+    return total_call_bytes
+
+
+def _validate_model_io_artifact(
+    attempt: Path,
+    job: EpisodeJob,
+    payload: Mapping[str, Any],
+    worker_id: str,
+    receipt: Any,
+    *,
+    recorded_artifact: Any = None,
+) -> dict[str, Any]:
+    receipt_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "trace_session_id",
+        "result_identity",
+        "episode_seed",
+        "seeded_reset_generation",
+        "outcome_sha256",
+        "record_count",
+        "last_trace_call_index",
+        "last_http_response_sequence",
+        "trace_status",
+        "manifest_relative_path",
+        "manifest_sha256",
+        "success_marker_relative_path",
+        "total_bytes",
+        "error",
+    }
+    outcome_sha256 = canonical_sha256(payload)
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != receipt_keys
+        or receipt.get("schema_version") != MODEL_IO_RECEIPT_SCHEMA_VERSION
+        or receipt.get("run_id") != attempt.name
+        or receipt.get("worker_id") != worker_id
+        or receipt.get("result_identity") != job.result_identity
+        or receipt.get("episode_seed") != job.episode_seed
+        or receipt.get("outcome_sha256") != outcome_sha256
+        or receipt.get("trace_status") != "complete"
+        or receipt.get("error") is not None
+    ):
+        raise ConfigError("model I/O receipt identity/outcome/status is invalid")
+    trace_session_id = receipt.get("trace_session_id")
+    seeded_generation = receipt.get("seeded_reset_generation")
+    record_count = receipt.get("record_count")
+    last_trace_call_index = receipt.get("last_trace_call_index")
+    last_http_response_sequence = receipt.get("last_http_response_sequence")
+    total_bytes = receipt.get("total_bytes")
+    if (
+        not isinstance(trace_session_id, str)
+        or re.fullmatch(r"[a-f0-9]{32}", trace_session_id) is None
+        or type(seeded_generation) is not int
+        or seeded_generation < 1
+        or type(record_count) is not int
+        or record_count < 0
+        or type(last_trace_call_index) is not int
+        or last_trace_call_index != record_count
+        or type(last_http_response_sequence) is not int
+        or last_http_response_sequence < 0
+        or type(total_bytes) is not int
+        or total_bytes <= 0
+    ):
+        raise ConfigError("model I/O receipt counters are invalid")
+    expected_manifest_relative = (
+        f"model_io/{worker_id}/session-{trace_session_id}/manifest.json"
+    )
+    expected_marker_relative = (
+        f"model_io/{worker_id}/session-{trace_session_id}/_SUCCESS"
+    )
+    manifest_relative = receipt.get("manifest_relative_path")
+    marker_relative = receipt.get("success_marker_relative_path")
+    if (
+        manifest_relative != expected_manifest_relative
+        or marker_relative != expected_marker_relative
+    ):
+        raise ConfigError("model I/O receipt artifact paths are invalid")
+    manifest_path = attempt / expected_manifest_relative
+    marker_path = attempt / expected_marker_relative
+    _require_owned_attempt_path(
+        attempt, manifest_path, label="model I/O manifest", directory=False
+    )
+    _require_owned_attempt_path(
+        attempt, marker_path, label="model I/O success marker", directory=False
+    )
+    manifest_sha256 = sha256_file(manifest_path)
+    marker_sha256 = sha256_file(marker_path)
+    if (
+        receipt.get("manifest_sha256") != manifest_sha256
+        or re.fullmatch(r"[0-9a-f]{64}", marker_sha256) is None
+    ):
+        raise ConfigError("model I/O receipt artifact digest is invalid")
+    manifest = _json_object(
+        manifest_path, label="model I/O manifest", attempt=attempt
+    )
+    marker = _json_object(
+        marker_path, label="model I/O success marker", attempt=attempt
+    )
+    context = _model_io_contract_context(attempt, job, worker_id)
+    expected_manifest_keys = {
+        "schema_version",
+        "run_id",
+        "worker_id",
+        "task",
+        "checkpoint_sha256",
+        "contract_hash",
+        "source_inventory_digest",
+        "model_architecture",
+        "action_horizon",
+        "num_inference_steps",
+        "mapping_version",
+        "trace_session_id",
+        "episode_seed",
+        "seeded_reset_generation",
+        "result_identity",
+        "outcome_sha256",
+        "record_count",
+        "last_trace_call_index",
+        "last_http_response_sequence",
+        "trace_status",
+        "degraded_reasons",
+        "calls",
+        "error",
+        "created_at",
+    }
+    if (
+        set(manifest) != expected_manifest_keys
+        or manifest.get("schema_version") != MODEL_IO_TRACE_SCHEMA_VERSION
+        or any(manifest.get(key) != value for key, value in context.items())
+        or manifest.get("trace_session_id") != trace_session_id
+        or manifest.get("episode_seed") != job.episode_seed
+        or manifest.get("seeded_reset_generation") != seeded_generation
+        or manifest.get("result_identity") != job.result_identity
+        or manifest.get("outcome_sha256") != outcome_sha256
+        or manifest.get("record_count") != record_count
+        or manifest.get("last_trace_call_index") != last_trace_call_index
+        or manifest.get("last_http_response_sequence")
+        != last_http_response_sequence
+        or manifest.get("trace_status") != "complete"
+        or manifest.get("degraded_reasons") != []
+        or manifest.get("error") is not None
+        or not isinstance(manifest.get("calls"), list)
+        or len(manifest["calls"]) != record_count
+        or not isinstance(manifest.get("created_at"), str)
+        or not manifest["created_at"]
+    ):
+        raise ConfigError("model I/O manifest provenance is invalid")
+    expected_marker = {
+        "schema_version": MODEL_IO_RECEIPT_SCHEMA_VERSION,
+        "trace_session_id": trace_session_id,
+        "manifest_relative_path": expected_manifest_relative,
+        "manifest_sha256": manifest_sha256,
+    }
+    if marker != expected_marker:
+        raise ConfigError("model I/O success marker is invalid")
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        marker_bytes = marker_path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read terminal model I/O artifacts: {exc}") from exc
+    if (
+        manifest_bytes != canonical_json_bytes(manifest) + b"\n"
+        or marker_bytes != canonical_json_bytes(marker) + b"\n"
+    ):
+        raise ConfigError("model I/O terminal JSON is not canonical")
+    call_bytes = _validate_model_io_call_inventory(
+        attempt,
+        manifest_path.parent,
+        manifest,
+        context,
+        trace_session_id=trace_session_id,
+        episode_seed=job.episode_seed,
+        seeded_generation=seeded_generation,
+        record_count=record_count,
+    )
+    if total_bytes != call_bytes + len(manifest_bytes) + len(marker_bytes):
+        raise ConfigError("model I/O receipt total_bytes is not exact")
+    artifact = {
+        "receipt": dict(receipt),
+        "manifest": {
+            "path": str(manifest_path.resolve()),
+            "sha256": manifest_sha256,
+        },
+        "success_marker": {
+            "path": str(marker_path.resolve()),
+            "sha256": marker_sha256,
+        },
+    }
+    if recorded_artifact is not None and recorded_artifact != artifact:
+        raise ConfigError("canonical model I/O artifact drifted")
+    return artifact
+
+
+def _episode_requires_video(attempt: Path, job: EpisodeJob) -> bool:
+    contract = _json_object(
+        attempt.parent.parent / "contract.json",
+        label="video-policy executable contract",
+    )
+    static_plan = contract.get("static_plan")
+    policy = static_plan.get("policy") if isinstance(static_plan, dict) else None
+    episodes = static_plan.get("episodes") if isinstance(static_plan, dict) else None
+    every = policy.get("record_video_every_n") if isinstance(policy, dict) else None
+    if (
+        contract.get("schema_version") != CONTRACT_SCHEMA_VERSION
+        or not isinstance(static_plan, dict)
+        or contract.get("static_plan_hash") != canonical_sha256(static_plan)
+        or not isinstance(episodes, list)
+        or asdict(job) not in episodes
+        or type(every) is not int
+        or every < 0
+    ):
+        raise ConfigError("record-video policy provenance is invalid")
+    return every > 0 and job.episode_index % every == 0
+
+
+def validate_completion_envelope(
+    attempt: Path,
+    job: EpisodeJob,
+    *,
+    shadow_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     completion_path = attempt / "completions" / _completion_filename(job)
     if not os.path.lexists(completion_path):
         return None
@@ -1930,11 +2848,46 @@ def validate_completion_envelope(attempt: Path, job: EpisodeJob) -> dict[str, An
     if not isinstance(payload, dict) or completion.get("payload_sha256") != canonical_sha256(payload):
         return None
     artifacts: dict[str, Any] = {}
-    if payload.get("video_recorded"):
-        video_path = Path(str(payload.get("video_path", ""))).resolve()
-        if not _is_relative_to(video_path, attempt_root) or not video_path.is_file():
+    video_recorded = payload.get("video_recorded")
+    video_path_raw = payload.get("video_path")
+    if not isinstance(video_recorded, bool) or not isinstance(video_path_raw, str):
+        return None
+    if classification == "task_complete":
+        try:
+            requires_video = _episode_requires_video(attempt, job)
+        except ConfigError:
             return None
-        artifacts["video"] = {"path": str(video_path), "sha256": sha256_file(video_path)}
+        if requires_video:
+            if video_recorded is not True or not video_path_raw:
+                return None
+            video_path = Path(video_path_raw).resolve()
+            if (
+                not _is_relative_to(video_path, attempt_root)
+                or not video_path.is_file()
+                or video_path.is_symlink()
+            ):
+                return None
+            artifacts["video"] = {
+                "path": str(video_path),
+                "sha256": sha256_file(video_path),
+            }
+        elif video_recorded is not False or video_path_raw != "":
+            return None
+        if shadow_status is None:
+            return None
+        worker_id = completion.get("worker_id")
+        try:
+            artifacts["model_io"] = _validate_model_io_artifact(
+                attempt,
+                job,
+                payload,
+                str(worker_id),
+                shadow_status.get("model_io"),
+            )
+        except (ConfigError, OSError, RuntimeError, ValueError):
+            return None
+    elif video_recorded is not False or video_path_raw != "" or artifacts:
+        return None
     canonical = {
         "schema_version": EPISODE_SCHEMA_VERSION, "result_identity": job.result_identity,
         "job": asdict(job), "payload": payload, "worker_id": completion.get("worker_id", ""),
@@ -1944,8 +2897,15 @@ def validate_completion_envelope(attempt: Path, job: EpisodeJob) -> dict[str, An
     return canonical
 
 
-def validate_and_publish_completion(attempt: Path, job: EpisodeJob) -> dict[str, Any] | None:
-    canonical = validate_completion_envelope(attempt, job)
+def validate_and_publish_completion(
+    attempt: Path,
+    job: EpisodeJob,
+    *,
+    shadow_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    canonical = validate_completion_envelope(
+        attempt, job, shadow_status=shadow_status
+    )
     if canonical is None:
         return None
     atomic_write_json(attempt / "episodes" / _completion_filename(job), canonical)
@@ -1981,17 +2941,71 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
     stored_classification = payload.get("classification")
     if stored_classification is not None and stored_classification != classification:
         return None
-    if isinstance(result, dict) and result.get("video_recorded"):
-        artifact = payload.get("artifacts", {}).get("video") if isinstance(payload.get("artifacts"), dict) else None
-        if not isinstance(artifact, dict):
+    worker_id = payload.get("worker_id")
+    artifacts = payload.get("artifacts")
+    completion_path = attempt / "completions" / _completion_filename(job)
+    if (
+        not isinstance(worker_id, str)
+        or _WORKER_RE.fullmatch(worker_id) is None
+        or not isinstance(artifacts, dict)
+        or not completion_path.is_file()
+        or payload.get("completion_sha256") != sha256_file(completion_path)
+    ):
+        return None
+    if classification == "task_complete":
+        if not isinstance(result, dict):
             return None
-        video_path = Path(str(artifact.get("path", ""))).resolve()
-        if (
-            not _is_relative_to(video_path, attempt.resolve())
-            or not video_path.is_file()
-            or artifact.get("sha256") != sha256_file(video_path)
+        try:
+            requires_video = _episode_requires_video(attempt, job)
+        except ConfigError:
+            return None
+        expected_artifacts = {"model_io", "video"} if requires_video else {"model_io"}
+        if set(artifacts) != expected_artifacts:
+            return None
+        if requires_video:
+            artifact = artifacts.get("video")
+            if (
+                result.get("video_recorded") is not True
+                or not isinstance(result.get("video_path"), str)
+                or not result["video_path"]
+                or not isinstance(artifact, dict)
+                or set(artifact) != {"path", "sha256"}
+            ):
+                return None
+            video_path = Path(str(artifact.get("path", ""))).resolve()
+            if (
+                not _is_relative_to(video_path, attempt.resolve())
+                or not video_path.is_file()
+                or video_path.is_symlink()
+                or Path(result["video_path"]).resolve() != video_path
+                or artifact.get("sha256") != sha256_file(video_path)
+            ):
+                return None
+        elif (
+            result.get("video_recorded") is not False
+            or result.get("video_path") != ""
         ):
             return None
+        model_io = artifacts.get("model_io")
+        receipt = model_io.get("receipt") if isinstance(model_io, dict) else None
+        try:
+            _validate_model_io_artifact(
+                attempt,
+                job,
+                result,
+                worker_id,
+                receipt,
+                recorded_artifact=model_io,
+            )
+        except (ConfigError, OSError, RuntimeError, ValueError):
+            return None
+    elif (
+        artifacts != {}
+        or not isinstance(result, dict)
+        or result.get("video_recorded") is not False
+        or result.get("video_path") != ""
+    ):
+        return None
     return payload
 
 
@@ -2064,7 +3078,9 @@ def _persisted_shadow_proves_completion(
         or _process_group_has_live_members(process_group_id)
     ):
         return None
-    completion = validate_completion_envelope(attempt, job)
+    completion = validate_completion_envelope(
+        attempt, job, shadow_status=status
+    )
     if completion is None:
         return None
     envelope = _json_object(expected_completion, label="persisted completion envelope")
@@ -2074,7 +3090,6 @@ def _persisted_shadow_proves_completion(
     if (
         envelope.get("run_id") != attempt.name
         or envelope.get("worker_id") != worker_id
-        or envelope.get("result_identity") != job.result_identity
         or not _strict_episode_identity_matches(
             envelope.get("identity"), expected_completion_identity
         )
@@ -2091,12 +3106,30 @@ def _load_reusable_episode_result(
     *,
     max_retries: int,
 ) -> dict[str, Any] | None:
-    result = _read_existing_episode(attempt, job) or validate_completion_envelope(
-        attempt, job
-    )
+    records = _episode_attempt_records(attempt, job)
+    result = _read_existing_episode(attempt, job)
+    if result is None:
+        result = validate_completion_envelope(attempt, job)
+    if records and records[-1]["state"] == "running":
+        proven_completion = _persisted_shadow_proves_completion(
+            attempt, job, records[-1]
+        )
+        if proven_completion is not None:
+            result = proven_completion
+            _finish_episode_attempt(
+                attempt,
+                job,
+                int(records[-1]["attempt_number"]),
+                state="succeeded",
+                reason="completion_recovered_after_orchestrator_restart",
+                returncode=0,
+            )
+            atomic_write_json(
+                attempt / "episodes" / _completion_filename(job), result
+            )
+            records = _episode_attempt_records(attempt, job)
     if result is None:
         return None
-    records = _episode_attempt_records(attempt, job)
     if not records:
         return result
     payload = result.get("payload")
@@ -2128,22 +3161,6 @@ def _load_reusable_episode_result(
     last = records[-1]
     if last["state"] == "succeeded":
         return result
-    proven_completion = None
-    if last["state"] == "running":
-        proven_completion = _persisted_shadow_proves_completion(attempt, job, last)
-    if proven_completion is not None:
-        _finish_episode_attempt(
-            attempt,
-            job,
-            int(last["attempt_number"]),
-            state="succeeded",
-            reason="completion_recovered_after_orchestrator_restart",
-            returncode=0,
-        )
-        atomic_write_json(
-            attempt / "episodes" / _completion_filename(job), proven_completion
-        )
-        return proven_completion
     return None
 
 
@@ -2436,7 +3453,13 @@ def _server_command(
     return [
         str(args.repo / ".venv/bin/python"), "-m", "huge.inference.humanoidarena_http_server",
         "--repo-root", str(args.repo), "--checkpoint", str(checkpoint.checkpoint_dir),
-        "--allowed-checkpoint-root", str(args.repo / ".runs/stage3_humanoidarena"),
+        "--allowed-checkpoint-root", str(
+            _allowed_checkpoint_root(
+                args.repo,
+                checkpoint.checkpoint_dir,
+                task.checkpoint_task,
+            )
+        ),
         "--checkpoint-task", task.checkpoint_task, "--task", task.cli_task,
         "--isaac-task", task.isaac_task, "--instruction", task.instruction,
         "--host", "127.0.0.1", "--port", str(port), "--expected-cuda-uuid", binding.gpu.cuda_uuid,
@@ -2464,6 +3487,7 @@ def _expected_server_health(
         "motion_token_dim": 64,
         "action_horizon": 50,
         "control_hz": 50,
+        "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
     }
 
 
@@ -2981,7 +4005,9 @@ def _finish_worker_shadow(
 
     if status_valid:
         try:
-            completion = validate_completion_envelope(attempt, job)
+            completion = validate_and_publish_completion(
+                attempt, job, shadow_status=status
+            )
             if completion is None:
                 raise SimulationError(
                     f"shadow completed without a valid completion envelope: {job.result_identity}"
@@ -4201,12 +5227,16 @@ def _validate_gpu_admission_payload(
         "ordinal",
         "captured_at",
         "threshold_gib",
+        "allowed_compute_pid",
+        "compute_apps",
         "gpus",
     }
     if not isinstance(payload, dict) or set(payload) != expected_keys:
         raise SimulationError(f"GPU admission payload shape is invalid: {path}")
     captured_at = payload.get("captured_at")
     threshold_gib = payload.get("threshold_gib")
+    allowed_compute_pid = payload.get("allowed_compute_pid")
+    compute_apps = payload.get("compute_apps")
     gpus = payload.get("gpus")
     if (
         payload.get("schema_version") != GPU_ADMISSION_SCHEMA_VERSION
@@ -4220,6 +5250,9 @@ def _validate_gpu_admission_payload(
         or type(threshold_gib) is not float
         or not math.isfinite(threshold_gib)
         or threshold_gib < 0.0
+        or type(allowed_compute_pid) is not int
+        or allowed_compute_pid < 1
+        or not isinstance(compute_apps, list)
         or not isinstance(gpus, list)
         or not gpus
     ):
@@ -4247,13 +5280,8 @@ def _validate_gpu_admission_payload(
             or type(cuda_uuid) is not str
             or type(total_memory_bytes) is not int
             or total_memory_bytes <= 0
-            or (
-                free_memory_bytes is not None
-                and (
-                    type(free_memory_bytes) is not int
-                    or free_memory_bytes < 0
-                )
-            )
+            or type(free_memory_bytes) is not int
+            or free_memory_bytes < 0
         ):
             raise SimulationError(f"GPU admission identity values are invalid: {path}")
         try:
@@ -4266,6 +5294,29 @@ def _validate_gpu_admission_payload(
             raise SimulationError(f"GPU admission UUIDs are not unique: {path}")
         logical_ordinals.add(logical_ordinal)
         normalized_uuids.add(normalized_uuid)
+    seen_apps: set[tuple[str, int]] = set()
+    for app in compute_apps:
+        if not isinstance(app, dict) or set(app) != {"cuda_uuid", "pid", "allowed"}:
+            raise SimulationError(f"GPU admission compute-app shape is invalid: {path}")
+        app_uuid = app.get("cuda_uuid")
+        pid = app.get("pid")
+        try:
+            normalized_app_uuid = _normalize_uuid(str(app_uuid))
+        except GpuError as exc:
+            raise SimulationError(
+                f"GPU admission compute-app UUID is invalid: {path}"
+            ) from exc
+        if (
+            type(app_uuid) is not str
+            or normalized_app_uuid not in normalized_uuids
+            or type(pid) is not int
+            or pid < 1
+            or (normalized_app_uuid, pid) in seen_apps
+            or app.get("allowed") is not True
+            or pid != allowed_compute_pid
+        ):
+            raise SimulationError(f"GPU admission compute-app values are invalid: {path}")
+        seen_apps.add((normalized_app_uuid, pid))
     return payload
 
 
@@ -4315,6 +5366,8 @@ def _append_gpu_admission(
     threshold_gib: float,
     captured_at: float,
     gpus: Sequence[GpuIdentity],
+    allowed_compute_pid: int,
+    compute_apps: Sequence[Mapping[str, Any]],
 ) -> int:
     if run_id != attempt.name:
         raise SimulationError(
@@ -4335,6 +5388,8 @@ def _append_gpu_admission(
         "ordinal": ordinal,
         "captured_at": captured_at,
         "threshold_gib": threshold_gib,
+        "allowed_compute_pid": allowed_compute_pid,
+        "compute_apps": [dict(app) for app in compute_apps],
         "gpus": [
             {
                 "parent_logical_ordinal": gpu.parent_logical_ordinal,
@@ -4447,6 +5502,8 @@ def _record_gpu_admission(
     threshold_gib: float,
     captured_at: float,
     gpus: Sequence[GpuIdentity],
+    allowed_compute_pid: int,
+    compute_apps: Sequence[Mapping[str, Any]],
 ) -> int:
     try:
         _write_manifest(
@@ -4462,6 +5519,8 @@ def _record_gpu_admission(
             threshold_gib=threshold_gib,
             captured_at=captured_at,
             gpus=gpus,
+            allowed_compute_pid=allowed_compute_pid,
+            compute_apps=compute_apps,
         )
         _write_manifest(
             attempt,
@@ -4587,11 +5646,68 @@ def _finalize(
     return execution_failed
 
 
+def _validate_controlled_retry_required(
+    contract_dir: Path,
+    jobs: Sequence[EpisodeJob],
+    contract_hash: str,
+    source_digest: str,
+) -> Path:
+    attempts_root = contract_dir / "attempts"
+    if not attempts_root.is_dir():
+        raise ConfigError(
+            f"retry_required contract has no attempts directory: {contract_dir}"
+        )
+    try:
+        candidates = _canonical_attempt_candidates(attempts_root)
+    except OSError as exc:
+        raise ConfigError(
+            f"cannot inspect retry_required attempts: {attempts_root}: {exc}"
+        ) from exc
+    if not candidates:
+        raise ConfigError(
+            f"retry_required contract has no canonical attempt: {contract_dir}"
+        )
+    attempt = _validate_canonical_attempt_entry(
+        candidates[-1], attempts_root
+    )
+    manifest = _json_object(
+        attempt / "manifest.json",
+        label="retry_required attempt manifest",
+        attempt=attempt,
+    )
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or manifest.get("contract_hash") != contract_hash
+        or manifest.get("run_id") != attempt.name
+        or manifest.get("state") != "completed_with_failures"
+        or not (attempt / _COMPLETED_WITH_FAILURES_MARKER).is_file()
+        or os.path.lexists(attempt / "_SUCCESS")
+    ):
+        raise ConfigError(
+            f"retry_required does not reference the latest valid failed "
+            f"terminal attempt: {attempt}"
+        )
+    execution_failed = _verify_completed_attempt(
+        attempt, jobs, contract_hash, source_digest
+    )
+    if execution_failed <= 0:
+        raise ConfigError(
+            f"retry_required attempt has no verified execution failures: "
+            f"{attempt}"
+        )
+    return attempt
+
+
 def _execute(
     args: argparse.Namespace, task: TaskSpec, checkpoint: CheckpointContract, policy: Mapping[str, Any],
     jobs: Sequence[EpisodeJob], source_inventory: Mapping[str, Any], static_plan: Mapping[str, Any],
 ) -> int:
-    gpus, driver, gpu_snapshot_captured_at = discover_visible_gpus(policy)
+    gpus, driver, _ = discover_visible_gpus(policy)
+    fresh_gpu_admission_snapshot(
+        gpus,
+        threshold_gib=float(policy["min_free_gpu_memory_gib"]),
+        allowed_pid=os.getpid(),
+    )
     host = host_fingerprint()
     isaac_version, kit_build = isaac_fingerprint(args.isaaclab_python, args.isaaclab_root)
     output_root = Path(str(policy["output_root"]))
@@ -4606,11 +5722,48 @@ def _execute(
     worker_bindings = expand_worker_bindings(
         physical_bindings, int(policy["workers_per_gpu"])
     )
+    topology_rows = [
+        {
+            "parent_logical_ordinal": binding.gpu.parent_logical_ordinal,
+            "cuda_uuid": binding.gpu.cuda_uuid,
+            "renderer_ordinal": binding.renderer_ordinal,
+            "worker_slots": list(range(int(policy["workers_per_gpu"]))),
+        }
+        for binding in physical_bindings
+    ]
+    print(
+        "[eval_orchestrator] topology="
+        + json.dumps(
+            {
+                "physical_gpu_count": len(physical_bindings),
+                "workers_per_gpu": int(policy["workers_per_gpu"]),
+                "total_workers": len(worker_bindings),
+                "min_free_gpu_memory_gib": float(
+                    policy["min_free_gpu_memory_gib"]
+                ),
+                "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
+                "bindings": topology_rows,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
     executable = build_executable_contract(static_plan, worker_bindings, kit_digest)
     contract_hash = executable["contract_hash"]
     source_digest = str(source_inventory["source_inventory_digest"])
     checkpoint_label = f"{checkpoint.checkpoint_task}-{checkpoint.checkpoint_dir.name}"
     contract_dir = output_root / task.cli_task / checkpoint_label / contract_hash[:16]
+    retry_required_hash = str(
+        policy.get("retry_required_contract_hash", "")
+    )
+    if retry_required_hash and retry_required_hash != contract_hash:
+        raise ConfigError(
+            "retry_required previous contract hash does not equal the "
+            f"current executable contract hash: previous={retry_required_hash}, "
+            f"current={contract_hash}"
+        )
     contract_dir.mkdir(parents=True, exist_ok=True)
     contract_path = contract_dir / "contract.json"
     contract_bytes = canonical_json_bytes(executable["contract"])
@@ -4630,7 +5783,26 @@ def _execute(
         if canonical_json_bytes(stored_inventory) != canonical_json_bytes(source_inventory):
             raise ConfigError("stored source inventory does not match the executable contract")
 
+    print(
+        f"[eval_orchestrator] contract_path={contract_path} "
+        f"contract_hash={contract_hash}",
+        file=sys.stderr,
+        flush=True,
+    )
     with ContractLock(contract_dir / "contract.lock", contract_hash):
+        if retry_required_hash:
+            previous_attempt = _validate_controlled_retry_required(
+                contract_dir,
+                jobs,
+                contract_hash,
+                source_digest,
+            )
+            print(
+                f"[eval_orchestrator] controlled_retry previous_attempt="
+                f"{previous_attempt} contract_hash={contract_hash}",
+                file=sys.stderr,
+                flush=True,
+            )
         attempt = select_or_create_attempt(
             contract_dir / "attempts",
             contract_hash,
@@ -4722,12 +5894,21 @@ def _execute(
             for worker_index, shard in remaining_by_worker
         ]
         active_bindings = [binding for _, binding, _ in worker_specs]
+        refreshed_gpus, admission_captured_at, compute_apps = (
+            fresh_gpu_admission_snapshot(
+                gpus,
+                threshold_gib=float(policy["min_free_gpu_memory_gib"]),
+                allowed_pid=os.getpid(),
+            )
+        )
         _record_gpu_admission(
             attempt,
             contract_hash,
             threshold_gib=float(policy["min_free_gpu_memory_gib"]),
-            captured_at=gpu_snapshot_captured_at,
-            gpus=gpus,
+            captured_at=admission_captured_at,
+            gpus=refreshed_gpus,
+            allowed_compute_pid=os.getpid(),
+            compute_apps=compute_apps,
         )
         reservations = _reserve_ports(
             int(policy["base_port"]), len(worker_specs)
@@ -4989,6 +6170,11 @@ def _execute(
                         )
 
                 if not frozen:
+                    shadow_startups_in_progress = sum(
+                        worker.active_shadow is not None
+                        and not worker.active_binding_verified
+                        for worker in workers
+                    )
                     for worker in workers:
                         if _CANCEL_REQUESTED:
                             frozen = True
@@ -5078,6 +6264,10 @@ def _execute(
                                 continue
                             if not server_ready:
                                 continue
+                        if shadow_startups_in_progress >= int(
+                            policy["max_concurrent_shadow_startups"]
+                        ):
+                            continue
                         try:
                             _launch_worker_shadow(
                                 worker,
@@ -5090,6 +6280,7 @@ def _execute(
                                 yaml_config=static_plan["yaml"],
                                 runtime_env=runtime_env,
                             )
+                            shadow_startups_in_progress += 1
                         except EpisodeAttemptError as exc:
                             exhausted = _schedule_episode_failure(
                                 worker,
@@ -5237,7 +6428,10 @@ def _execute(
             return EXIT_INTERRUPTED
 
         for job in initially_pending:
-            if validate_and_publish_completion(attempt, job) is None:
+            if (
+                _read_existing_episode(attempt, job)
+                or validate_and_publish_completion(attempt, job)
+            ) is None:
                 raise SimulationError(
                     f"worker completed without a valid completion envelope: {job.result_identity}"
                 )

@@ -33,6 +33,8 @@ deepspeed_config="${HUGE_DEEPSPEED_CONFIG:-configs/deepspeed/ds_zero2.json}"
 deepspeed_config_arg_seen=0
 init_ckpt="${HUGE_INIT_CKPT:-}"
 init_ckpt_arg_seen=0
+resume_from_checkpoint="${HUGE_RESUME_FROM_CHECKPOINT:-}"
+resume_arg_seen=0
 output_dir=".runs/train"
 accelerate_config="${HUGE_ACCELERATE_CONFIG:-}"
 zero_stage=""
@@ -88,6 +90,10 @@ while [[ $# -gt 0 ]]; do
       init_ckpt="$2"; init_ckpt_arg_seen=1; train_args+=("$1" "$2"); shift 2 ;;
     --init_ckpt=*|--init-ckpt=*)
       init_ckpt="${1#*=}"; init_ckpt_arg_seen=1; train_args+=("$1"); shift ;;
+    --resume_from_checkpoint|--resume-from-checkpoint)
+      resume_from_checkpoint="$2"; resume_arg_seen=1; train_args+=("$1" "$2"); shift 2 ;;
+    --resume_from_checkpoint=*|--resume-from-checkpoint=*)
+      resume_from_checkpoint="${1#*=}"; resume_arg_seen=1; train_args+=("$1"); shift ;;
     --zero_stage|--zero-stage)
       zero_stage="$2"; train_args+=("$1" "$2"); shift 2 ;;
     --zero_stage=*|--zero-stage=*)
@@ -202,6 +208,9 @@ print_launch_config() {
   if [[ -n "$init_ckpt" ]]; then
     echo "==> init_ckpt=$init_ckpt"
   fi
+  if [[ -n "$resume_from_checkpoint" ]]; then
+    echo "==> resume_from_checkpoint=$resume_from_checkpoint"
+  fi
   if [[ -n "$run_id" ]]; then
     echo "==> run_id=$run_id"
   fi
@@ -237,25 +246,41 @@ launch_train() {
   shift
   local prev_stage
   local resolved_init_ckpt="$init_ckpt"
-  if [[ "$init_ckpt_arg_seen" -eq 0 && -z "$resolved_init_ckpt" ]]; then
-    prev_stage="$(previous_stage_for "$stage")"
-    if [[ -n "$prev_stage" ]]; then
-      resolved_init_ckpt="$(resolve_latest_stage_ckpt "$prev_stage")" || {
-        echo "==> ERROR: no checkpoint found for previous stage '$prev_stage' under $output_dir" >&2
-        echo "==>       run '$prev_stage' first, or pass --init-ckpt none to disable auto-init." >&2
-        exit 1
-      }
-      init_ckpt="$resolved_init_ckpt"
+  case "${resume_from_checkpoint,,}" in
+    ""|none|null) resume_from_checkpoint="" ;;
+  esac
+  if [[ -n "$resume_from_checkpoint" ]]; then
+    case "${resolved_init_ckpt,,}" in
+      ""|none|null) ;;
+      *)
+        echo "==> ERROR: --init-ckpt and --resume-from-checkpoint are mutually exclusive" >&2
+        exit 2
+        ;;
+    esac
+    if [[ "$resume_arg_seen" -eq 0 ]]; then
+      train_args+=(--resume-from-checkpoint "$resume_from_checkpoint")
+    fi
+  else
+    if [[ "$init_ckpt_arg_seen" -eq 0 && -z "$resolved_init_ckpt" ]]; then
+      prev_stage="$(previous_stage_for "$stage")"
+      if [[ -n "$prev_stage" ]]; then
+        resolved_init_ckpt="$(resolve_latest_stage_ckpt "$prev_stage")" || {
+          echo "==> ERROR: no checkpoint found for previous stage '$prev_stage' under $output_dir" >&2
+          echo "==>       run '$prev_stage' first, or pass --init-ckpt none to disable auto-init." >&2
+          exit 1
+        }
+        init_ckpt="$resolved_init_ckpt"
+      fi
+    fi
+    if [[ "$init_ckpt_arg_seen" -eq 0 && -n "$resolved_init_ckpt" ]]; then
+      train_args+=(--init-ckpt "$resolved_init_ckpt")
     fi
   fi
-  if [[ "$init_ckpt_arg_seen" -eq 0 && -n "$resolved_init_ckpt" ]]; then
-    train_args+=(--init-ckpt "$resolved_init_ckpt")
-  fi
-  if [[ "$run_id_arg_seen" -eq 0 ]]; then
+  if [[ "$run_id_arg_seen" -eq 0 && -z "$resume_from_checkpoint" ]]; then
     run_id="${run_id:-$(date +%Y%m%d_%H%M%S)}"
     train_args+=(--run-id "$run_id")
   fi
-  if [[ "$run_name_arg_seen" -eq 0 && -n "$run_name" ]]; then
+  if [[ "$run_name_arg_seen" -eq 0 && -n "$run_name" && -z "$resume_from_checkpoint" ]]; then
     train_args+=(--run-name "$run_name")
   fi
   local launch_args=(

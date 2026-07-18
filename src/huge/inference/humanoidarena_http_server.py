@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation
 
 from huge.data.humanoid_arena_preprocess import GROUP_IDX, GROUP_ORDER
@@ -53,6 +54,8 @@ MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_EDGE = 4096
 MAPPING_VERSION = "humanoidarena_rotlocal_v31_to_huge_proprio_v1"
+MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
+_MODEL_NOISE_SEED_MASK = (1 << 63) - 1
 REQUIRED_CHECKPOINT_FILES = (
     "config.json",
     "model.safetensors",
@@ -96,6 +99,12 @@ class ParsedInferRequest:
     state: np.ndarray
 
 
+def derive_model_noise_seed(episode_seed: int) -> int:
+    payload = f"{MODEL_NOISE_SEED_ALGORITHM}|{int(episode_seed)}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False) & _MODEL_NOISE_SEED_MASK
+
+
 @dataclass
 class EpisodeState:
     reset_generation: int = 0
@@ -104,17 +113,33 @@ class EpisodeState:
     last_completed_sequence: int = 0
     has_reset: bool = False
     hand_hysteresis: HandHysteresis = field(default_factory=HandHysteresis)
+    model_noise_seed: int | None = None
+    model_noise_generator: torch.Generator | None = field(default=None, repr=False)
 
     @property
     def hand_state(self) -> np.ndarray:
         return self.hand_hysteresis.state.copy()
 
-    def reset(self, seed: int | None) -> None:
+    def reset(
+        self,
+        seed: int | None,
+        *,
+        generator_device: str | torch.device = "cpu",
+    ) -> None:
+        model_noise_seed = None
+        model_noise_generator = None
+        if seed is not None:
+            model_noise_seed = derive_model_noise_seed(seed)
+            model_noise_generator = torch.Generator(device=torch.device(generator_device))
+            model_noise_generator.manual_seed(model_noise_seed)
         self.reset_generation += 1
         self.sequence = 0
         self.last_completed_sequence = 0
         self.has_reset = True
         self.hand_hysteresis.reset()
+        self.last_seeded_episode = None
+        self.model_noise_seed = model_noise_seed
+        self.model_noise_generator = model_noise_generator
         if seed is not None:
             self.last_seeded_episode = int(seed)
 
@@ -155,6 +180,8 @@ class PolicyLike(Protocol):
     def get_action_with_trace(
         self,
         observation: dict[str, Any],
+        *,
+        generator: torch.Generator | None = None,
     ) -> tuple[dict[str, np.ndarray], Any]: ...
 
 
@@ -522,42 +549,9 @@ def parse_infer_payload(
 
 
 def load_safetensors_strict(model: Any, path: str | Path, *, device: str) -> None:
-    import torch
-    from safetensors import safe_open
-    from safetensors.torch import load_file
+    from huge.models.qwen_sonicfm import load_portable_safetensors_strict
 
-    source = Path(path).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"model.safetensors not found: {source}")
-    expected_state = model.state_dict()
-    expected_keys = set(expected_state)
-    with safe_open(source, framework="pt", device="cpu") as stream:
-        checkpoint_keys = set(stream.keys())
-    if checkpoint_keys != expected_keys:
-        missing = sorted(expected_keys - checkpoint_keys)
-        unexpected = sorted(checkpoint_keys - expected_keys)
-        raise RuntimeError(
-            f"checkpoint key mismatch: missing={missing}, unexpected={unexpected}"
-        )
-    state_dict = load_file(str(source), device=str(device))
-    shared_groups: dict[tuple[str, int], list[str]] = {}
-    for name, tensor in expected_state.items():
-        key = (str(tensor.device), tensor.untyped_storage().data_ptr())
-        shared_groups.setdefault(key, []).append(name)
-    for names in shared_groups.values():
-        if len(names) < 2:
-            continue
-        reference = state_dict[names[0]]
-        if any(not torch.equal(reference, state_dict[name]) for name in names[1:]):
-            raise RuntimeError(f"checkpoint shared aliases differ: {sorted(names)}")
-    model.load_state_dict(state_dict, strict=True)
-    del state_dict
-    with torch.no_grad():
-        for name, tensor in model.state_dict().items():
-            if (torch.is_floating_point(tensor) or torch.is_complex(tensor)) and not bool(
-                torch.isfinite(tensor).all().item()
-            ):
-                raise ValueError(f"checkpoint contains non-finite tensor: {name}")
+    load_portable_safetensors_strict(model, path, device=device)
 
 
 def load_policy_strict(contract: CheckpointContract, *, device: str) -> PolicyLike:
@@ -684,6 +678,7 @@ class InferenceRuntime:
             "fatal_error_code": self.fatal_error_code,
             "trace_status": self._trace_status,
             "trace_error": self._trace_error,
+            "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
             "updated_at": time.time(),
         }
         payload.update(extra)
@@ -813,6 +808,7 @@ class InferenceRuntime:
                 "control_hz": CONTROL_FREQ_HZ,
                 "mapping_version": MAPPING_VERSION,
                 "mapping_source_sha256": _mapping_source_sha256(),
+                "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
                 "trace_status": self._trace_status,
                 "trace_error": self._trace_error,
             }
@@ -826,7 +822,7 @@ class InferenceRuntime:
                     "server_fatal",
                     "server is in fatal state",
                 )
-            self.episode.reset(seed)
+            self.episode.reset(seed, generator_device=self.contract.device)
             if seed is not None:
                 self._begin_trace_locked(seed)
             self._write_status("ready")
@@ -860,7 +856,10 @@ class InferenceRuntime:
                     "state": proprio,
                     "language": self.contract.instruction,
                 }
-                parts, policy_trace = self.policy.get_action_with_trace(observation)
+                parts, policy_trace = self.policy.get_action_with_trace(
+                    observation,
+                    generator=self.episode.model_noise_generator,
+                )
                 action = combine_action_dict(parts)
                 if action.ndim == 3 and action.shape[0] == 1:
                     action = action[0]
@@ -1183,6 +1182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cuda_uuid": args.expected_cuda_uuid,
         "trace_status": "incomplete",
         "trace_error": "",
+        "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
         "updated_at": time.time(),
     }
     atomic_write_json(status_file, starting_status)

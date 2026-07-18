@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -13,6 +14,257 @@ from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM
 from huge.models.action_heads.starvla_gr00t_head import StarVLAGR00TActionHead
 from huge.models.action_heads.starvla_oft_head import StarVLAOFTActionHead
 from huge.models.action_heads.starvla_pi_head import StarVLAPIActionHead
+
+
+PORTABLE_SAFETENSORS_SCHEMA = "huge_portable_safetensors_v1"
+_SAFETENSORS_SCHEMA_KEY = "huge_schema"
+_SAFETENSORS_ALIASES_KEY = "huge_shared_tensor_aliases"
+
+
+def _portable_dtype_compatible(saved: torch.dtype, runtime: torch.dtype) -> bool:
+    if saved == runtime:
+        return True
+    return saved in {torch.bfloat16, torch.float16} and runtime == torch.float32
+
+
+def _shared_tensor_aliases(
+    model: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, str]:
+    """Return deterministic aliases for exact shared model-state tensor views."""
+    names = set(state_dict)
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(group: list[str]) -> None:
+        if len(group) < 2:
+            return
+        root = find(group[0])
+        for name in group[1:]:
+            other = find(name)
+            if other != root:
+                parent[other] = root
+
+    object_groups: dict[int, list[str]] = {}
+    for name, tensor in (
+        *model.named_parameters(remove_duplicate=False),
+        *model.named_buffers(remove_duplicate=False),
+    ):
+        if name in names:
+            object_groups.setdefault(id(tensor), []).append(name)
+    for group in object_groups.values():
+        union(group)
+
+    view_groups: dict[tuple[Any, ...], list[str]] = {}
+    for name, tensor in state_dict.items():
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"model state contains a non-tensor value: {name}")
+        if tensor.device.type == "meta" or tensor.numel() == 0:
+            continue
+        storage = tensor.untyped_storage()
+        pointer = storage.data_ptr()
+        size = storage.nbytes()
+        if pointer == 0 or size == 0:
+            continue
+        signature = (
+            str(tensor.device),
+            pointer,
+            size,
+            tensor.storage_offset(),
+            tensor.dtype,
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+        )
+        view_groups.setdefault(signature, []).append(name)
+    for group in view_groups.values():
+        union(group)
+
+    components: dict[str, list[str]] = {}
+    for name in sorted(names):
+        components.setdefault(find(name), []).append(name)
+    aliases: dict[str, str] = {}
+    for group in components.values():
+        if len(group) < 2:
+            continue
+        canonical = min(group)
+        for name in sorted(group):
+            if name != canonical:
+                aliases[name] = canonical
+    return aliases
+
+
+def _save_portable_safetensors(
+    model: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    destination: Path,
+) -> None:
+    from safetensors.torch import save_file
+
+    expected_state = model.state_dict()
+    expected_keys = set(expected_state)
+    actual_keys = set(state_dict)
+    if actual_keys != expected_keys:
+        raise RuntimeError(
+            "portable checkpoint state key mismatch: "
+            f"missing={sorted(expected_keys - actual_keys)}, "
+            f"unexpected={sorted(actual_keys - expected_keys)}"
+        )
+    aliases = _shared_tensor_aliases(model, expected_state)
+    for alias, canonical in aliases.items():
+        alias_tensor = state_dict[alias]
+        canonical_tensor = state_dict[canonical]
+        if not torch.is_tensor(alias_tensor) or not torch.is_tensor(canonical_tensor):
+            raise TypeError(f"portable shared state contains a non-tensor: {alias} -> {canonical}")
+        if alias_tensor.shape != canonical_tensor.shape or alias_tensor.dtype != canonical_tensor.dtype:
+            raise RuntimeError(f"portable shared alias shape/dtype mismatch: {alias} -> {canonical}")
+        same_view = (
+            alias_tensor.device == canonical_tensor.device
+            and alias_tensor.untyped_storage().data_ptr()
+            == canonical_tensor.untyped_storage().data_ptr()
+            and alias_tensor.storage_offset() == canonical_tensor.storage_offset()
+            and alias_tensor.stride() == canonical_tensor.stride()
+        )
+        if not same_view and not torch.equal(alias_tensor, canonical_tensor):
+            raise RuntimeError(f"portable shared alias values differ: {alias} -> {canonical}")
+
+    tensors: dict[str, torch.Tensor] = {}
+    for name in sorted(expected_keys - set(aliases)):
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"portable state contains a non-tensor value: {name}")
+        expected = expected_state[name]
+        if tensor.shape != expected.shape or not _portable_dtype_compatible(
+            tensor.dtype,
+            expected.dtype,
+        ):
+            raise RuntimeError(
+                f"portable tensor shape/dtype mismatch: {name}: "
+                f"saved={tensor.dtype}, runtime={expected.dtype}"
+            )
+        tensors[name] = tensor.detach().cpu().contiguous()
+    metadata = {
+        _SAFETENSORS_SCHEMA_KEY: PORTABLE_SAFETENSORS_SCHEMA,
+        _SAFETENSORS_ALIASES_KEY: json.dumps(
+            aliases,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ),
+    }
+    save_file(tensors, str(destination), metadata=metadata)
+
+
+def load_portable_safetensors_strict(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    device: str | torch.device,
+) -> None:
+    """Strictly load historical or v1 alias-aware Huge weights."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"model.safetensors not found: {source}")
+    expected_state = model.state_dict()
+    expected_keys = set(expected_state)
+    expected_aliases = _shared_tensor_aliases(model, expected_state)
+    with safe_open(source, framework="pt", device="cpu") as stream:
+        checkpoint_keys = set(stream.keys())
+        metadata = stream.metadata()
+
+    canonical_keys = expected_keys - set(expected_aliases)
+    no_metadata = metadata is None or metadata == {}
+    legacy_full_key_format = no_metadata and checkpoint_keys == expected_keys
+    legacy_deduplicated_format = no_metadata and checkpoint_keys == canonical_keys
+    historical_save_model_format = metadata == expected_aliases and bool(expected_aliases)
+    if no_metadata:
+        if not legacy_full_key_format and not legacy_deduplicated_format:
+            raise RuntimeError(
+                "checkpoint key mismatch for metadata-free safetensors: "
+                f"actual={sorted(checkpoint_keys)}, expected one of: "
+                f"full-key={sorted(expected_keys)}, "
+                f"canonical-only={sorted(canonical_keys)}"
+            )
+        expected_file_keys = expected_keys if legacy_full_key_format else canonical_keys
+    elif historical_save_model_format:
+        expected_file_keys = canonical_keys
+    else:
+        if not isinstance(metadata, dict) or set(metadata) != {
+            _SAFETENSORS_SCHEMA_KEY,
+            _SAFETENSORS_ALIASES_KEY,
+        }:
+            raise RuntimeError("checkpoint safetensors metadata schema mismatch")
+        if metadata[_SAFETENSORS_SCHEMA_KEY] != PORTABLE_SAFETENSORS_SCHEMA:
+            raise RuntimeError(
+                "unsupported checkpoint safetensors schema: "
+                f"{metadata[_SAFETENSORS_SCHEMA_KEY]!r}"
+            )
+        try:
+            aliases = json.loads(metadata[_SAFETENSORS_ALIASES_KEY])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("invalid checkpoint shared-tensor metadata") from exc
+        if aliases != expected_aliases:
+            raise RuntimeError(
+                "checkpoint shared-tensor aliases mismatch: "
+                f"expected={expected_aliases}, actual={aliases}"
+            )
+        expected_file_keys = canonical_keys
+
+    if checkpoint_keys != expected_file_keys:
+        raise RuntimeError(
+            "checkpoint key mismatch: "
+            f"missing={sorted(expected_file_keys - checkpoint_keys)}, "
+            f"unexpected={sorted(checkpoint_keys - expected_file_keys)}"
+        )
+    state_dict = load_file(str(source), device=str(device))
+    for name, tensor in state_dict.items():
+        expected = expected_state[name]
+        if tensor.shape != expected.shape or not _portable_dtype_compatible(
+            tensor.dtype,
+            expected.dtype,
+        ):
+            raise RuntimeError(
+                f"checkpoint tensor shape/dtype mismatch: {name}: "
+                f"saved={tensor.dtype}, runtime={expected.dtype}"
+            )
+    if legacy_full_key_format:
+        for alias, canonical in expected_aliases.items():
+            alias_tensor = state_dict[alias]
+            canonical_tensor = state_dict[canonical]
+            if (
+                alias_tensor.shape != canonical_tensor.shape
+                or alias_tensor.dtype != canonical_tensor.dtype
+                or not torch.equal(alias_tensor, canonical_tensor)
+            ):
+                raise RuntimeError(f"legacy checkpoint shared aliases differ: {alias} -> {canonical}")
+    else:
+        for alias, canonical in expected_aliases.items():
+            canonical_tensor = state_dict[canonical]
+            expected_alias = expected_state[alias]
+            if canonical_tensor.shape != expected_alias.shape or not _portable_dtype_compatible(
+                canonical_tensor.dtype,
+                expected_alias.dtype,
+            ):
+                raise RuntimeError(
+                    f"checkpoint shared alias shape/dtype mismatch: {alias} -> {canonical}: "
+                    f"saved={canonical_tensor.dtype}, runtime={expected_alias.dtype}"
+                )
+            state_dict[alias] = canonical_tensor
+    model.load_state_dict(state_dict, strict=True)
+    del state_dict
+    with torch.no_grad():
+        for name, tensor in model.state_dict().items():
+            if (torch.is_floating_point(tensor) or torch.is_complex(tensor)) and not bool(
+                torch.isfinite(tensor).all().item()
+            ):
+                raise ValueError(f"checkpoint contains non-finite tensor: {name}")
 
 
 @dataclass
@@ -347,6 +599,7 @@ class QwenSonicFM(nn.Module):
         action_token_mask: torch.Tensor | None = None,
         horizon: int | None = None,
         num_inference_steps: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         del input_ids, images
         if self.action_head is None:
@@ -362,6 +615,7 @@ class QwenSonicFM(nn.Module):
                 encoder_attention_mask=attention_mask,
                 horizon=horizon or self.config.action_horizon,
                 num_inference_steps=num_inference_steps or self.config.num_inference_steps,
+                generator=generator,
             )
         hidden_states, attention_mask = self._encode_qwen(qwen_inputs=qwen_inputs)
         last_hidden = self._project_vlm_layer(hidden_states[-1])
@@ -375,6 +629,7 @@ class QwenSonicFM(nn.Module):
                 encoder_attention_mask=attention_mask,
                 horizon=horizon or self.config.action_horizon,
                 num_inference_steps=num_inference_steps or self.config.num_inference_steps,
+                generator=generator,
             )
         action_queries = self._gather_action_queries(
             last_hidden,
@@ -389,27 +644,15 @@ class QwenSonicFM(nn.Module):
         metadata: dict[str, Any] | None = None,
         state_dict: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        import json
         from dataclasses import asdict
-
-        from safetensors.torch import save_file, save_model
 
         dst = Path(output_dir)
         dst.mkdir(parents=True, exist_ok=True)
-        if state_dict is None:
-            save_model(self, str(dst / "model.safetensors"))
-        else:
-            tensors: dict[str, torch.Tensor] = {}
-            seen_storage_ptrs: set[int] = set()
-            for k, v in state_dict.items():
-                if not torch.is_tensor(v):
-                    continue
-                storage_ptr = v.untyped_storage().data_ptr()
-                if storage_ptr in seen_storage_ptrs:
-                    continue
-                seen_storage_ptrs.add(storage_ptr)
-                tensors[k] = v.detach().cpu().contiguous()
-            save_file(tensors, str(dst / "model.safetensors"))
+        _save_portable_safetensors(
+            self,
+            self.state_dict() if state_dict is None else state_dict,
+            dst / "model.safetensors",
+        )
         (dst / "config.json").write_text(
             json.dumps({"config": asdict(self.config), "metadata": metadata or {}}, indent=2),
             encoding="utf-8",
@@ -417,10 +660,6 @@ class QwenSonicFM(nn.Module):
 
     @classmethod
     def from_checkpoint(cls, checkpoint_dir: str | Path, *, map_location: str | torch.device = "cpu") -> "QwenSonicFM":
-        import json
-
-        from safetensors.torch import load_model
-
         ckpt_path = Path(checkpoint_dir)
         if ckpt_path.is_dir():
             ckpt_path = ckpt_path / "model.safetensors"
@@ -430,5 +669,5 @@ class QwenSonicFM(nn.Module):
         allowed_keys = {field.name for field in fields(QwenSonicFMConfig)}
         config = QwenSonicFMConfig(**{k: v for k, v in config_raw.items() if k in allowed_keys})
         model = cls(config)
-        load_model(model, str(ckpt_path), strict=False, device=str(map_location))
+        load_portable_safetensors_strict(model, ckpt_path, device=map_location)
         return model

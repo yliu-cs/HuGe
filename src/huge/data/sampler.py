@@ -1,23 +1,45 @@
-"""Episode-aware block shuffle sampler."""
+"""Episode-aware, epoch-addressable block shuffle sampler."""
 
 from __future__ import annotations
 
-from typing import Iterator
+import hashlib
+from typing import Any, Iterator
 
 import numpy as np
 import torch
 from torch.utils.data import Sampler
 
 
+SAMPLER_STATE_SCHEMA_VERSION = 1
+
+
 class BlockShuffleSampler(Sampler[int]):
-    def __init__(self, episode_spans: np.ndarray, block_size: int, generator: torch.Generator | None = None) -> None:
+    """Shuffle contiguous episode blocks from a deterministic epoch seed."""
+
+    def __init__(
+        self,
+        episode_spans: np.ndarray,
+        block_size: int,
+        generator: torch.Generator | None = None,
+        *,
+        base_seed: int | None = None,
+    ) -> None:
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
         spans = np.asarray(episode_spans, dtype=np.int64)
         if spans.ndim != 2 or spans.shape[1] != 2:
             raise ValueError(f"episode_spans must be [N,2], got {spans.shape}")
+        if np.any(spans < 0):
+            raise ValueError("episode_spans starts and lengths must be non-negative")
+        if base_seed is not None and generator is not None:
+            raise ValueError("pass either base_seed or generator, not both")
+        if base_seed is None:
+            base_seed = int(generator.initial_seed()) if generator is not None else 0
+        if base_seed < 0:
+            raise ValueError("base_seed must be non-negative")
         self.block_size = int(block_size)
-        self.generator = generator
+        self.base_seed = int(base_seed)
+        self.epoch = 0
         starts: list[int] = []
         lengths: list[int] = []
         for start, length in spans:
@@ -27,16 +49,50 @@ class BlockShuffleSampler(Sampler[int]):
         self.starts = np.asarray(starts, dtype=np.int64)
         self.lengths = np.asarray(lengths, dtype=np.int64)
         self.total = int(spans[:, 1].sum())
+        digest = hashlib.sha256()
+        digest.update(self.starts.tobytes())
+        digest.update(self.lengths.tobytes())
+        self.span_fingerprint = digest.hexdigest()
 
     def __len__(self) -> int:
         return self.total
 
+    def set_epoch(self, epoch: int) -> None:
+        if int(epoch) < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = int(epoch)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SAMPLER_STATE_SCHEMA_VERSION,
+            "base_seed": self.base_seed,
+            "epoch": self.epoch,
+            "block_size": self.block_size,
+            "total": self.total,
+            "span_fingerprint": self.span_fingerprint,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        expected_keys = {"schema_version", "base_seed", "epoch", "block_size", "total", "span_fingerprint"}
+        if (
+            not isinstance(state, dict)
+            or set(state) != expected_keys
+            or state.get("schema_version") != SAMPLER_STATE_SCHEMA_VERSION
+        ):
+            raise ValueError(f"unsupported BlockShuffleSampler state: {state!r}")
+        expected = {
+            "base_seed": self.base_seed,
+            "block_size": self.block_size,
+            "total": self.total,
+            "span_fingerprint": self.span_fingerprint,
+        }
+        mismatches = {key: (expected_value, state.get(key)) for key, expected_value in expected.items() if state.get(key) != expected_value}
+        if mismatches:
+            raise ValueError(f"BlockShuffleSampler state does not match current data contract: {mismatches}")
+        self.set_epoch(int(state.get("epoch", -1)))
+
     def __iter__(self) -> Iterator[int]:
-        if self.generator is not None:
-            seed = int(torch.empty((), dtype=torch.int64).random_(generator=self.generator).item())
-            rng = np.random.default_rng(seed)
-        else:
-            rng = np.random.default_rng()
+        rng = np.random.default_rng(self.base_seed + self.epoch)
         for block_id in rng.permutation(len(self.starts)):
             start = int(self.starts[block_id])
             length = int(self.lengths[block_id])
