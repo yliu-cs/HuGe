@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from importlib import metadata as importlib_metadata
 import json
 import math
 import os
@@ -35,23 +34,6 @@ MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
 MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
 MODEL_IO_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
 MODEL_IO_TRACE_POLICY = "require_complete_v1"
-ROOT_SOFTWARE_SCHEMA_VERSION = "huge_root_software_v1"
-ROOT_SOFTWARE_PACKAGES = (
-    "torch",
-    "torchvision",
-    "transformers",
-    "accelerate",
-    "safetensors",
-    "numpy",
-    "scipy",
-    "Pillow",
-    "qwen-vl-utils",
-    "flash-attn",
-    "peft",
-    "onnxruntime-gpu",
-    "opencv-python",
-    "psutil",
-)
 STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v1"
 CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
@@ -63,9 +45,6 @@ EXPECTED_RUN_MATRIX = (
     ("qwenpi_v3", (6000, 12000, 18000, 24000, 30000)),
     ("qwengr00t", (6000, 12000, 18000, 24000, 30000)),
     ("qwenoft", (6000, 12000, 18000, 24000, 30000)),
-)
-EXPECTED_CHECKPOINT_COUNT = sum(
-    len(steps) for _architecture, steps in EXPECTED_RUN_MATRIX
 )
 ALLOWED_TRAINING_ROOT_NAMES = (
     "stage3_humanoidarena_full_optimized",
@@ -79,33 +58,6 @@ REQUIRED_CHECKPOINT_FILES = (
     "model.safetensors",
     "proprio_stats_sonic.json",
     "proprio_norm_config.json",
-)
-EXPECTED_HUGE_SOURCE_PATHS = (
-    "src/huge/inference/humanoidarena_io_trace.py",
-    "src/huge/inference/humanoidarena_http_server.py",
-    "src/huge/inference/policy.py",
-    "src/huge/inference/observation.py",
-    "src/huge/inference/sonic_adapter.py",
-    "src/huge/data/state_normalizer.py",
-    "src/huge/data/transforms.py",
-    "src/huge/models/qwen_sonicfm.py",
-    "src/huge/data/humanoid_arena_preprocess.py",
-    "src/huge/data/schemas.py",
-    "src/huge/models/action_heads/__init__.py",
-    "src/huge/models/action_heads/hand_binary_head.py",
-    "src/huge/models/action_heads/layerwise_cross_dit_fm.py",
-    "src/huge/models/action_heads/starvla_gr00t_head.py",
-    "src/huge/models/action_heads/starvla_oft_head.py",
-    "src/huge/models/action_heads/starvla_pi_head.py",
-    "scripts/eval/humanoidarena/eval_orchestrator.py",
-    "scripts/eval/run_ha_eval.sh",
-    "scripts/eval/humanoidarena/watch_eval_summary.py",
-    "scripts/eval/humanoidarena/shard_checkpoints.py",
-    "scripts/eval/humanoidarena/sim_eval_shadow.py",
-    "scripts/eval/humanoidarena/run_eval.sh",
-    "scripts/eval/humanoidarena/env.sh",
-    "pyproject.toml",
-    "uv.lock",
 )
 TERMINAL_MARKER_STATES = {
     "_SUCCESS": "success",
@@ -410,54 +362,6 @@ def _validate_portable_checkpoint_publication(
     }
 
 
-def _directory_inventory(path: Path) -> dict[str, str] | None:
-    if not path.is_dir():
-        return None
-    inventory: dict[str, str] = {}
-    try:
-        for entry in sorted(path.rglob("*")):
-            if entry.is_symlink():
-                if not _is_relative_to(entry.resolve(), path.resolve()):
-                    return None
-                inventory[entry.relative_to(path).as_posix()] = (
-                    f"symlink:{os.readlink(entry)}"
-                )
-            elif entry.is_file():
-                inventory[entry.relative_to(path).as_posix()] = _sha256_file(entry)
-    except OSError:
-        return None
-    return inventory or None
-
-
-def _matches_file_hash_mapping(
-    mapping: Any,
-    root: Path,
-    *,
-    expected_names: set[str] | None = None,
-) -> bool:
-    if not isinstance(mapping, dict) or not mapping:
-        return False
-    if expected_names is not None and set(mapping) != expected_names:
-        return False
-    resolved_root = root.resolve()
-    for relative, expected_digest in mapping.items():
-        if (
-            not isinstance(relative, str)
-            or not isinstance(expected_digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
-        ):
-            return False
-        path = (resolved_root / relative).resolve()
-        if not path.is_file() or not _is_relative_to(path, resolved_root):
-            return False
-        try:
-            if _sha256_file(path) != expected_digest:
-                return False
-        except OSError:
-            return False
-    return True
-
-
 def validate_shard(*, index: int, count: int) -> None:
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise ShardConfigError("shard index must be a non-negative integer")
@@ -676,9 +580,14 @@ def _validate_training_completion_barrier(
     return local
 
 
-def discover_targets(repo_root: Path, checkpoint_roots: Sequence[Path]) -> list[ShardTarget]:
+def discover_targets(
+    repo_root: Path,
+    checkpoint_roots: Sequence[Path],
+    *,
+    expected_run_matrix: Sequence[tuple[str, Sequence[int]]] = EXPECTED_RUN_MATRIX,
+) -> list[ShardTarget]:
     repo = repo_root.expanduser().resolve()
-    if len(checkpoint_roots) != len(EXPECTED_RUN_MATRIX):
+    if len(checkpoint_roots) != len(expected_run_matrix):
         raise ShardConfigError(
             "exactly three run-specific roots are required in "
             "qwenpi_v3, qwengr00t, qwenoft order"
@@ -687,7 +596,7 @@ def discover_targets(repo_root: Path, checkpoint_roots: Sequence[Path]) -> list[
     seen_roots: set[Path] = set()
     seen_checkpoints: set[Path] = set()
     for raw_root, (architecture, expected_steps) in zip(
-        checkpoint_roots, EXPECTED_RUN_MATRIX
+        checkpoint_roots, expected_run_matrix
     ):
         root, training_base = _resolve_training_run_root(
             repo, raw_root, architecture
@@ -706,7 +615,7 @@ def discover_targets(repo_root: Path, checkpoint_roots: Sequence[Path]) -> list[
             seen_checkpoints.add(checkpoint)
         ordered.extend(local)
 
-    expected_total = EXPECTED_CHECKPOINT_COUNT
+    expected_total = sum(len(steps) for _architecture, steps in expected_run_matrix)
     if len(ordered) != expected_total:
         raise ShardConfigError(
             f"checkpoint barrier expected {expected_total} targets, got {len(ordered)}"
@@ -903,255 +812,6 @@ def _matches_current_checkpoint_and_yaml(
     )
 
 
-def _matches_current_source_inventory(
-    contract: Mapping[str, Any],
-    repo_root: Path,
-) -> bool:
-    static_plan = contract.get("static_plan")
-    source = static_plan.get("source_inventory") if isinstance(static_plan, dict) else None
-    if not isinstance(source, dict) or set(source) != {
-        "files",
-        "source_inventory_digest",
-    }:
-        return False
-    files = source.get("files")
-    if (
-        not isinstance(files, dict)
-        or set(files)
-        != {
-            "upstream_compatibility",
-            "wrapper_semantics",
-            "wrapper_semantics_digest",
-            "huge_sources",
-            "task_yaml",
-                "checkpoint_files",
-                "checkpoint_publication",
-                "sonic_assets",
-            "qwen_assets",
-            "qwen_assets_digest",
-        }
-        or source.get("source_inventory_digest") != _canonical_sha256(files)
-    ):
-        return False
-    repo = repo_root.expanduser().resolve()
-    humanoidarena = (repo / "HumanoidArena").resolve()
-    isaaclab = (humanoidarena / "isaaclab_twist2_g1").resolve()
-    if not humanoidarena.is_dir() or not isaaclab.is_dir():
-        return False
-    if not _matches_file_hash_mapping(
-        files.get("huge_sources"),
-        repo,
-        expected_names=set(EXPECTED_HUGE_SOURCE_PATHS),
-    ):
-        return False
-    if not _matches_file_hash_mapping(
-        files.get("upstream_compatibility"), humanoidarena
-    ) or not _matches_file_hash_mapping(files.get("wrapper_semantics"), isaaclab):
-        return False
-    yaml_payload = static_plan.get("yaml")
-    checkpoint_payload = static_plan.get("checkpoint")
-    if not isinstance(yaml_payload, dict) or not isinstance(checkpoint_payload, dict):
-        return False
-    if files.get("task_yaml") != {
-        yaml_payload.get("path"): yaml_payload.get("sha256")
-    } or files.get("checkpoint_files") != checkpoint_payload.get("files"):
-        return False
-    if files.get("checkpoint_publication") != checkpoint_payload.get(
-        "portable_publication"
-    ):
-        return False
-    qwen_raw = checkpoint_payload.get("qwen_path")
-    if not isinstance(qwen_raw, str):
-        return False
-    qwen_path = (repo / qwen_raw).resolve()
-    if not _is_relative_to(qwen_path, repo):
-        return False
-    qwen_inventory = _directory_inventory(qwen_path)
-    if (
-        qwen_inventory is None
-        or files.get("qwen_assets") != qwen_inventory
-        or files.get("qwen_assets_digest") != _canonical_sha256(qwen_inventory)
-    ):
-        return False
-    sonic_paths = {
-        "huge_encoder": repo / "resource/model/sonic/model_encoder.onnx",
-        "huge_decoder": repo / "resource/model/sonic/model_decoder.onnx",
-        "humanoidarena_encoder": (
-            humanoidarena
-            / "GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_encoder.onnx"
-        ),
-        "humanoidarena_decoder": (
-            humanoidarena
-            / "GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_decoder.onnx"
-        ),
-    }
-    try:
-        current_sonic = {
-            name: _sha256_file(path)
-            for name, path in sonic_paths.items()
-            if path.is_file()
-        }
-    except OSError:
-        return False
-    if set(current_sonic) != set(sonic_paths) or files.get("sonic_assets") != current_sonic:
-        return False
-    wrapper_digest = files.get("wrapper_semantics_digest")
-    return (
-        isinstance(wrapper_digest, str)
-        and re.fullmatch(r"[0-9a-f]{64}", wrapper_digest) is not None
-    )
-
-
-def _requested_gpu_topology() -> tuple[tuple[int, ...], int, float] | None:
-    raw_count = os.environ.get("HUGE_EVAL_GPU_COUNT", "")
-    raw_ids = os.environ.get("HUGE_EVAL_GPU_LOGICAL_IDS", "")
-    if raw_count and raw_ids:
-        return None
-    try:
-        if raw_count:
-            count = int(raw_count)
-            if count < 1:
-                return None
-            ordinals = tuple(range(count))
-        elif raw_ids:
-            parsed = tuple(
-                int(token.strip())
-                for token in raw_ids.split(",")
-                if token.strip()
-            )
-            if (
-                not parsed
-                or len(set(parsed)) != len(parsed)
-                or any(ordinal < 0 for ordinal in parsed)
-            ):
-                return None
-            ordinals = parsed
-        else:
-            ordinals = tuple(range(8))
-        workers_per_gpu = int(
-            os.environ.get("HUGE_EVAL_WORKERS_PER_GPU", "1")
-        )
-        min_free_gib = float(
-            os.environ.get("HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB", "0")
-        )
-    except ValueError:
-        return None
-    if (
-        workers_per_gpu not in {1, 2}
-        or not math.isfinite(min_free_gib)
-        or min_free_gib < 0.0
-        or (workers_per_gpu == 2 and min_free_gib <= 0.0)
-    ):
-        return None
-    return ordinals, workers_per_gpu, min_free_gib
-
-
-def _matches_requested_gpu_bindings(
-    bindings: Any,
-    ordinals: Sequence[int],
-    workers_per_gpu: int,
-) -> bool:
-    if (
-        not isinstance(bindings, list)
-        or len(bindings) != len(ordinals) * workers_per_gpu
-    ):
-        return False
-    expected_gpu_keys = {
-        "parent_logical_ordinal",
-        "child_cuda_visible_token",
-        "cuda_uuid",
-        "pci_bus_id",
-        "device_name",
-        "total_memory_bytes",
-        "compute_capability",
-        "free_memory_bytes",
-    }
-    per_parent: dict[int, list[tuple[int, int, dict[str, Any]]]] = {}
-    for binding in bindings:
-        if not isinstance(binding, dict) or set(binding) != {
-            "gpu",
-            "renderer_ordinal",
-            "worker_slot",
-        }:
-            return False
-        gpu = binding.get("gpu")
-        renderer = binding.get("renderer_ordinal")
-        worker_slot = binding.get("worker_slot")
-        if (
-            not isinstance(gpu, dict)
-            or set(gpu) != expected_gpu_keys
-            or type(renderer) is not int
-            or renderer < 0
-            or type(worker_slot) is not int
-            or not 0 <= worker_slot < workers_per_gpu
-        ):
-            return False
-        ordinal = gpu.get("parent_logical_ordinal")
-        uuid = gpu.get("cuda_uuid")
-        if (
-            type(ordinal) is not int
-            or ordinal not in ordinals
-            or not isinstance(uuid, str)
-            or re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid, re.IGNORECASE)
-            is None
-            or gpu.get("child_cuda_visible_token") != uuid
-            or not isinstance(gpu.get("pci_bus_id"), str)
-            or not gpu["pci_bus_id"]
-            or not isinstance(gpu.get("device_name"), str)
-            or not gpu["device_name"]
-            or type(gpu.get("total_memory_bytes")) is not int
-            or gpu["total_memory_bytes"] <= 0
-            or not isinstance(gpu.get("compute_capability"), str)
-            or re.fullmatch(r"[0-9]+[.][0-9]+", gpu["compute_capability"])
-            is None
-            or gpu.get("free_memory_bytes") is not None
-        ):
-            return False
-        per_parent.setdefault(ordinal, []).append(
-            (worker_slot, renderer, gpu)
-        )
-
-    if set(per_parent) != set(ordinals):
-        return False
-    physical_uuids: set[str] = set()
-    physical_pcis: set[str] = set()
-    physical_renderers: set[int] = set()
-    for ordinal in ordinals:
-        rows = per_parent[ordinal]
-        if len(rows) != workers_per_gpu:
-            return False
-        first_gpu = rows[0][2]
-        renderer_values = {renderer for _slot, renderer, _gpu in rows}
-        if (
-            {slot for slot, _renderer, _gpu in rows}
-            != set(range(workers_per_gpu))
-            or len(renderer_values) != 1
-            or any(
-                not _strict_json_equal(gpu, first_gpu)
-                for _slot, _renderer, gpu in rows[1:]
-            )
-        ):
-            return False
-        uuid = str(first_gpu["cuda_uuid"]).upper()
-        pci = str(first_gpu["pci_bus_id"]).upper()
-        renderer = next(iter(renderer_values))
-        if (
-            uuid in physical_uuids
-            or pci in physical_pcis
-            or renderer in physical_renderers
-        ):
-            return False
-        physical_uuids.add(uuid)
-        physical_pcis.add(pci)
-        physical_renderers.add(renderer)
-    return (
-        len(physical_uuids)
-        == len(physical_pcis)
-        == len(physical_renderers)
-        == len(ordinals)
-    )
-
-
 def _current_host_fingerprint() -> str:
     machine_id = ""
     try:
@@ -1167,29 +827,6 @@ def _current_host_fingerprint() -> str:
             "machine": platform.machine(),
         }
     )
-
-
-def _current_root_software(repo_root: Path) -> dict[str, Any] | None:
-    repo = repo_root.expanduser().resolve()
-    try:
-        if Path(sys.prefix).resolve(strict=True) != (repo / ".venv").resolve():
-            return None
-    except (OSError, RuntimeError):
-        return None
-    packages: dict[str, str | None] = {}
-    for distribution in ROOT_SOFTWARE_PACKAGES:
-        try:
-            packages[distribution] = importlib_metadata.version(distribution)
-        except importlib_metadata.PackageNotFoundError:
-            packages[distribution] = None
-    return {
-        "schema_version": ROOT_SOFTWARE_SCHEMA_VERSION,
-        "interpreter": ".venv/bin/python",
-        "python": platform.python_version(),
-        "implementation": platform.python_implementation(),
-        "platform": platform.platform(),
-        "packages": packages,
-    }
 
 
 def _contract_execution_host_is_current(
@@ -1213,209 +850,6 @@ def _contract_execution_host_is_current(
         isinstance(kit_payload, dict)
         and kit_payload.get("host_fingerprint")
         == _current_host_fingerprint()
-    )
-
-
-def _matches_current_executable_contract(
-    contract: Mapping[str, Any],
-    repo_root: Path,
-) -> bool:
-    if set(contract) != {
-        "schema_version",
-        "static_plan",
-        "static_plan_hash",
-        "gpu_bindings",
-        "kit_gpu_map_sha256",
-    }:
-        return False
-    static_plan = contract.get("static_plan")
-    if (
-        contract.get("schema_version") != CONTRACT_SCHEMA_VERSION
-        or not isinstance(static_plan, dict)
-        or set(static_plan)
-        != {
-            "schema_version",
-            "task",
-            "checkpoint",
-            "yaml",
-            "policy",
-            "protocol",
-            "episode_seed_algorithm",
-            "model_noise_seed_algorithm",
-            "episodes",
-            "source_inventory",
-            "upstream_contract",
-            "software",
-        }
-        or static_plan.get("schema_version") != STATIC_PLAN_SCHEMA_VERSION
-        or contract.get("static_plan_hash") != _canonical_sha256(static_plan)
-    ):
-        return False
-    expected_task = {
-        "cli_task": "pp_box",
-        "checkpoint_task": EXPECTED_CHECKPOINT_TASK,
-        "isaac_task": EXPECTED_ISAAC_TASK,
-        "yaml_stem": "pp_box",
-        "instruction": EXPECTED_INSTRUCTION,
-        "default_max_steps": EXPECTED_MAX_STEPS,
-        "default_record_video_every_n": 1,
-        "memory_limit_percent": None,
-    }
-    if static_plan.get("task") != expected_task:
-        return False
-    checkpoint = static_plan.get("checkpoint")
-    yaml_config = static_plan.get("yaml")
-    policy = static_plan.get("policy")
-    if (
-        not isinstance(checkpoint, dict)
-        or set(checkpoint)
-        != {
-            "relative_path",
-            "step",
-            "checkpoint_task",
-            "checkpoint_sha256",
-            "files",
-            "qwen_path",
-            "model_architecture",
-            "action_horizon",
-            "num_inference_steps",
-            "portable_publication",
-        }
-        or not isinstance(yaml_config, dict)
-        or set(yaml_config)
-        != {
-            "path",
-            "sha256",
-            "seeds",
-            "repeats_per_seed",
-            "source_persistent_sim",
-            "episode_seed_formula",
-            "vision_randomization",
-            "selected_seeds",
-            "selected_repeats_per_seed",
-        }
-        or yaml_config.get("seeds") != EXPECTED_SEEDS
-        or yaml_config.get("repeats_per_seed") != EXPECTED_REPEATS_PER_SEED
-        or yaml_config.get("vision_randomization") is not None
-        or not isinstance(policy, dict)
-    ):
-        return False
-    required_policy = {
-        "test_mode": EXPECTED_TEST_MODE,
-        "effective_persistent_sim": False,
-        "simulator_process_scope": "per_episode_v1",
-        "model_io_schema": "huge_humanoidarena_model_io_trace_v1",
-        "model_io_trace_policy": MODEL_IO_TRACE_POLICY,
-        "max_steps": EXPECTED_MAX_STEPS,
-        "post_termination_record_steps": 10,
-        "record_video_every_n": 1,
-        "episode_max_retries": 1,
-        "headless": True,
-        "enable_depth": False,
-        "robot_type": "unitree_g1_refpose_v3_1",
-        "root_rot6d_layout": "row",
-        "root_max_delta_deg": 26.0,
-        "heading_align": True,
-        "output_delay_steps": 0,
-        "memory_limit_percent": None,
-        "open_door_latch": None,
-    }
-    if any(policy.get(key) != value for key, value in required_policy.items()):
-        return False
-    requested_topology = _requested_gpu_topology()
-    if requested_topology is None:
-        return False
-    requested_ordinals, requested_workers_per_gpu, requested_min_free_gib = (
-        requested_topology
-    )
-    try:
-        current_policy = {
-            "video_fps": int(os.environ.get("VIDEO_FPS", "30")),
-            "step_log_every_n": int(
-                os.environ.get("HUGE_EVAL_STEP_LOG_EVERY_N", "100")
-            ),
-            "server_timeout": float(
-                os.environ.get("HUGE_EVAL_SERVER_TIMEOUT", "360.0")
-            ),
-            "shadow_startup_timeout_sec": float(
-                os.environ.get("HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC", "180")
-            ),
-            "episode_timeout_sec": float(
-                os.environ.get("HUGE_EVAL_EPISODE_TIMEOUT_SEC", "900")
-            ),
-            "retry_backoff_sec": float(
-                os.environ.get("HUGE_EVAL_RETRY_BACKOFF_SEC", "5")
-            ),
-            "workers_per_gpu": requested_workers_per_gpu,
-            "max_concurrent_shadow_startups": int(
-                os.environ.get("HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS", "2")
-            ),
-            "min_free_gpu_memory_gib": requested_min_free_gib,
-        }
-    except ValueError:
-        return False
-    if current_policy["max_concurrent_shadow_startups"] < 1:
-        return False
-    if any(policy.get(key) != value for key, value in current_policy.items()):
-        return False
-    if (
-        static_plan.get("protocol")
-        != {
-            "http": "huge_humanoidarena_http_v1",
-            "mapping": "humanoidarena_rotlocal_v31_to_huge_proprio_v1",
-            "action": [50, 66],
-            "latent": [50, 64],
-        }
-        or static_plan.get("episode_seed_algorithm") != EPISODE_SEED_FORMULA
-        or static_plan.get("model_noise_seed_algorithm")
-        != MODEL_NOISE_SEED_ALGORITHM
-    ):
-        return False
-    software = static_plan.get("software")
-    if software != _current_root_software(repo_root):
-        return False
-    repo = repo_root.expanduser().resolve()
-    upstream_path = (
-        repo
-        / "HumanoidArena/isaaclab_twist2_g1/script/eval_scripts/sonic/sim_eval_vla.py"
-    ).resolve()
-    upstream = static_plan.get("upstream_contract")
-    try:
-        upstream_digest = _sha256_file(upstream_path)
-    except OSError:
-        return False
-    if (
-        not isinstance(upstream, dict)
-        or upstream.get("status") != "compatible"
-        or upstream.get("path") != str(upstream_path)
-        or upstream.get("sha256") != upstream_digest
-        or not isinstance(upstream.get("required_signatures"), dict)
-        or not isinstance(upstream.get("forbidden_helpers"), list)
-    ):
-        return False
-    kit_digest = contract.get("kit_gpu_map_sha256")
-    kit_path_raw = policy.get("kit_gpu_map_file")
-    if (
-        not isinstance(kit_digest, str)
-        or re.fullmatch(r"[0-9a-f]{64}", kit_digest) is None
-        or not isinstance(kit_path_raw, str)
-    ):
-        return False
-    kit_path = Path(kit_path_raw).expanduser().resolve()
-    if (
-        not kit_path.is_file()
-        or not _is_relative_to(kit_path, (repo / ".runs").resolve())
-    ):
-        return False
-    try:
-        if _sha256_file(kit_path) != kit_digest:
-            return False
-    except OSError:
-        return False
-    return _matches_requested_gpu_bindings(
-        contract.get("gpu_bindings"),
-        requested_ordinals,
-        requested_workers_per_gpu,
     )
 
 
@@ -1522,9 +956,7 @@ def _matches_full_pp_box_contract(
         and (
             repo_root is None
             or (
-                _matches_current_executable_contract(contract, repo_root)
-                and _matches_current_checkpoint_and_yaml(contract, relative_path, repo_root)
-                and _matches_current_source_inventory(contract, repo_root)
+                _matches_current_checkpoint_and_yaml(contract, relative_path, repo_root)
             )
         )
     )
@@ -2680,10 +2112,30 @@ def select_pending_shard(
     ]
 
 
+def _parse_expected_steps(value: str) -> tuple[int, ...]:
+    raw_steps = value.split(",")
+    if not raw_steps or any(
+        re.fullmatch(r"[1-9][0-9]*", item) is None for item in raw_steps
+    ):
+        raise argparse.ArgumentTypeError(
+            "--expected-steps must be comma-separated positive integers"
+        )
+    steps = tuple(int(item) for item in raw_steps)
+    if tuple(sorted(set(steps))) != steps:
+        raise argparse.ArgumentTypeError("--expected-steps must be unique and strictly ascending")
+    return steps
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--eval-root", required=True, type=Path)
+    parser.add_argument(
+        "--expected-steps",
+        type=_parse_expected_steps,
+        default=EXPECTED_RUN_MATRIX[0][1],
+        help="shared comma-separated checkpoint steps for all three architectures",
+    )
     parser.add_argument("--shard-index", required=True, type=int)
     parser.add_argument("--shard-count", required=True, type=int)
     parser.add_argument(
@@ -2697,9 +2149,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    expected_run_matrix = tuple(
+        (architecture, args.expected_steps)
+        for architecture, _steps in EXPECTED_RUN_MATRIX
+    )
     try:
         validate_shard(index=args.shard_index, count=args.shard_count)
-        targets = discover_targets(args.repo_root, args.checkpoint_roots)
+        targets = discover_targets(
+            args.repo_root,
+            args.checkpoint_roots,
+            expected_run_matrix=expected_run_matrix,
+        )
         statuses = checkpoint_contract_statuses(
             args.eval_root, {target.relative_path for target in targets},
             allowed_root=args.repo_root / ".runs",

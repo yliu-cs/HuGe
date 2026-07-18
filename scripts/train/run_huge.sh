@@ -16,12 +16,12 @@ set -euo pipefail
 # found under HUGE_STAGE2_SOURCE_ROOT. The sim tree is never written to:
 #   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_real_cola}/stride_<stride>/stage3/<ts>/
 #
-# humanoid_arena mode (the default) trains HOI_pp_box full tuning. Without an
+# humanoid_arena mode (the default) trains all tasks with full tuning. Without an
 # architecture selector it uses the fixed order qwenoft -> qwenpi_v3 ->
 # qwengr00t; formal multi-host runs select exactly one architecture with
 # --arch. It writes to:
 #   ${HUGE_RUN_ROOT:-./.runs/stage3_humanoidarena_full_optimized}/
-#     HOI_pp_box/<arch>/full/stage3/<run_id>/
+#     all/<arch>/full/stage3/<run_id>/
 #
 # Useful environment variables:
 #   HUGE_DRY_RUN=1                 print commands without launching training
@@ -33,7 +33,7 @@ set -euo pipefail
 #   HUGE_SIM_STAGE3_CHECKPOINTING_STEPS=...   sim stage3 ckpt interval (default 500)
 #   HUGE_REAL_STAGE3_EPOCHS=...    real stage3 epochs (default 50)
 #   HUGE_REAL_STAGE3_CHECKPOINTING_STEPS=...  real stage3 ckpt interval (default 20000)
-#   HUGE_HUMANOID_ARENA_TASK=...   exact HumanoidArena task name, or all (default HOI_pp_box)
+#   HUGE_HUMANOID_ARENA_TASK=...   exact HumanoidArena task name, or all (default all)
 #   HUGE_HUMANOID_ARENA_INIT_CKPT=...  optional init checkpoint (default none/from scratch)
 #   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenoft qwenpi_v3 qwengr00t")
 #   HUGE_HUMANOID_ARENA_TUNING_MODES=...      space-separated modes (default "full")
@@ -43,8 +43,8 @@ set -euo pipefail
 #   HUGE_HUMANOID_ARENA_ACTION_LR=...         full action-head LR (default 1e-4)
 #   HUGE_HUMANOID_ARENA_WARMUP_RATIO=...      full warmup ratio (default 0.05)
 #   HUGE_HUMANOID_ARENA_MIN_LR_RATE=...       full cosine floor ratio (default 0.04)
-#   HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS=... full model/state interval (default 6000)
-#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 30000)
+#   HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS=... full model/state interval (default 20000)
+#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 150000)
 #   HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS=...    optional qwenoft override
 #   HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS=...  optional qwenpi_v3 override
 #   HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS=...  optional qwengr00t override
@@ -98,20 +98,20 @@ REAL_STAGE3_CHECKPOINTING_STEPS="${HUGE_REAL_STAGE3_CHECKPOINTING_STEPS:-20000}"
 STAGE2_SOURCE_ROOT="${HUGE_STAGE2_SOURCE_ROOT:-./.runs/stage1_stride_abla}"
 
 # --- humanoid_arena stage3 (full-only by default; legacy modes are opt-in) ---
-HUMANOID_ARENA_TASK="${HUGE_HUMANOID_ARENA_TASK:-HOI_pp_box}"
+HUMANOID_ARENA_TASK="${HUGE_HUMANOID_ARENA_TASK:-all}"
 HUMANOID_ARENA_ROOT="${HUGE_STAGE3_HUMANOID_ARENA_ROOT:-resource/datasets/HumanoidArena}"
 HUMANOID_ARENA_STATS="${HUGE_STAGE3_HUMANOID_ARENA_PROPRIO_STATS:-$HUMANOID_ARENA_ROOT/meta/proprio_stats_union_sonic.json}"
 HUMANOID_ARENA_INIT_CKPT="${HUGE_HUMANOID_ARENA_INIT_CKPT:-none}"
 HUMANOID_ARENA_RESUME_STATE="${HUGE_HUMANOID_ARENA_RESUME_STATE:-}"
 HUMANOID_ARENA_STAGE3_EPOCHS="${HUGE_HUMANOID_ARENA_STAGE3_EPOCHS:-50}"
-HUMANOID_ARENA_CHECKPOINTING_STEPS="${HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS:-${HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS:-6000}}"
+HUMANOID_ARENA_CHECKPOINTING_STEPS="${HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS:-${HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS:-20000}}"
 HUMANOID_ARENA_RESUME_STATE_KEEP="${HUGE_HUMANOID_ARENA_RESUME_STATE_KEEP:-2}"
 HUMANOID_ARENA_VLM_LR="${HUGE_HUMANOID_ARENA_VLM_LR:-1e-5}"
 HUMANOID_ARENA_PROJECTOR_LR="${HUGE_HUMANOID_ARENA_PROJECTOR_LR:-2.5e-5}"
 HUMANOID_ARENA_ACTION_LR="${HUGE_HUMANOID_ARENA_ACTION_LR:-1e-4}"
 HUMANOID_ARENA_WARMUP_RATIO="${HUGE_HUMANOID_ARENA_WARMUP_RATIO:-0.05}"
 HUMANOID_ARENA_MIN_LR_RATE="${HUGE_HUMANOID_ARENA_MIN_LR_RATE:-0.04}"
-HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-30000}"
+HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-150000}"
 HUMANOID_ARENA_QWENOFT_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENPI_V3_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENGR00T_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"

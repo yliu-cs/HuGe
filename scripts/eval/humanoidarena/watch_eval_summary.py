@@ -406,7 +406,7 @@ def _validate_running_completion(
     attempt: Path,
     path: Path,
     episode: ExpectedEpisode,
-) -> bool:
+) -> tuple[bool, bool]:
     completion = _json_object(path, label=f"completion {path.name}")
     if completion.get("schema_version") != COMPLETION_SCHEMA_VERSION:
         raise SummaryError(f"completion {path.name} schema_version is invalid")
@@ -471,15 +471,18 @@ def _validate_running_completion(
         raise SummaryError(
             f"completion {path.name} raw result content does not match payload"
         )
-    return execution_failed
+    return execution_failed, success
 
 
 def _running_metrics(
     attempt: Path, episodes: dict[str, ExpectedEpisode]
-) -> tuple[str, str]:
+) -> tuple[str, str, str, str]:
     completions = attempt / "completions"
     completed = 0
     execution_failed = 0
+    total_success = 0
+    completed_by_seed: dict[int, int] = {}
+    success_by_seed: dict[int, int] = {}
     try:
         if os.path.lexists(completions):
             _require_owned_attempt_path(
@@ -504,11 +507,37 @@ def _running_metrics(
             if episode is None:
                 raise SummaryError(f"extra completion does not match contract: {path.name}")
             completed += 1
-            if _validate_running_completion(attempt, path, episode):
+            outcome_execution_failed, success = _validate_running_completion(
+                attempt, path, episode
+            )
+            if outcome_execution_failed:
                 execution_failed += 1
+            if success:
+                total_success += 1
+                success_by_seed[episode.seed] = success_by_seed.get(episode.seed, 0) + 1
+            completed_by_seed[episode.seed] = completed_by_seed.get(episode.seed, 0) + 1
     except OSError as exc:
         raise SummaryError(f"cannot count completions: {exc}") from exc
-    return f"{completed}/{len(episodes)}", str(execution_failed)
+
+    success_metric = "-"
+    seed_rates = "-"
+    if completed == len(episodes) and completed > 0:
+        rates: list[float] = []
+        for seed in sorted({episode.seed for episode in episodes.values()}):
+            seed_completed = completed_by_seed.get(seed, 0)
+            if seed_completed <= 0:
+                raise SummaryError(f"completed checkpoint has no results for seed {seed}")
+            rates.append(success_by_seed.get(seed, 0) / seed_completed)
+        rate = total_success / completed
+        stddev = statistics.pstdev(rates)
+        success_metric = f"{rate * 100:.2f}% ± {stddev * 100:.2f}%"
+        seed_rates = ",".join(f"{seed_rate * 100:.1f}%" for seed_rate in rates)
+    return (
+        f"{completed}/{len(episodes)}",
+        str(execution_failed),
+        success_metric,
+        seed_rates,
+    )
 
 
 def _running_progress(
@@ -995,7 +1024,9 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
                 execution_failed=str(execution_failed),
                 checkpoint_relative_path=checkpoint_relative_path,
             )
-        progress, execution_failed = _running_metrics(attempt, episodes)
+        progress, execution_failed, success, seed_rates = _running_metrics(
+            attempt, episodes
+        )
         return EvalRow(
             task,
             architecture,
@@ -1004,8 +1035,8 @@ def _row_from_contract(contract_path: Path, eval_root: Path) -> EvalRow:
             step,
             RUNNING,
             progress,
-            "-",
-            "-",
+            success,
+            seed_rates,
             execution_failed=execution_failed,
             checkpoint_relative_path=checkpoint_relative_path,
         )
@@ -1067,7 +1098,7 @@ def _strict_checkpoint_relative_path(value: object, selector: Any) -> str:
     ):
         raise SummaryError(
             "strict checkpoint.relative_path architecture/step is outside the "
-            f"frozen {selector.EXPECTED_CHECKPOINT_COUNT}-checkpoint matrix"
+            "supported checkpoint matrix"
         )
     return value
 
@@ -1150,7 +1181,7 @@ def _strict_contract_groups(
     return groups, list(diagnostics.values())
 
 
-def _strict_current_contracts(
+def _strict_eligible_contracts(
     selector: Any,
     contract_paths: list[Path],
     *,
@@ -1194,14 +1225,14 @@ def _strict_current_contracts(
 
 def _strict_success_candidates(
     selector: Any,
-    current_contracts: list[tuple[Path, str, dict[str, Any]]],
+    eligible_contracts: list[tuple[Path, str, dict[str, Any]]],
     *,
     eval_root: Path,
     repo_root: Path,
     relative_path: str,
 ) -> list[tuple[Path, str, Path]]:
     successes: list[tuple[Path, str, Path]] = []
-    for contract_path, contract_hash, contract in current_contracts:
+    for contract_path, contract_hash, contract in eligible_contracts:
         try:
             attempts_root = (contract_path.parent / "attempts").resolve()
             if (
@@ -1275,7 +1306,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
         rows.extend(
             _strict_identity_row(
                 relative_path,
-                error=f"strict current-source validation failed: {exc}",
+                error=f"strict contract validation failed: {exc}",
             )
             for relative_path in sorted(groups)
         )
@@ -1283,7 +1314,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
 
     for relative_path, contract_paths in sorted(groups.items()):
         status = statuses[relative_path]
-        current_contracts = _strict_current_contracts(
+        eligible_contracts = _strict_eligible_contracts(
             selector,
             contract_paths,
             eval_root=eval_root,
@@ -1292,7 +1323,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
         )
         successes = _strict_success_candidates(
             selector,
-            current_contracts,
+            eligible_contracts,
             eval_root=eval_root,
             repo_root=repo_root,
             relative_path=relative_path,
@@ -1311,7 +1342,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
                         relative_path,
                         error=(
                             "selector accepted provenance does not uniquely match "
-                            "a legal current-source `_SUCCESS` contract"
+                            "a legal `_SUCCESS` contract"
                         ),
                     )
                 )
@@ -1369,8 +1400,8 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
             )
             continue
 
-        if len(current_contracts) == 1:
-            contract_path, _contract_hash, _contract = current_contracts[0]
+        if len(eligible_contracts) == 1:
+            contract_path, _contract_hash, _contract = eligible_contracts[0]
             base = _row_from_contract(contract_path, eval_root)
             if base.status == DONE:
                 rows.append(
@@ -1378,7 +1409,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
                         base,
                         relative_path=relative_path,
                         error=(
-                            "current-source row is DONE but no legal `_SUCCESS` "
+                            "eligible row is DONE but no legal `_SUCCESS` "
                             "was accepted"
                         ),
                     )
@@ -1394,16 +1425,16 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
                 )
             continue
 
-        if len(current_contracts) > 1:
+        if len(eligible_contracts) > 1:
             provenance = ", ".join(
                 f"{path}#{contract_hash}"
-                for path, contract_hash, _contract in current_contracts
+                for path, contract_hash, _contract in eligible_contracts
             )
             rows.append(
                 _strict_identity_row(
                     relative_path,
                     error=(
-                        "multiple current-source contracts exist without one "
+                        "multiple eligible contracts exist without one "
                         f"accepted `_SUCCESS`: {provenance}"
                     ),
                 )
@@ -1417,7 +1448,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
                 base,
                 relative_path=relative_path,
                 error=(
-                    "no legal current-source contract is selectable; "
+                    "no legal contract is selectable; "
                     f"discovered_contracts={len(contract_paths)}"
                 ),
             )
@@ -1452,10 +1483,10 @@ def _sort_rows(rows: list[EvalRow]) -> list[EvalRow]:
 def collect_rows(
     eval_root: Path,
     *,
-    strict_current_source: bool = False,
+    strict: bool = False,
     repo_root: Path | None = None,
 ) -> list[EvalRow]:
-    if strict_current_source:
+    if strict:
         resolved_repo = (
             repo_root.expanduser().resolve()
             if repo_root is not None
@@ -1481,9 +1512,6 @@ def _table(rows: list[EvalRow]) -> str:
         "PROGRESS",
         "EXEC_FAILED",
         "SUCCESS RATE ± STD",
-        "CHECKPOINT_RELATIVE_PATH",
-        "ACCEPTED_CONTRACT_PATH",
-        "ACCEPTED_CONTRACT_HASH",
     )
     values = [
         (
@@ -1496,9 +1524,6 @@ def _table(rows: list[EvalRow]) -> str:
             row.progress,
             row.execution_failed,
             row.success,
-            row.checkpoint_relative_path or "-",
-            row.accepted_contract_path or "-",
-            row.accepted_contract_hash or "-",
         )
         for row in rows
     ]
@@ -1579,15 +1604,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-root",
         type=Path,
         default=repo_root,
-        help="repository root used for strict current-source validation",
+        help="repository root used for strict checkpoint contract validation",
     )
     parser.add_argument(
-        "--strict-current-source",
         "--strict",
         action="store_true",
         help=(
             "group by checkpoint relative path and accept exactly one legal "
-            "current-source _SUCCESS contract per discovered checkpoint"
+            "_SUCCESS contract per discovered checkpoint"
         ),
     )
     parser.add_argument(
@@ -1607,7 +1631,7 @@ def main() -> int:
         rows = (
             collect_rows(
                 eval_root,
-                strict_current_source=args.strict_current_source,
+                strict=args.strict,
                 repo_root=repo_root,
             )
             if eval_root.is_dir()
@@ -1623,7 +1647,7 @@ def main() -> int:
     )
     if output:
         print(output)
-    if args.strict_current_source and not _strict_rows_complete(rows):
+    if args.strict and not _strict_rows_complete(rows):
         return 2
     return 0
 

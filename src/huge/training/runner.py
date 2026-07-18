@@ -30,7 +30,7 @@ from huge.data.datamodule import build_stage_dataset, limit_dataset
 from huge.data.sampler import BlockShuffleSampler
 from huge.data.schemas import ActionSchema
 from huge.data.video_reader import set_frame_cache_size
-from huge.models.qwen_sonicfm import QwenSonicFM, QwenSonicFMConfig
+from huge.models.qwen_sonicfm import ACTION_HEAD_DEFAULTS, QwenSonicFM, QwenSonicFMConfig
 from huge.training.checkpointing import (
     PORTABLE_CHECKPOINT_KIND,
     RESUME_STATE_KIND,
@@ -94,9 +94,9 @@ class StageDefaults:
     max_text_tokens: int = 48
     model_max_length: int = 8192
     char_max_length: int = 256
-    action_hidden_size: int = 1024
-    num_action_layers: int = 16
-    num_attention_heads: int = 16
+    action_hidden_size: int | None = None
+    num_action_layers: int | None = None
+    num_attention_heads: int | None = None
     state_dropout_prob: float = 0.2
 
 
@@ -276,6 +276,13 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
             "--model-architecture must be one of "
             f"{sorted(EXPECTED_FULL_INVENTORY)}"
         )
+    action_defaults = ACTION_HEAD_DEFAULTS[args.model_architecture]
+    if args.action_hidden_size is None:
+        args.action_hidden_size = action_defaults.hidden_size
+    if args.num_action_layers is None:
+        args.num_action_layers = action_defaults.num_layers
+    if args.action_ffn_multiplier is None:
+        args.action_ffn_multiplier = action_defaults.ffn_multiplier
 
     is_humanoid_arena = bool(args.humanoid_arena_roots)
     if is_humanoid_arena and args.explicit_group_learning_rates:
@@ -788,8 +795,8 @@ def _resolved_training_contract(args: argparse.Namespace) -> dict[str, Any]:
     resolved.update(
         {
             "tuning_mode": _tuning_mode(args),
-            "resolved_action_hidden_size": args.action_hidden_size or 1024,
-            "resolved_num_action_layers": args.num_action_layers or 16,
+            "resolved_action_hidden_size": args.action_hidden_size,
+            "resolved_num_action_layers": args.num_action_layers,
             "resolved_state_dropout_prob": (
                 0.2 if args.state_dropout_prob is None else args.state_dropout_prob
             ),
@@ -2177,8 +2184,8 @@ def _train_stage_impl(
     )
     config = QwenSonicFMConfig(
         model_architecture=args.model_architecture,
-        action_hidden_size=args.action_hidden_size or 1024,
-        num_action_layers=args.num_action_layers or 16,
+        action_hidden_size=args.action_hidden_size,
+        num_action_layers=args.num_action_layers,
         num_attention_heads=args.num_attention_heads,
         action_ffn_multiplier=args.action_ffn_multiplier,
         action_dropout=args.action_dropout,

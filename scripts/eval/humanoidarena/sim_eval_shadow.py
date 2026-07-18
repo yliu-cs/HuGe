@@ -21,7 +21,7 @@ import types
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
@@ -40,6 +40,8 @@ REQUIRED_HELPER_PARAMETERS: dict[str, tuple[str, ...]] = {
     "_configure_episode_seed_state": ("env_cfg", "episode_seed"),
     "_load_episode_specs": ("args_cli",),
     "_reset_environment_for_episode": ("env", "env_cfg", "episode_seed"),
+    "_reset_lerobot_runtime_seed": ("action_provider", "episode_seed"),
+    "_notify_action_provider_env_reset": ("action_provider",),
     "_run_episode_once": (
         "simulation_app",
         "env",
@@ -798,6 +800,77 @@ def finish_model_io_trace(
         )
 
 
+def _run_upstream_episode_with_seeded_reset_last(
+    upstream: types.ModuleType,
+    *,
+    action_provider: Any,
+    episode_seed: int,
+    invoke: Callable[[], Any],
+) -> Any:
+    """Run one upstream episode after moving its seeded HTTP reset last."""
+    if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
+        raise TypeError("episode_seed must be an integer")
+    original_seed_reset = getattr(upstream, "_reset_lerobot_runtime_seed", None)
+    original_provider_reset = getattr(
+        upstream, "_notify_action_provider_env_reset", None
+    )
+    if not callable(original_seed_reset) or not callable(original_provider_reset):
+        raise UpstreamContractError(
+            "upstream evaluator lacks the required LeRobot reset helpers"
+        )
+
+    seed_deferred = False
+    seed_applied = False
+    provider_reset_calls = 0
+
+    def defer_seed_reset(provider: Any, seed: int) -> None:
+        nonlocal seed_deferred
+        if provider is not action_provider:
+            raise RuntimeError("upstream seeded reset used an unexpected action provider")
+        if seed_deferred:
+            raise RuntimeError("upstream seeded reset was requested more than once")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed != episode_seed:
+            raise RuntimeError(
+                f"upstream seeded reset used {seed!r}, expected {episode_seed}"
+            )
+        seed_deferred = True
+
+    def reset_provider_then_apply_seed(provider: Any) -> None:
+        nonlocal provider_reset_calls, seed_applied
+        if provider is not action_provider:
+            raise RuntimeError("upstream provider reset used an unexpected action provider")
+        provider_reset_calls += 1
+        if provider_reset_calls != 1:
+            raise RuntimeError("upstream provider reset was requested more than once")
+        if not seed_deferred:
+            raise RuntimeError("upstream provider reset ran before a seed was scheduled")
+        original_provider_reset(provider)
+        original_seed_reset(provider, episode_seed)
+        seed_applied = True
+
+    setattr(upstream, "_reset_lerobot_runtime_seed", defer_seed_reset)
+    setattr(
+        upstream,
+        "_notify_action_provider_env_reset",
+        reset_provider_then_apply_seed,
+    )
+    try:
+        result = invoke()
+    finally:
+        setattr(upstream, "_reset_lerobot_runtime_seed", original_seed_reset)
+        setattr(
+            upstream,
+            "_notify_action_provider_env_reset",
+            original_provider_reset,
+        )
+
+    if not seed_deferred or provider_reset_calls != 1 or not seed_applied:
+        raise RuntimeError(
+            "upstream episode did not complete the required provider-reset/seed-reset sequence"
+        )
+    return result
+
+
 def _run_probe(args: argparse.Namespace) -> int:
     launcher_args = {
         "headless": True,
@@ -953,15 +1026,20 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
         controller = RobotController(env, control_config)
         controller.set_action_provider(action_provider)
 
-        payload = upstream._run_episode_once(
-            simulation_app,
-            env,
-            env_cfg,
-            action_provider,
-            controller,
-            args,
-            episode_spec,
-            SimpleVideoRecorder,
+        payload = _run_upstream_episode_with_seeded_reset_last(
+            upstream,
+            action_provider=action_provider,
+            episode_seed=int(episode_spec["episode_seed"]),
+            invoke=lambda: upstream._run_episode_once(
+                simulation_app,
+                env,
+                env_cfg,
+                action_provider,
+                controller,
+                args,
+                episode_spec,
+                SimpleVideoRecorder,
+            ),
         )
         if not isinstance(payload, dict):
             raise ValueError("upstream episode helper returned a non-object payload")

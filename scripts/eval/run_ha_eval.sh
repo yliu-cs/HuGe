@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate the frozen 15-checkpoint HumanoidArena matrix in stable shards.
+# Evaluate the current 9-checkpoint HumanoidArena matrix in stable shards.
 set -euo pipefail
 
 usage() {
@@ -11,6 +11,10 @@ Default run-specific roots (environment variables may override):
   HUGE_EVAL_QWENPI_V3_RUN_ROOT
   HUGE_EVAL_QWENGR00T_RUN_ROOT
   HUGE_EVAL_QWENOFT_RUN_ROOT
+
+Matrix/output overrides:
+  HUGE_EVAL_EXPECTED_STEPS (default 6000,12000,18000)
+  HUGE_EVAL_OUTPUT_ROOT
 
 Optional topology overrides (defaults: 8 GPUs, 2 workers/GPU):
   HUGE_EVAL_GPU_COUNT or HUGE_EVAL_GPU_LOGICAL_IDS (mutually exclusive)
@@ -39,14 +43,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUN_EVAL="${SCRIPT_DIR}/humanoidarena/run_eval.sh"
 SELECTOR="${SCRIPT_DIR}/humanoidarena/shard_checkpoints.py"
 PYTHON="${REPO_ROOT}/.venv/bin/python"
-EVAL_ROOT="${REPO_ROOT}/.runs/eval/humanoidarena/full_optimized_g1_20260717"
-export HUGE_EVAL_QWENPI_V3_RUN_ROOT="${HUGE_EVAL_QWENPI_V3_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwenpi_v3/full/stage3/20260717_234123}"
-export HUGE_EVAL_QWENGR00T_RUN_ROOT="${HUGE_EVAL_QWENGR00T_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwengr00t/full/stage3/20260717_234421}"
-export HUGE_EVAL_QWENOFT_RUN_ROOT="${HUGE_EVAL_QWENOFT_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwenoft/full/stage3/20260717_234443}"
-if [[ -n "${HUGE_EVAL_OUTPUT_ROOT:-}" && "${HUGE_EVAL_OUTPUT_ROOT}" != "${EVAL_ROOT}" ]]; then
-  echo "[run_ha_eval] HUGE_EVAL_OUTPUT_ROOT is frozen to ${EVAL_ROOT}" >&2
-  exit 2
-fi
+EVAL_ROOT="${HUGE_EVAL_OUTPUT_ROOT:-${REPO_ROOT}/.runs/eval/humanoidarena/full_optimized_g1_18k_20260718}"
+EXPECTED_STEPS="${HUGE_EVAL_EXPECTED_STEPS:-6000,12000,18000}"
+export HUGE_EVAL_QWENPI_V3_RUN_ROOT="${HUGE_EVAL_QWENPI_V3_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwenpi_v3/full/stage3/20260718_170115}"
+export HUGE_EVAL_QWENGR00T_RUN_ROOT="${HUGE_EVAL_QWENGR00T_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwengr00t/full/stage3/20260718_170147}"
+export HUGE_EVAL_QWENOFT_RUN_ROOT="${HUGE_EVAL_QWENOFT_RUN_ROOT:-${REPO_ROOT}/.runs/stage3_humanoidarena_full_optimized/HOI_pp_box/qwenoft/full/stage3/20260718_165140}"
 if [[ -n "${HUGE_ALLOW_KIT_MAP_BOOTSTRAP:-}" && "${HUGE_ALLOW_KIT_MAP_BOOTSTRAP}" != "0" && "${HUGE_ALLOW_KIT_MAP_BOOTSTRAP}" != "1" ]]; then
   echo "[run_ha_eval] HUGE_ALLOW_KIT_MAP_BOOTSTRAP must be 0 or 1" >&2
   exit 2
@@ -145,7 +146,7 @@ export HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS="${HUGE_EVAL_MAX_CONCURRENT_SHAD
 export HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC="${HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC:-360}"
 
 total_workers=$((selected_gpu_count * HUGE_EVAL_WORKERS_PER_GPU))
-echo "[run_ha_eval] topology gpu_selection=${gpu_selection} workers_per_gpu=${HUGE_EVAL_WORKERS_PER_GPU} total_workers=${total_workers} min_free_gib=${HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB} output_root=${EVAL_ROOT} base_port=${HUGE_EVAL_BASE_PORT:-18080} kit_map_bootstrap=${HUGE_ALLOW_KIT_MAP_BOOTSTRAP} model_noise_seed_algorithm=huge_ha_model_noise_v1" >&2
+echo "[run_ha_eval] topology gpu_selection=${gpu_selection} workers_per_gpu=${HUGE_EVAL_WORKERS_PER_GPU} total_workers=${total_workers} min_free_gib=${HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB} output_root=${EVAL_ROOT} expected_steps=${EXPECTED_STEPS} base_port=${HUGE_EVAL_BASE_PORT:-18080} kit_map_bootstrap=${HUGE_ALLOW_KIT_MAP_BOOTSTRAP} model_noise_seed_algorithm=huge_ha_model_noise_v1" >&2
 
 CHECKPOINT_ROOTS=(
   "${HUGE_EVAL_QWENPI_V3_RUN_ROOT}"
@@ -165,6 +166,7 @@ if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${REPO_ROOT}/src" \
   "${PYTHON}" "${SELECTOR}" \
   --repo-root "${REPO_ROOT}" \
   --eval-root "${EVAL_ROOT}" \
+  --expected-steps "${EXPECTED_STEPS}" \
   --shard-index "${SHARD_INDEX}" \
   --shard-count "${SHARD_COUNT}" \
   --output-format actions \

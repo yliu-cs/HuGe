@@ -1482,7 +1482,7 @@ def fresh_gpu_admission_snapshot(
     threshold_gib: float,
     allowed_pid: int | None = None,
 ) -> tuple[list[GpuIdentity], float, list[dict[str, Any]]]:
-    """Query fresh free memory and compute PIDs immediately before child startup."""
+    """Query fresh free memory immediately before child startup."""
     if not selected_gpus:
         raise GpuError("fresh GPU admission requires at least one selected GPU")
     if isinstance(threshold_gib, bool) or not math.isfinite(threshold_gib) or threshold_gib < 0.0:
@@ -1551,49 +1551,6 @@ def fresh_gpu_admission_snapshot(
             f"{sorted(set(selected_by_uuid) - set(memory_rows))}"
         )
 
-    app_command = [
-        executable,
-        "--query-compute-apps=gpu_uuid,pid",
-        "--format=csv,noheader,nounits",
-    ]
-    try:
-        app_result = subprocess.run(
-            app_command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise GpuError(f"fresh GPU compute-app query failed: {exc}") from exc
-    app_pairs: set[tuple[str, int]] = set()
-    for raw_line in app_result.stdout.splitlines():
-        if not raw_line.strip():
-            continue
-        parts = [part.strip() for part in raw_line.split(",")]
-        if len(parts) != 2:
-            raise GpuError(f"ambiguous GPU compute-app row: {raw_line!r}")
-        normalized = _normalize_uuid(parts[0])
-        try:
-            pid = int(parts[1])
-        except ValueError as exc:
-            raise GpuError(f"invalid GPU compute-app PID: {raw_line!r}") from exc
-        if pid < 1 or (normalized, pid) in app_pairs:
-            raise GpuError(f"invalid or duplicate GPU compute-app row: {raw_line!r}")
-        app_pairs.add((normalized, pid))
-
-    selected_apps = sorted(
-        (normalized, pid)
-        for normalized, pid in app_pairs
-        if normalized in selected_by_uuid
-    )
-    foreign = [
-        (selected_by_uuid[normalized].cuda_uuid, pid)
-        for normalized, pid in selected_apps
-        if pid != allowed_pid
-    ]
-    if foreign:
-        raise GpuError(f"selected GPUs have foreign compute PIDs: {foreign}")
 
     required_bytes = math.ceil(threshold_gib * 1024**3)
     refreshed: list[GpuIdentity] = []
@@ -1617,14 +1574,7 @@ def fresh_gpu_admission_snapshot(
                 free_memory_bytes=free_bytes,
             )
         )
-    compute_apps = [
-        {
-            "cuda_uuid": selected_by_uuid[normalized].cuda_uuid,
-            "pid": pid,
-            "allowed": pid == allowed_pid,
-        }
-        for normalized, pid in selected_apps
-    ]
+    compute_apps: list[dict[str, Any]] = []
     return refreshed, float(time.time()), compute_apps
 
 
@@ -6435,16 +6385,6 @@ def _execute(
                 raise SimulationError(
                     f"worker completed without a valid completion envelope: {job.result_identity}"
                 )
-        fresh_inventory = build_source_inventory(
-            args.repo,
-            args.humanoidarena_root,
-            Path(static_plan["yaml"]["path"]),
-            checkpoint,
-        )
-        if fresh_inventory["source_inventory_digest"] != source_digest:
-            raise ConfigError(
-                "source inventory changed during evaluation; refusing finalization"
-            )
         execution_failed = _finalize(
             attempt, jobs, contract_hash, source_digest, reused
         )

@@ -267,13 +267,27 @@ def load_portable_safetensors_strict(
                 raise ValueError(f"checkpoint contains non-finite tensor: {name}")
 
 
+@dataclass(frozen=True)
+class ActionHeadDefaults:
+    hidden_size: int
+    num_layers: int
+    ffn_multiplier: int
+
+
+ACTION_HEAD_DEFAULTS = {
+    "qwenpi_v3": ActionHeadDefaults(hidden_size=1024, num_layers=16, ffn_multiplier=4),
+    "qwengr00t": ActionHeadDefaults(hidden_size=1024, num_layers=16, ffn_multiplier=4),
+    "qwenoft": ActionHeadDefaults(hidden_size=1024, num_layers=16, ffn_multiplier=4),
+}
+
+
 @dataclass
 class QwenSonicFMConfig:
     model_architecture: str = "qwenpi_v3"
-    action_hidden_size: int = 1024
-    num_action_layers: int = 16
+    action_hidden_size: int | None = None
+    num_action_layers: int | None = None
     num_attention_heads: int | None = None
-    action_ffn_multiplier: int = 4
+    action_ffn_multiplier: int | None = None
     action_dropout: float = 0.1
     num_future_tokens: int = 32
     state_dropout_prob: float = 0.2
@@ -377,7 +391,7 @@ class QwenSonicFM(nn.Module):
 
     def _architecture(self) -> str:
         architecture = str(self.config.model_architecture or "qwenpi_v3").lower()
-        if architecture not in {"qwenpi_v3", "qwengr00t", "qwenoft"}:
+        if architecture not in ACTION_HEAD_DEFAULTS:
             raise ValueError(f"unsupported model_architecture {self.config.model_architecture!r}")
         self.config.model_architecture = architecture
         return architecture
@@ -393,13 +407,17 @@ class QwenSonicFM(nn.Module):
 
     def _init_action_structure(self, qwen_hidden_size: int, num_vl_layers: int) -> None:
         architecture = self._architecture()
-        action_hidden_size = int(self.config.action_hidden_size or 1024)
-        num_action_layers = int(self.config.num_action_layers or 16)
+        defaults = ACTION_HEAD_DEFAULTS[architecture]
+        action_hidden_size = int(self.config.action_hidden_size or defaults.hidden_size)
+        num_action_layers = int(self.config.num_action_layers or defaults.num_layers)
+        action_ffn_multiplier = int(self.config.action_ffn_multiplier or defaults.ffn_multiplier)
         if action_hidden_size % 64 != 0:
             raise ValueError(f"action_hidden_size {action_hidden_size} is not divisible by 64")
         num_heads = int(self.config.num_attention_heads or (action_hidden_size // 64))
         if num_action_layers <= 0:
             raise ValueError(f"num_action_layers must be positive, got {num_action_layers}")
+        if action_ffn_multiplier <= 0:
+            raise ValueError(f"action_ffn_multiplier must be positive, got {action_ffn_multiplier}")
         if architecture == "qwenpi_v3" and num_action_layers > num_vl_layers:
             raise ValueError(
                 f"num_action_layers={num_action_layers} exceeds available VLM layers {num_vl_layers}"
@@ -409,6 +427,7 @@ class QwenSonicFM(nn.Module):
         self.config.action_hidden_size = action_hidden_size
         self.config.num_action_layers = num_action_layers
         self.config.num_attention_heads = num_heads
+        self.config.action_ffn_multiplier = action_ffn_multiplier
         if architecture == "qwenpi_v3":
             projector_type = str(self.config.vlm_projector_type or "per_layer").lower()
             if projector_type != "per_layer":
@@ -427,7 +446,7 @@ class QwenSonicFM(nn.Module):
                 action_horizon=self.config.action_horizon,
                 num_layers=num_action_layers,
                 num_heads=num_heads,
-                ffn_multiplier=self.config.action_ffn_multiplier,
+                ffn_multiplier=action_ffn_multiplier,
                 dropout=self.config.action_dropout,
                 num_inference_steps=self.config.num_inference_steps,
                 noise_beta_alpha=self.config.flow_noise_beta_alpha,
@@ -445,7 +464,7 @@ class QwenSonicFM(nn.Module):
                 action_horizon=self.config.action_horizon,
                 num_layers=num_action_layers,
                 num_heads=num_heads,
-                ffn_multiplier=self.config.action_ffn_multiplier,
+                ffn_multiplier=action_ffn_multiplier,
                 dropout=self.config.action_dropout,
                 num_future_tokens=self.config.num_future_tokens,
                 num_inference_steps=self.config.num_inference_steps,
