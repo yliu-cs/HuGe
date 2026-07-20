@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,10 +19,18 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence
 
+from shard_checkpoints import (
+    _canonical_sha256,
+    _json_object,
+    _sha256_file,
+    _valid_terminal_attempt,
+)
+
 
 BATCH_SCHEMA_VERSION = "huge_ha_batch_summary_v1"
 STEP_RE = re.compile(r"^step_([0-9]+)$")
 TASKS = (
+    "all",
     "boxing",
     "doubledesk",
     "football",
@@ -30,7 +39,13 @@ TASKS = (
     "sit_sofa",
     "vision_navi",
 )
+EVAL_TASKS = TASKS[1:]
 INTERRUPTED_EXIT_CODES = {130, 143, -signal.SIGINT, -signal.SIGTERM}
+ALLOWED_TRAINING_ROOT_NAMES = (
+    "full_all_stage",
+    "stage3_humanoidarena_full_optimized",
+    "stage3_humanoidarena",
+)
 
 
 class BatchConfigError(RuntimeError):
@@ -43,7 +58,13 @@ class CheckpointTarget(NamedTuple):
     step: int
 
 
-InvokeCheckpoint = Callable[[CheckpointTarget, Path], int]
+class InvocationResult(NamedTuple):
+    exit_code: int
+    skipped: bool = False
+    skipped_tasks: tuple[str, ...] = ()
+
+
+InvokeCheckpoint = Callable[[CheckpointTarget, Path], int | InvocationResult]
 _ACTIVE_CHILD: subprocess.Popen[str] | None = None
 _STOP_SIGNAL: int | None = None
 
@@ -67,11 +88,28 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
     resolved_paths: set[Path] = set()
     for lexical_path in candidate_root.rglob("step_*"):
         match = STEP_RE.fullmatch(lexical_path.name)
-        if match is None or not lexical_path.is_dir():
+        if match is None:
             continue
-        resolved = lexical_path.resolve()
+        try:
+            info = lexical_path.lstat()
+            resolved = lexical_path.resolve(strict=True)
+        except OSError as exc:
+            raise BatchConfigError(f"cannot inspect checkpoint: {lexical_path}: {exc}") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            continue
         _relative_to(resolved, candidate_root, label="checkpoint")
-        _relative_to(resolved, allowed, label="checkpoint")
+        allowed_relative = _relative_to(resolved, allowed, label="checkpoint")
+        if len(allowed_relative.parts) != 6 or allowed_relative.parts[3] != "stage3":
+            continue
+        publication_files = (resolved / "manifest.json", resolved / "_SUCCESS")
+        try:
+            publication_stats = tuple(path.lstat() for path in publication_files)
+        except FileNotFoundError:
+            continue
+        if any(not stat.S_ISREG(item.st_mode) for item in publication_stats):
+            raise BatchConfigError(
+                f"checkpoint publication metadata must be real files: {resolved}"
+            )
         if resolved in resolved_paths:
             raise BatchConfigError(f"multiple checkpoint paths resolve to the same directory: {resolved}")
         resolved_paths.add(resolved)
@@ -80,8 +118,101 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
 
     targets.sort(key=lambda target: (str(Path(target.relative_path).parent), target.step, target.relative_path))
     if not targets:
-        raise BatchConfigError(f"no step_<number> checkpoint directories found under {candidate_root}")
+        raise BatchConfigError(f"no published step_<number> checkpoints found under {candidate_root}")
     return targets
+
+
+def completed_tasks(
+    *,
+    target: CheckpointTarget,
+    tasks: Sequence[str],
+    repo_root: Path,
+    allowed_root: Path,
+    eval_root: Path,
+) -> set[str]:
+    """Return tasks with a valid success publication for this exact checkpoint."""
+    checkpoint_relative = target.path.relative_to(repo_root).as_posix()
+    checkpoint_task = target.path.relative_to(allowed_root).parts[0]
+    try:
+        manifest_sha256 = _sha256_file(target.path / "manifest.json")
+        marker_sha256 = _sha256_file(target.path / "_SUCCESS")
+    except OSError:
+        return set()
+
+    completed: set[str] = set()
+    for task in tasks:
+        checkpoint_eval_root = eval_root / task / f"{checkpoint_task}-{target.path.name}"
+        try:
+            contract_dirs = tuple(checkpoint_eval_root.iterdir())
+        except OSError:
+            continue
+        for contract_dir in contract_dirs:
+            try:
+                contract_info = contract_dir.lstat()
+            except OSError:
+                continue
+            if (
+                re.fullmatch(r"[0-9a-f]{16}", contract_dir.name) is None
+                or not stat.S_ISDIR(contract_info.st_mode)
+            ):
+                continue
+            contract = _json_object(contract_dir / "contract.json")
+            if contract is None:
+                continue
+            try:
+                contract_hash = _canonical_sha256(contract)
+            except (TypeError, ValueError):
+                continue
+            static_plan = contract.get("static_plan")
+            checkpoint = (
+                static_plan.get("checkpoint")
+                if isinstance(static_plan, dict)
+                else None
+            )
+            task_spec = (
+                static_plan.get("task") if isinstance(static_plan, dict) else None
+            )
+            publication = (
+                checkpoint.get("portable_publication")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            if (
+                contract.get("schema_version")
+                != "huge_humanoidarena_contract_v1"
+                or contract_dir.name != contract_hash[:16]
+                or not isinstance(task_spec, dict)
+                or task_spec.get("cli_task") != task
+                or not isinstance(checkpoint, dict)
+                or checkpoint.get("relative_path") != checkpoint_relative
+                or checkpoint.get("step") != target.step
+                or not isinstance(publication, dict)
+                or publication.get("manifest_sha256") != manifest_sha256
+                or publication.get("success_marker_sha256") != marker_sha256
+            ):
+                continue
+            attempts_root = contract_dir / "attempts"
+            try:
+                attempts = tuple(attempts_root.iterdir())
+            except OSError:
+                continue
+            if any(
+                re.fullmatch(
+                    r"[0-9]{8}_[0-9]{6}_[0-9a-f]{8}", attempt.name
+                )
+                and _valid_terminal_attempt(
+                    contract_dir,
+                    attempt,
+                    attempt / "_SUCCESS",
+                    contract,
+                    checkpoint_relative,
+                    contract_prevalidated=True,
+                )
+                for attempt in attempts
+            ):
+                completed.add(task)
+                break
+    return completed
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -165,8 +296,16 @@ def execute_batch(
         print(f"[batch_eval] [{index + 1}/{len(targets)}] start {target.relative_path}", flush=True)
         child_started = time.monotonic()
         error = ""
+        skipped = False
+        skipped_tasks: tuple[str, ...] = ()
         try:
-            exit_code = int(invoke(target, log_path))
+            invocation = invoke(target, log_path)
+            if isinstance(invocation, InvocationResult):
+                exit_code = invocation.exit_code
+                skipped = invocation.skipped
+                skipped_tasks = invocation.skipped_tasks
+            else:
+                exit_code = int(invocation)
         except KeyboardInterrupt:
             exit_code = 130
         except Exception as exc:  # Keep evaluating later checkpoints after launcher failures.
@@ -176,7 +315,7 @@ def execute_batch(
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"[batch_eval] launcher exception: {error}\n")
         duration = time.monotonic() - child_started
-        status = "success" if exit_code == 0 else "failed"
+        status = "skipped" if skipped else "success" if exit_code == 0 else "failed"
         if exit_code in INTERRUPTED_EXIT_CODES or (stop_requested is not None and stop_requested()):
             status = "interrupted"
             interrupted = True
@@ -191,6 +330,8 @@ def execute_batch(
         }
         if error:
             row["error"] = error
+        if skipped_tasks:
+            row["skipped_tasks"] = list(skipped_tasks)
         results.append(row)
         summary["completed"] = len(results)
         summary["succeeded"] = sum(row["exit_code"] == 0 for row in results)
@@ -249,7 +390,7 @@ def _invoke_run_eval(
     global _ACTIVE_CHILD
     command = ["bash", str(run_eval), task, str(target.path), backend]
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
+    with log_path.open("a", encoding="utf-8") as log:
         log.write("[batch_eval] command=" + " ".join(command) + "\n")
         log.flush()
         child = subprocess.Popen(
@@ -304,15 +445,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _env_bool(name: str, default: str) -> bool:
+    raw = os.environ.get(name, default)
+    if raw not in {"0", "1"}:
+        raise BatchConfigError(f"{name} must be 0 or 1")
+    return raw == "1"
+
+
+def _eval_root(repo_root: Path) -> Path:
+    raw = Path(
+        os.environ.get("HUGE_EVAL_OUTPUT_ROOT", ".runs/eval/humanoidarena")
+    ).expanduser()
+    resolved = (repo_root / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    _relative_to(resolved, (repo_root / ".runs").resolve(), label="evaluation output root")
+    return resolved
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     global _STOP_SIGNAL
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[3]
     raw_root = Path(args.checkpoint_root).expanduser()
     checkpoint_root = (repo_root / raw_root).resolve() if not raw_root.is_absolute() else raw_root.resolve()
-    allowed_root = repo_root / ".runs/stage3_humanoidarena"
     try:
+        allowed_roots = tuple(
+            (repo_root / ".runs" / name).resolve()
+            for name in ALLOWED_TRAINING_ROOT_NAMES
+        )
+        allowed_root = next(
+            (
+                candidate
+                for candidate in allowed_roots
+                if checkpoint_root == candidate or candidate in checkpoint_root.parents
+            ),
+            None,
+        )
+        if allowed_root is None:
+            raise BatchConfigError(
+                "checkpoint batch root must be inside one allowed training root: "
+                + ", ".join(str(path) for path in allowed_roots)
+            )
         targets = discover_checkpoints(checkpoint_root, allowed_root)
+        eval_root = _eval_root(repo_root)
+        skip_completed = _env_bool("HUGE_EVAL_RESUME", "1") and not _env_bool(
+            "HUGE_EVAL_FORCE_NEW_RUN", "0"
+        )
         report_dir = _report_directory(repo_root, args.task)
     except BatchConfigError as exc:
         print(f"[batch_eval] configuration error: {exc}", file=sys.stderr)
@@ -327,15 +504,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
-    def invoke(target: CheckpointTarget, log_path: Path) -> int:
-        return _invoke_run_eval(
-            target,
-            log_path,
-            repo_root=repo_root,
-            run_eval=repo_root / "scripts/eval/humanoidarena/run_eval.sh",
-            task=args.task,
-            backend=args.backend,
+    requested_tasks = EVAL_TASKS if args.task == "all" else (args.task,)
+
+    def invoke(target: CheckpointTarget, log_path: Path) -> InvocationResult:
+        already_completed = (
+            completed_tasks(
+                target=target,
+                tasks=requested_tasks,
+                repo_root=repo_root,
+                allowed_root=allowed_root,
+                eval_root=eval_root,
+            )
+            if skip_completed
+            else set()
         )
+        skipped_tasks = tuple(
+            task for task in requested_tasks if task in already_completed
+        )
+        pending_tasks = tuple(
+            task for task in requested_tasks if task not in already_completed
+        )
+        if skipped_tasks:
+            message = (
+                f"[batch_eval] skip completed checkpoint={target.relative_path} "
+                f"tasks={','.join(skipped_tasks)}"
+            )
+            print(message, flush=True)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(message + "\n")
+        if not pending_tasks:
+            return InvocationResult(0, True, skipped_tasks)
+
+        overall_rc = 0
+        for task in pending_tasks:
+            exit_code = _invoke_run_eval(
+                target,
+                log_path,
+                repo_root=repo_root,
+                run_eval=repo_root / "scripts/eval/humanoidarena/run_eval.sh",
+                task=task,
+                backend=args.backend,
+            )
+            if exit_code in INTERRUPTED_EXIT_CODES:
+                return InvocationResult(exit_code, False, skipped_tasks)
+            if exit_code != 0 and overall_rc == 0:
+                overall_rc = exit_code
+        return InvocationResult(overall_rc, False, skipped_tasks)
 
     return execute_batch(
         task=args.task,

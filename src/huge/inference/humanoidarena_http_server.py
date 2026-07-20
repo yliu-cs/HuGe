@@ -15,7 +15,7 @@ import signal
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -559,10 +559,9 @@ def load_policy_strict(contract: CheckpointContract, *, device: str) -> PolicyLi
     from huge.inference.policy import HugePolicy
     from huge.models.qwen_sonicfm import QwenSonicFM, QwenSonicFMConfig
 
-    allowed = {item.name for item in fields(QwenSonicFMConfig)}
-    config_values = {key: value for key, value in contract.config.items() if key in allowed}
+    config_values = dict(contract.config)
     config_values["base_vlm_path"] = str(contract.base_vlm_path)
-    model = QwenSonicFM(QwenSonicFMConfig(**config_values)).to(device)
+    model = QwenSonicFM(QwenSonicFMConfig.from_checkpoint_config(config_values)).to(device)
     load_safetensors_strict(model, contract.checkpoint_dir / "model.safetensors", device=device)
     model.eval()
     normalizer = StateNormalizer.from_json(

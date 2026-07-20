@@ -21,6 +21,41 @@ def _truncate_with_tokenizer(tokenizer: Any, text: str, max_tokens: int | None) 
     return tokenizer.decode(ids, skip_special_tokens=True)
 
 
+def append_oft_prompt(
+    text: str,
+    *,
+    action_token: str,
+    action_horizon: int,
+    state: np.ndarray | torch.Tensor | None,
+    state_mask: np.ndarray | torch.Tensor | None,
+    use_proprio: bool,
+    proprio_bins: int,
+) -> str:
+    """Build the shared train/inference QwenOFT prompt."""
+    if use_proprio:
+        if int(proprio_bins) < 2:
+            raise ValueError("qwenoft proprio_bins must be at least 2")
+        if state is None or state_mask is None:
+            raise ValueError("qwenoft proprio prompting requires state and state_mask")
+        mask = state_mask.detach().cpu().numpy() if torch.is_tensor(state_mask) else np.asarray(state_mask)
+        if bool(np.asarray(mask, dtype=np.float32).max(initial=0.0) > 0.0):
+            values = state.detach().cpu().numpy() if torch.is_tensor(state) else np.asarray(state)
+            values = np.asarray(values, dtype=np.float32).reshape(-1)
+            if values.shape != (PROPRIO_DIM,):
+                raise ValueError(f"qwenoft proprio dim {values.size} != {PROPRIO_DIM}")
+            if not np.isfinite(values).all():
+                raise ValueError("qwenoft proprio must be finite")
+            if values.min(initial=0.0) < -1.0001 or values.max(initial=0.0) > 1.0001:
+                raise ValueError("qwenoft proprio must be normalized to [-1, 1]")
+            values = np.clip(values, -1.0, 1.0)
+            bin_edges = np.linspace(-1.0, 1.0, int(proprio_bins) + 1, dtype=np.float32)[:-1]
+            discretized = np.digitize(values, bins=bin_edges) - 1
+            state_text = " ".join(map(str, discretized.tolist()))
+            text = f"{text} [STATE] {state_text} [ACTION]"
+    suffix = action_token * int(action_horizon)
+    return f"{text} Please predict the next {int(action_horizon)} robot actions:{suffix}"
+
+
 class HugeCollator:
     """Collate dataset dicts into tensors.
 
@@ -44,6 +79,8 @@ class HugeCollator:
         model_architecture: str = "qwenpi_v3",
         action_horizon: int = ACTION_HORIZON,
         oft_action_token: str = "\U0001f50d",
+        oft_use_proprio: bool = True,
+        oft_proprio_bins: int = 256,
     ) -> None:
         self.use_qwen_processor = use_qwen_processor
         self.image_size = image_size
@@ -57,6 +94,8 @@ class HugeCollator:
         self.model_architecture = str(model_architecture or "qwenpi_v3").lower()
         self.action_horizon = int(action_horizon)
         self.oft_action_token = oft_action_token
+        self.oft_use_proprio = bool(oft_use_proprio)
+        self.oft_proprio_bins = int(oft_proprio_bins)
         self.oft_action_token_id: int | None = None
         self.processor = None
         self.tokenizer = None
@@ -97,21 +136,40 @@ class HugeCollator:
             color_jitter=self.image_color_jitter,
         )
 
-    def _append_oft_action_tokens(self, text: str) -> str:
-        suffix = self.oft_action_token * self.action_horizon
-        return f"{text} Please predict the next {self.action_horizon} robot actions:{suffix}"
+    def _append_oft_action_tokens(
+        self,
+        text: str,
+        state: torch.Tensor,
+        state_mask: torch.Tensor,
+    ) -> str:
+        return append_oft_prompt(
+            text,
+            action_token=self.oft_action_token,
+            action_horizon=self.action_horizon,
+            state=state,
+            state_mask=state_mask,
+            use_proprio=self.oft_use_proprio,
+            proprio_bins=self.oft_proprio_bins,
+        )
 
     def __call__(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         texts = [str(x.get("language") or x.get("text") or "perform the task") for x in items]
         if self.tokenizer is not None:
             texts = [_truncate_with_tokenizer(self.tokenizer, text, self.max_text_tokens) for text in texts]
-        qwen_texts = [self._append_oft_action_tokens(text) for text in texts] if self.model_architecture == "qwenoft" else texts
         images_pil = [self._qwen_image(self._image(x)) for x in items]
         images = torch.from_numpy(np.stack([image_to_float_array(im) for im in images_pil], axis=0))
         actions = torch.from_numpy(np.stack([np.asarray(x["normalized_actions"], dtype=np.float32) for x in items], axis=0))
         sonic_mask = torch.from_numpy(np.stack([np.asarray(x["sonic_mask"], dtype=np.float32) for x in items], axis=0))
         state = torch.from_numpy(np.stack([np.asarray(x.get("state", np.zeros(PROPRIO_DIM)), dtype=np.float32) for x in items], axis=0))
         state_mask = torch.from_numpy(np.stack([np.asarray(x.get("state_mask", np.zeros(1)), dtype=np.float32) for x in items], axis=0)).reshape(len(items), -1)
+        qwen_texts = (
+            [
+                self._append_oft_action_tokens(text, state[index], state_mask[index])
+                for index, text in enumerate(texts)
+            ]
+            if self.model_architecture == "qwenoft"
+            else texts
+        )
         if actions.shape[-1] != ACTION_DIM:
             raise ValueError(f"action dim {actions.shape[-1]} != {ACTION_DIM}")
         if self.processor is None:

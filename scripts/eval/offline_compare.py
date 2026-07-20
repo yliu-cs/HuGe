@@ -76,6 +76,8 @@ def _collator_for(model: QwenSonicFM, use_qwen_processor: bool | None) -> HugeCo
         model_architecture=model.config.model_architecture,
         action_horizon=model.config.action_horizon,
         oft_action_token=model.config.oft_action_token,
+        oft_use_proprio=model.config.oft_use_proprio,
+        oft_proprio_bins=model.config.oft_proprio_bins,
     )
 
 

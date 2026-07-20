@@ -19,8 +19,9 @@ set -euo pipefail
 # humanoid_arena mode (the default) trains all tasks with full tuning. Without an
 # architecture selector it uses the fixed order qwenoft -> qwenpi_v3 ->
 # qwengr00t; formal multi-host runs select exactly one architecture with
-# --arch. It writes to:
-#   ${HUGE_RUN_ROOT:-./.runs/stage3_humanoidarena_full_optimized}/
+# --arch. Add --full-pipeline to run stage1 -> stage2 -> stage3 per architecture.
+# It writes to:
+#   ${HUGE_RUN_ROOT:-./.runs/full_all_stage}/
 #     all/<arch>/full/stage3/<run_id>/
 #
 # Useful environment variables:
@@ -35,6 +36,11 @@ set -euo pipefail
 #   HUGE_REAL_STAGE3_CHECKPOINTING_STEPS=...  real stage3 ckpt interval (default 20000)
 #   HUGE_HUMANOID_ARENA_TASK=...   exact HumanoidArena task name, or all (default all)
 #   HUGE_HUMANOID_ARENA_INIT_CKPT=...  optional init checkpoint (default none/from scratch)
+#   HUGE_STAGE12_DATA_ROOT=...           Stage 1/2 dataset root (default resource/datasets)
+#   HUGE_STAGE2_PROPRIO_STATS=...        Stage 2 stats under that root by default
+#   HUGE_STAGE12_VLM_LR=...               Stage 1/2 VLM LR (default 2e-5)
+#   HUGE_STAGE12_PROJECTOR_LR=...         Stage 1/2 projector LR (default 5e-5)
+#   HUGE_STAGE12_ACTION_LR=...            Stage 1/2 action-head LR (default 2e-4)
 #   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenoft qwenpi_v3 qwengr00t")
 #   HUGE_HUMANOID_ARENA_TUNING_MODES=...      space-separated modes (default "full")
 #   HUGE_HUMANOID_ARENA_RESUME_STATE=...      resume state; requires one architecture and full mode
@@ -44,7 +50,7 @@ set -euo pipefail
 #   HUGE_HUMANOID_ARENA_WARMUP_RATIO=...      full warmup ratio (default 0.05)
 #   HUGE_HUMANOID_ARENA_MIN_LR_RATE=...       full cosine floor ratio (default 0.04)
 #   HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS=... full model/state interval (default 20000)
-#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 150000)
+#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 140000)
 #   HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS=...    optional qwenoft override
 #   HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS=...  optional qwenpi_v3 override
 #   HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS=...  optional qwengr00t override
@@ -57,7 +63,9 @@ set -euo pipefail
 #   HUGE_LOCK_FILE=...             override the default run flag file
 #
 # Usage:
-#   scripts/train/run_huge.sh --arch qwenoft    run one formal 8-GPU architecture
+#   scripts/train/run_huge.sh --full-pipeline   run all three full pipelines sequentially
+#   scripts/train/run_huge.sh --full-pipeline --arch qwenoft  run one formal 8-GPU pipeline
+#   scripts/train/run_huge.sh --arch qwenoft    run one Stage 3-only architecture
 #   scripts/train/run_huge.sh                   run all three architectures sequentially
 #   HUGE_STAGE3_DATA=sim scripts/train/run_huge.sh   run all configured sim strides
 #   scripts/train/run_huge.sh 10           run only stride_10
@@ -72,7 +80,7 @@ STAGE3_DATA="${HUGE_STAGE3_DATA:-humanoid_arena}"
 case "$STAGE3_DATA" in
   sim)  DEFAULT_RUN_ROOT="./.runs/stage1_stride_abla" ;;
   real) DEFAULT_RUN_ROOT="./.runs/stage3_real_cola" ;;
-  humanoid_arena) DEFAULT_RUN_ROOT="./.runs/stage3_humanoidarena_full_optimized" ;;
+  humanoid_arena) DEFAULT_RUN_ROOT="./.runs/full_all_stage" ;;
   *) echo "HUGE_STAGE3_DATA must be 'sim', 'real', or 'humanoid_arena', got '$STAGE3_DATA'" >&2; exit 2 ;;
 esac
 RUN_ROOT="${HUGE_RUN_ROOT:-$DEFAULT_RUN_ROOT}"
@@ -111,7 +119,7 @@ HUMANOID_ARENA_PROJECTOR_LR="${HUGE_HUMANOID_ARENA_PROJECTOR_LR:-2.5e-5}"
 HUMANOID_ARENA_ACTION_LR="${HUGE_HUMANOID_ARENA_ACTION_LR:-1e-4}"
 HUMANOID_ARENA_WARMUP_RATIO="${HUGE_HUMANOID_ARENA_WARMUP_RATIO:-0.05}"
 HUMANOID_ARENA_MIN_LR_RATE="${HUGE_HUMANOID_ARENA_MIN_LR_RATE:-0.04}"
-HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-150000}"
+HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-140000}"
 HUMANOID_ARENA_QWENOFT_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENPI_V3_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENGR00T_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
@@ -121,18 +129,25 @@ read -r -a HUMANOID_ARENA_TUNING_MODES <<< "${HUGE_HUMANOID_ARENA_TUNING_MODES:-
 HUMANOID_ARENA_LORA_R="${HUGE_HUMANOID_ARENA_LORA_R:-8}"
 HUMANOID_ARENA_LORA_ALPHA="${HUGE_HUMANOID_ARENA_LORA_ALPHA:-16}"
 HUMANOID_ARENA_LORA_DROPOUT="${HUGE_HUMANOID_ARENA_LORA_DROPOUT:-0.0}"
+STAGE12_DATA_ROOT="${HUGE_STAGE12_DATA_ROOT:-resource/datasets}"
+STAGE2_PROPRIO_STATS="${HUGE_STAGE2_PROPRIO_STATS:-$STAGE12_DATA_ROOT/G1_WBT-cache/meta/g1_proprio_stats_sonic.json}"
+STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-2e-5}"
+STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-5e-5}"
+STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-2e-4}"
 
 read -r -a STAGE1_SAMPLE_STRIDES <<< "${HUGE_STAGE1_SAMPLE_STRIDES:-1 2 5 10 50}"
 SELECTED_STRIDE=""
 SELECTED_ARCH=""
+FULL_PIPELINE=0
 
 usage() {
   cat <<EOF
-Usage: $0 [--arch ARCH]
+Usage: $0 [--full-pipeline] [--arch ARCH]
        $0 [--stride STRIDE] [STRIDE]
 
 For HumanoidArena, --arch must be one of qwenoft, qwenpi_v3, or qwengr00t.
-Without --arch, run the HumanoidArena full-only three-architecture recipe.
+Without --arch, run all three architectures. --full-pipeline adds Stage 1 and
+Stage 2 before HumanoidArena Stage 3 for each architecture.
 With HUGE_STAGE3_DATA=sim|real, optionally select one stride; configured strides:
 ${STAGE1_SAMPLE_STRIDES[*]}
 EOF
@@ -140,6 +155,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --full-pipeline)
+      FULL_PIPELINE=1
+      shift
+      ;;
     --arch)
       [[ $# -ge 2 && -n "$2" ]] || { echo "--arch requires a value" >&2; exit 2; }
       [[ -z "$SELECTED_ARCH" ]] || { echo "--arch may be specified only once" >&2; exit 2; }
@@ -225,6 +244,11 @@ truthy() {
   esac
 }
 
+if truthy "$FULL_PIPELINE" && [[ "$STAGE3_DATA" != "humanoid_arena" ]]; then
+  echo "--full-pipeline is only valid with HUGE_STAGE3_DATA=humanoid_arena" >&2
+  exit 2
+fi
+
 validate_humanoid_arena_matrix() {
   if [[ "${#HUMANOID_ARENA_ARCHITECTURES[@]}" -eq 0 ]]; then
     echo "HumanoidArena architecture list must not be empty" >&2
@@ -259,6 +283,29 @@ validate_humanoid_arena_matrix() {
       ""|none|null) ;;
       *) echo "HumanoidArena resume cannot also set HUGE_HUMANOID_ARENA_INIT_CKPT" >&2; return 2 ;;
     esac
+  fi
+  if truthy "$FULL_PIPELINE"; then
+    if [[ "${#HUMANOID_ARENA_TUNING_MODES[@]}" -ne 1 ]] ||
+       [[ "${HUMANOID_ARENA_TUNING_MODES[0]}" != "full" ]]; then
+      echo "--full-pipeline requires exactly the full tuning mode" >&2
+      return 2
+    fi
+    if [[ -n "$HUMANOID_ARENA_RESUME_STATE" ]]; then
+      echo "--full-pipeline cannot resume an existing Stage 3 run" >&2
+      return 2
+    fi
+    case "${HUMANOID_ARENA_INIT_CKPT,,}" in
+      ""|none|null) ;;
+      *) echo "--full-pipeline cannot set HUGE_HUMANOID_ARENA_INIT_CKPT" >&2; return 2 ;;
+    esac
+    if [[ ! -d "$STAGE12_DATA_ROOT" ]]; then
+      echo "Stage 1/2 dataset root not found: $STAGE12_DATA_ROOT" >&2
+      return 2
+    fi
+    if [[ ! -f "$STAGE2_PROPRIO_STATS" ]]; then
+      echo "Stage 2 proprio stats not found: $STAGE2_PROPRIO_STATS" >&2
+      return 2
+    fi
   fi
   if [[ " ${HUMANOID_ARENA_TUNING_MODES[*]} " == *" full "* ]]; then
     if [[ -n "${HUGE_NUM_PROCESSES:-}" && "${HUGE_NUM_PROCESSES}" != "8" ]]; then
@@ -345,6 +392,33 @@ run_sim_stage3() {
     --checkpointing-steps "$SIM_STAGE3_CHECKPOINTING_STEPS"
 }
 
+run_humanoid_arena_stage1() {
+  local architecture="$1"
+  run_exp stage1 \
+    --model-architecture "$architecture" \
+    --dataset-root "$STAGE12_DATA_ROOT" \
+    --vlm-learning-rate "$STAGE12_VLM_LR" \
+    --projector-learning-rate "$STAGE12_PROJECTOR_LR" \
+    --action-learning-rate "$STAGE12_ACTION_LR" \
+    --num-gpus 8 \
+    --num-nodes 1 \
+    --mixed-precision bf16
+}
+
+run_humanoid_arena_stage2() {
+  local architecture="$1"
+  run_exp stage2 \
+    --model-architecture "$architecture" \
+    --dataset-root "$STAGE12_DATA_ROOT" \
+    --proprio-stats-path "$STAGE2_PROPRIO_STATS" \
+    --vlm-learning-rate "$STAGE12_VLM_LR" \
+    --projector-learning-rate "$STAGE12_PROJECTOR_LR" \
+    --action-learning-rate "$STAGE12_ACTION_LR" \
+    --num-gpus 8 \
+    --num-nodes 1 \
+    --mixed-precision bf16
+}
+
 # Resolve the latest stage2 checkpoint for a stride under STAGE2_SOURCE_ROOT.
 # Mirrors resolve_latest_stage_ckpt in train_huge.sh but reads the source root.
 resolve_stage2_ckpt() {
@@ -382,10 +456,12 @@ run_humanoid_arena_stage3() {
   local architecture="$1"
   local tuning_mode="$2"
   local tuning_args=()
-  local initialization_args=(--init-ckpt "$HUMANOID_ARENA_INIT_CKPT")
+  local initialization_args=()
   local recipe_args=()
   if [[ -n "$HUMANOID_ARENA_RESUME_STATE" ]]; then
     initialization_args=(--resume-from-checkpoint "$HUMANOID_ARENA_RESUME_STATE")
+  elif ! truthy "$FULL_PIPELINE"; then
+    initialization_args=(--init-ckpt "$HUMANOID_ARENA_INIT_CKPT")
   fi
   case "$tuning_mode" in
     full)
@@ -454,6 +530,10 @@ run_all() {
     for architecture in "${HUMANOID_ARENA_ARCHITECTURES[@]}"; do
       for tuning_mode in "${HUMANOID_ARENA_TUNING_MODES[@]}"; do
         EXPERIMENT_NAME="$HUMANOID_ARENA_TASK/$architecture/$tuning_mode"
+        if truthy "$FULL_PIPELINE"; then
+          run_humanoid_arena_stage1 "$architecture"
+          run_humanoid_arena_stage2 "$architecture"
+        fi
         run_humanoid_arena_stage3 "$architecture" "$tuning_mode"
       done
     done

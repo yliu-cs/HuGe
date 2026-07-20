@@ -42,6 +42,12 @@ _LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "max_steps", "sim_stopped"
 _EXECUTION_FAILED = "execution_failed"
 _WORKER_RE = re.compile(r"^w[0-9]{2}$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[a-f0-9]{8}$")
+_TASK_SORT_ORDER = {
+    task: index
+    for index, task in enumerate(
+        ("football", "doubledesk", "pp_box", "open_door", "sit_sofa", "boxing", "vision_navi")
+    )
+}
 
 
 class SummaryError(ValueError):
@@ -1470,12 +1476,13 @@ def _sort_rows(rows: list[EvalRow]) -> list[EvalRow]:
     return sorted(
         rows,
         key=lambda row: (
-            row.task,
             row.architecture,
+            row.step,
             row.mode,
             row.run_id,
-            row.step,
             row.checkpoint_relative_path or "",
+            _TASK_SORT_ORDER.get(row.task, len(_TASK_SORT_ORDER)),
+            row.task,
         ),
     )
 

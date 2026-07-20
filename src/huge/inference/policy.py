@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from huge.data.collator import append_oft_prompt
 from huge.data.schemas import ACTION_DIM, PROPRIO_DIM, split_action_dict
 from huge.inference.observation import assemble_proprio
 from huge.models.qwen_sonicfm import QwenSonicFM
@@ -137,12 +138,31 @@ class HugePolicy:
             arr = arr / 255.0
         return torch.from_numpy(arr[None]).to(self.device)
 
-    def _append_oft_action_tokens(self, prompt: str) -> str:
+    def _append_oft_action_tokens(
+        self,
+        prompt: str,
+        state: torch.Tensor,
+        state_mask: torch.Tensor,
+    ) -> str:
         token = getattr(self.model.config, "oft_action_token", "\U0001f50d")
         horizon = int(getattr(self.model.config, "action_horizon", 50) or 50)
-        return f"{prompt} Please predict the next {horizon} robot actions:{token * horizon}"
+        return append_oft_prompt(
+            prompt,
+            action_token=token,
+            action_horizon=horizon,
+            state=state,
+            state_mask=state_mask,
+            use_proprio=bool(getattr(self.model.config, "oft_use_proprio", False)),
+            proprio_bins=int(getattr(self.model.config, "oft_proprio_bins", 256) or 256),
+        )
 
-    def _qwen_inputs(self, observation: dict[str, Any], prompt: str) -> tuple[dict[str, torch.Tensor] | None, torch.Tensor | None, str | None]:
+    def _qwen_inputs(
+        self,
+        observation: dict[str, Any],
+        prompt: str,
+        state: torch.Tensor,
+        state_mask: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor] | None, torch.Tensor | None, str | None]:
         if self.processor is None:
             raise ValueError("Qwen processor is required; fallback text/image path has been removed")
         arr = self._image_array(observation)
@@ -155,7 +175,7 @@ class HugePolicy:
                 getattr(self.model.config, "max_text_tokens", None),
             )
         if self.model_architecture == "qwenoft":
-            prompt = self._append_oft_action_tokens(prompt)
+            prompt = self._append_oft_action_tokens(prompt, state, state_mask)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
@@ -213,7 +233,12 @@ class HugePolicy:
     def _prepare_model_inputs(self, observation: dict[str, Any]) -> dict[str, Any]:
         prompt = self._prompt(observation)
         state_raw, state, state_mask = self._state_tensor(observation)
-        qwen_inputs, action_token_mask, qwen_text = self._qwen_inputs(observation, prompt)
+        qwen_inputs, action_token_mask, qwen_text = self._qwen_inputs(
+            observation,
+            prompt,
+            state,
+            state_mask,
+        )
         return {
             "prompt": prompt,
             "input_ids": self._input_ids(prompt),

@@ -882,6 +882,7 @@ def _data_contract(
 ) -> dict[str, Any]:
     roots: list[dict[str, Any]] = []
     root_values = [
+        *(args.dataset_root and [args.dataset_root] or []),
         *(args.egodex_root and [args.egodex_root] or []),
         *(args.prop_roots or []),
         *(args.prop_ego_roots or []),
@@ -2074,6 +2075,7 @@ def _train_stage_impl(
     )
     dataset = build_stage_dataset(
         args.stage,
+        dataset_root=args.dataset_root,
         sample_stride=args.sample_stride,
         max_episodes=args.max_episodes,
         proprio_stats_path=stats,
@@ -2698,6 +2700,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--init-ckpt", default=None)
     p.add_argument("--resume-from-checkpoint", default=None)
     p.add_argument("--proprio-stats-path", default=None)
+    p.add_argument("--dataset-root", default=None)
     p.add_argument("--egodex-root", default=None)
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)

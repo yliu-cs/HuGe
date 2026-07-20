@@ -133,6 +133,7 @@ def build_stage_dataset(
     stage: str,
     *,
     repo_root: str | Path = ".",
+    dataset_root: str | Path | None = None,
     sample_stride: int = 1,
     max_episodes: int | None = None,
     proprio_stats_path: str | Path | None = None,
@@ -143,7 +144,7 @@ def build_stage_dataset(
     humanoid_arena_task: str = "all",
 ) -> Dataset:
     root = Path(repo_root)
-    data = root / "resource" / "dataset"
+    data = Path(dataset_root) if dataset_root is not None else root / "resource" / "dataset"
     stage = stage.lower()
     normalizer = StateNormalizer.from_json(proprio_stats_path) if proprio_stats_path else None
     if stage in {"stage1", "egodex", "pretrain_egodex"}:

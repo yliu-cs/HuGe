@@ -309,12 +309,26 @@ class QwenSonicFMConfig:
     qwen_lora_target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
     vlm_projector_type: str = "per_layer"
     oft_action_token: str = "\U0001f50d"
+    oft_use_proprio: bool = True
+    oft_proprio_bins: int = 256
     max_text_tokens: int | None = 48
     model_max_length: int = 8192
     char_max_length: int = 256
     qwen_image_size: tuple[int, int] = (256, 256)
     image_crop_fraction: float = 0.95
     image_color_jitter: bool = True
+
+    @classmethod
+    def from_checkpoint_config(cls, config: Mapping[str, Any]) -> "QwenSonicFMConfig":
+        """Load config while preserving pre-proprio QwenOFT checkpoint behavior."""
+        allowed_keys = {field.name for field in fields(cls)}
+        values = {key: value for key, value in config.items() if key in allowed_keys}
+        if (
+            str(values.get("model_architecture", "qwenpi_v3") or "qwenpi_v3").lower() == "qwenoft"
+            and "oft_use_proprio" not in config
+        ):
+            values["oft_use_proprio"] = False
+        return cls(**values)
 
 
 class QwenSonicFM(nn.Module):
@@ -685,8 +699,9 @@ class QwenSonicFM(nn.Module):
         config_path = ckpt_path.parent / "config.json"
         payload = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
         config_raw = payload.get("config", {})
-        allowed_keys = {field.name for field in fields(QwenSonicFMConfig)}
-        config = QwenSonicFMConfig(**{k: v for k, v in config_raw.items() if k in allowed_keys})
+        if not isinstance(config_raw, dict):
+            raise ValueError(f"checkpoint config must be an object: {config_path}")
+        config = QwenSonicFMConfig.from_checkpoint_config(config_raw)
         model = cls(config)
         load_portable_safetensors_strict(model, ckpt_path, device=map_location)
         return model
