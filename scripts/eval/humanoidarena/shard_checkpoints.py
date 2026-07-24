@@ -33,9 +33,13 @@ EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
 MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
 MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
 MODEL_IO_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
-MODEL_IO_TRACE_POLICY = "require_complete_v1"
-STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v1"
-CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v1"
+MODEL_IO_TRACE_POLICY = "disabled"
+MODEL_IO_REQUIRED_TRACE_POLICY = "require_complete_v1"
+MODEL_IO_TRACE_POLICIES = frozenset(
+    {MODEL_IO_TRACE_POLICY, MODEL_IO_REQUIRED_TRACE_POLICY}
+)
+STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v2"
+CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v2"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
 SELECTION_SCHEMA_VERSION = "huge_humanoidarena_shard_selection_v1"
 CHECKPOINT_MANIFEST_VERSION = 1
@@ -858,6 +862,7 @@ def _matches_full_pp_box_contract(
     relative_path: str,
     *,
     repo_root: Path | None = None,
+    execution_horizon: int = 20,
 ) -> bool:
     static_plan = contract.get("static_plan")
     if not isinstance(static_plan, dict):
@@ -894,6 +899,7 @@ def _matches_full_pp_box_contract(
     checkpoint = static_plan.get("checkpoint")
     yaml_config = static_plan.get("yaml")
     policy = static_plan.get("policy")
+    protocol = static_plan.get("protocol")
     yaml_sha256 = yaml_config.get("sha256") if isinstance(yaml_config, dict) else None
     checkpoint_files = checkpoint.get("files") if isinstance(checkpoint, dict) else None
     checkpoint_digest = (
@@ -952,7 +958,12 @@ def _matches_full_pp_box_contract(
         and isinstance(policy, dict)
         and policy.get("test_mode", EXPECTED_TEST_MODE) == EXPECTED_TEST_MODE
         and policy.get("max_steps") == EXPECTED_MAX_STEPS
+        and policy.get("execution_horizon") == execution_horizon
         and policy.get("effective_persistent_sim") is False
+        and policy.get("model_io_trace_policy") in MODEL_IO_TRACE_POLICIES
+        and isinstance(protocol, dict)
+        and protocol.get("prediction_horizon") == 50
+        and protocol.get("execution_horizon") == execution_horizon
         and (
             repo_root is None
             or (
@@ -1375,13 +1386,18 @@ def _canonical_episode_metrics(
     record_video_every_n = (
         policy.get("record_video_every_n") if isinstance(policy, dict) else None
     )
+    trace_policy = (
+        policy.get("model_io_trace_policy") if isinstance(policy, dict) else None
+    )
     if (
         not isinstance(jobs, list)
         or not jobs
         or type(record_video_every_n) is not int
         or record_video_every_n < 0
+        or trace_policy not in MODEL_IO_TRACE_POLICIES
     ):
         return None
+    requires_model_io = trace_policy == MODEL_IO_REQUIRED_TRACE_POLICY
     expected_job_keys = {
         "task_cli",
         "isaac_task_name",
@@ -1528,9 +1544,11 @@ def _canonical_episode_metrics(
                 record_video_every_n > 0
                 and job["episode_index"] % record_video_every_n == 0
             )
-            expected_artifacts = (
-                {"video", "model_io"} if requires_video else {"model_io"}
-            )
+            expected_artifacts: set[str] = set()
+            if requires_video:
+                expected_artifacts.add("video")
+            if requires_model_io:
+                expected_artifacts.add("model_io")
             if set(artifacts) != expected_artifacts:
                 return None
             if requires_video:
@@ -1560,7 +1578,7 @@ def _canonical_episode_metrics(
                     return None
             elif video_recorded is not False or video_path_raw != "":
                 return None
-            if not _valid_model_io_artifact(
+            if requires_model_io and not _valid_model_io_artifact(
                 attempt,
                 contract,
                 job,
@@ -1845,7 +1863,10 @@ def checkpoint_contract_statuses(
     *,
     allowed_root: Path | None = None,
     repo_root: Path | None = None,
+    execution_horizon: int = 20,
 ) -> dict[str, CheckpointContractStatus]:
+    if type(execution_horizon) is not int or not 1 <= execution_horizon <= 50:
+        raise ShardConfigError("execution horizon must be an integer in 1..50")
     root = eval_root.expanduser().resolve()
     if allowed_root is not None:
         allowed = allowed_root.expanduser().resolve()
@@ -1888,7 +1909,10 @@ def checkpoint_contract_statuses(
             continue
         try:
             contract_matches = _matches_full_pp_box_contract(
-                contract, relative, repo_root=repo_root
+                contract,
+                relative,
+                repo_root=repo_root,
+                execution_horizon=execution_horizon,
             )
         except (OSError, TypeError, ValueError):
             contract_matches = False
@@ -2084,12 +2108,14 @@ def completed_checkpoint_paths(
     *,
     allowed_root: Path | None = None,
     repo_root: Path | None = None,
+    execution_horizon: int = 20,
 ) -> set[str]:
     statuses = checkpoint_contract_statuses(
         eval_root,
         candidate_relative_paths,
         allowed_root=allowed_root,
         repo_root=repo_root,
+        execution_horizon=execution_horizon,
     )
     return {
         relative
@@ -2138,6 +2164,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shard-index", required=True, type=int)
     parser.add_argument("--shard-count", required=True, type=int)
+    parser.add_argument("--execution-horizon", type=int, default=20)
     parser.add_argument(
         "--output-format",
         choices=("paths", "actions", "jsonl"),
@@ -2164,6 +2191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.eval_root, {target.relative_path for target in targets},
             allowed_root=args.repo_root / ".runs",
             repo_root=args.repo_root,
+            execution_horizon=args.execution_horizon,
         )
         completed = {
             relative

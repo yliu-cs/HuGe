@@ -31,6 +31,7 @@ Default run-specific roots (environment variables may override):
 Matrix/output overrides:
   HUGE_EVAL_EXPECTED_STEPS (default 6000,12000,18000)
   HUGE_EVAL_OUTPUT_ROOT
+  HUGE_EVAL_EXECUTION_HORIZON (default 20, valid 1..50)
 
 Optional topology overrides (defaults: 8 GPUs, 2 workers/GPU):
   HUGE_EVAL_GPU_COUNT or HUGE_EVAL_GPU_LOGICAL_IDS (mutually exclusive)
@@ -48,6 +49,7 @@ if [[ -n "${HUGE_ALLOW_KIT_MAP_BOOTSTRAP:-}" && "${HUGE_ALLOW_KIT_MAP_BOOTSTRAP}
 fi
 export HUGE_ALLOW_KIT_MAP_BOOTSTRAP="${HUGE_ALLOW_KIT_MAP_BOOTSTRAP:-1}"
 export HUGE_EVAL_WORKERS_PER_GPU="${HUGE_EVAL_WORKERS_PER_GPU:-2}"
+export HUGE_EVAL_EXECUTION_HORIZON="${HUGE_EVAL_EXECUTION_HORIZON:-20}"
 
 # A numeric first argument selects the former matrix interface.
 # All task names are non-numeric, so single-run invocations remain unambiguous.
@@ -147,12 +149,12 @@ if (( $# == 2 )) && [[ "$1" =~ ^[0-9]+$ ]]; then
   export POST_TERMINATION_RECORD_STEPS=10
   export HUGE_EVAL_RECORD_VIDEO_EVERY_N=1
   export HUGE_EVAL_EPISODE_MAX_RETRIES=1
-  export HUGE_EVAL_MODEL_IO_TRACE_POLICY=require_complete_v1
+  export HUGE_EVAL_MODEL_IO_TRACE_POLICY="${HUGE_EVAL_MODEL_IO_TRACE_POLICY:-disabled}"
   export HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS="${HUGE_EVAL_MAX_CONCURRENT_SHADOW_STARTUPS:-2}"
   export HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC="${HUGE_EVAL_SHADOW_STARTUP_TIMEOUT_SEC:-360}"
 
   total_workers=$((selected_gpu_count * HUGE_EVAL_WORKERS_PER_GPU))
-  echo "[run_ha_eval] topology gpu_selection=${gpu_selection} workers_per_gpu=${HUGE_EVAL_WORKERS_PER_GPU} total_workers=${total_workers} min_free_gib=${HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB} output_root=${EVAL_ROOT} expected_steps=${EXPECTED_STEPS} base_port=${HUGE_EVAL_BASE_PORT:-18080} kit_map_bootstrap=${HUGE_ALLOW_KIT_MAP_BOOTSTRAP} model_noise_seed_algorithm=huge_ha_model_noise_v1" >&2
+  echo "[run_ha_eval] topology gpu_selection=${gpu_selection} workers_per_gpu=${HUGE_EVAL_WORKERS_PER_GPU} total_workers=${total_workers} min_free_gib=${HUGE_EVAL_MIN_FREE_GPU_MEMORY_GIB} output_root=${EVAL_ROOT} expected_steps=${EXPECTED_STEPS} base_port=${HUGE_EVAL_BASE_PORT:-18080} kit_map_bootstrap=${HUGE_ALLOW_KIT_MAP_BOOTSTRAP} prediction_horizon=50 execution_horizon=${HUGE_EVAL_EXECUTION_HORIZON} model_noise_seed_algorithm=huge_ha_model_noise_v1" >&2
 
   CHECKPOINT_ROOTS=(
     "${HUGE_EVAL_QWENPI_V3_RUN_ROOT}"
@@ -175,6 +177,7 @@ if (( $# == 2 )) && [[ "$1" =~ ^[0-9]+$ ]]; then
     --expected-steps "${EXPECTED_STEPS}" \
     --shard-index "${SHARD_INDEX}" \
     --shard-count "${SHARD_COUNT}" \
+    --execution-horizon "${HUGE_EVAL_EXECUTION_HORIZON}" \
     --output-format actions \
     "${CHECKPOINT_ROOTS[@]}" >"${selection_file}"; then
     exit 2
@@ -245,8 +248,6 @@ if [[ "$1" == "all" ]]; then
 
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-  RUN_EVAL="${SCRIPT_DIR}/run_eval.sh"
-  ALL_TASKS=(boxing doubledesk football open_door pp_box sit_sofa vision_navi)
 
   cd "${REPO_ROOT}"
   if [[ ! -d "$2" ]]; then
@@ -254,38 +255,13 @@ if [[ "$1" == "all" ]]; then
     exit 2
   fi
 
-  CHECKPOINT_BASENAME="$(basename -- "${2%/}")"
-  if [[ ! "${CHECKPOINT_BASENAME}" =~ ^step_[0-9]+$ ]]; then
-    exec env \
-      PYTHONDONTWRITEBYTECODE=1 \
-      PYTHONPYCACHEPREFIX=/tmp/huge-agent-pycache \
-      PYTHONPATH="${REPO_ROOT}/src" \
-      "${REPO_ROOT}/.venv/bin/python" \
-      "${SCRIPT_DIR}/batch_eval.py" \
-      all "$2" sonic
-  fi
-
-  overall_rc=0
-  for position in "${!ALL_TASKS[@]}"; do
-    task="${ALL_TASKS[${position}]}"
-    echo "[run_eval] [$((position + 1))/${#ALL_TASKS[@]}] task=${task} checkpoint=$2"
-    if bash "${RUN_EVAL}" "${task}" "$2" sonic; then
-      continue
-    else
-      task_rc=$?
-    fi
-    case "${task_rc}" in
-      130|143)
-        exit "${task_rc}"
-        ;;
-      *)
-        if (( overall_rc == 0 )); then
-          overall_rc=${task_rc}
-        fi
-        ;;
-    esac
-  done
-  exit "${overall_rc}"
+  exec env \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPYCACHEPREFIX=/tmp/huge-agent-pycache \
+    PYTHONPATH="${REPO_ROOT}/src" \
+    "${REPO_ROOT}/.venv/bin/python" \
+    "${SCRIPT_DIR}/batch_eval.py" \
+    all "$2" sonic
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

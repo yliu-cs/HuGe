@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
+CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v2"
 COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 WORKER_STATUS_SCHEMA_VERSION = "huge_ha_worker_status_v1"
 TRACE_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
@@ -608,6 +609,9 @@ def _validate_shadow_identity_args(args: argparse.Namespace) -> None:
         or expected_episode_seed > 0x7FFFFFFF
     ):
         raise ValueError("expected episode seed must be an integer in 0..2147483647")
+    execution_horizon = getattr(args, "sonic_vla_execution_horizon", None)
+    if type(execution_horizon) is not int or not 1 <= execution_horizon <= 50:
+        raise ValueError("sonic VLA execution horizon must be an integer in 1..50")
 
 
 def _validate_single_episode_contract(
@@ -676,11 +680,22 @@ def _validate_single_episode_contract(
         )
 
     plan = _read_json_object(attempt / "plan.json", label="attempt plan")
-    if plan.get("schema_version") != "huge_humanoidarena_contract_v1":
+    if plan.get("schema_version") != CONTRACT_SCHEMA_VERSION:
         raise ValueError("attempt plan schema version is incompatible")
     static_plan = plan.get("static_plan")
     if not isinstance(static_plan, dict):
         raise ValueError("attempt plan static_plan must be an object")
+    policy = static_plan.get("policy")
+    protocol = static_plan.get("protocol")
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(protocol, dict)
+        or policy.get("execution_horizon") != args.sonic_vla_execution_horizon
+        or protocol.get("prediction_horizon") != 50
+        or protocol.get("execution_horizon") != args.sonic_vla_execution_horizon
+        or protocol.get("hand_binary_threshold") != args.lerobot_gripper_threshold
+    ):
+        raise ValueError("attempt plan execution policy does not match shadow arguments")
     plan_episodes = static_plan.get("episodes")
     if not isinstance(plan_episodes, list):
         raise ValueError("attempt plan episodes must be a list")
@@ -957,6 +972,8 @@ def run_persistent_shard(args: argparse.Namespace, upstream: types.ModuleType) -
             process_started_at=_PROCESS_STARTED_AT,
             simulator_pid=os.getpid(),
             episode_identity=dict(episode_identity),
+            execution_horizon=args.sonic_vla_execution_horizon,
+            hand_binary_threshold=args.lerobot_gripper_threshold,
             model_io=dict(model_io_result),
             cleanup_errors=list(cleanup_errors),
             **extra,
@@ -1205,6 +1222,7 @@ def build_parser(upstream: types.ModuleType) -> argparse.ArgumentParser:
     parser.add_argument("--expected-episode-seed", required=True, type=int)
     parser.add_argument("--shadow-session-id", required=True)
     parser.add_argument("--completion-dir", required=True)
+    parser.add_argument("--sonic-vla-execution-horizon", required=True, type=int)
     parser.add_argument("--memory-limit-percent", type=int, default=None)
     return parser
 

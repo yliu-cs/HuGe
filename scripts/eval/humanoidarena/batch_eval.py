@@ -45,6 +45,7 @@ ALLOWED_TRAINING_ROOT_NAMES = (
     "full_all_stage",
     "stage3_humanoidarena_full_optimized",
     "stage3_humanoidarena",
+    "archive",
 )
 
 
@@ -77,7 +78,7 @@ def _relative_to(path: Path, root: Path, *, label: str) -> Path:
 
 
 def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarget]:
-    """Find step directories below root and order parent paths then numeric steps."""
+    """Find step directories at or below root and order parent paths then numeric steps."""
     allowed = allowed_root.expanduser().resolve()
     candidate_root = root.expanduser().resolve()
     if not candidate_root.is_dir():
@@ -86,7 +87,12 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
 
     targets: list[CheckpointTarget] = []
     resolved_paths: set[Path] = set()
-    for lexical_path in candidate_root.rglob("step_*"):
+    checkpoint_paths = (
+        (candidate_root,)
+        if STEP_RE.fullmatch(candidate_root.name)
+        else candidate_root.rglob("step_*")
+    )
+    for lexical_path in checkpoint_paths:
         match = STEP_RE.fullmatch(lexical_path.name)
         if match is None:
             continue
@@ -99,7 +105,7 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
             continue
         _relative_to(resolved, candidate_root, label="checkpoint")
         allowed_relative = _relative_to(resolved, allowed, label="checkpoint")
-        if len(allowed_relative.parts) != 6 or allowed_relative.parts[3] != "stage3":
+        if len(allowed_relative.parts) < 6 or allowed_relative.parts[-3] != "stage3":
             continue
         publication_files = (resolved / "manifest.json", resolved / "_SUCCESS")
         try:
@@ -113,7 +119,11 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
         if resolved in resolved_paths:
             raise BatchConfigError(f"multiple checkpoint paths resolve to the same directory: {resolved}")
         resolved_paths.add(resolved)
-        relative = lexical_path.relative_to(candidate_root).as_posix()
+        relative = (
+            lexical_path.name
+            if lexical_path == candidate_root
+            else lexical_path.relative_to(candidate_root).as_posix()
+        )
         targets.append(CheckpointTarget(resolved, relative, int(match.group(1))))
 
     targets.sort(key=lambda target: (str(Path(target.relative_path).parent), target.step, target.relative_path))
@@ -129,10 +139,11 @@ def completed_tasks(
     repo_root: Path,
     allowed_root: Path,
     eval_root: Path,
+    execution_horizon: int,
 ) -> set[str]:
     """Return tasks with a valid success publication for this exact checkpoint."""
     checkpoint_relative = target.path.relative_to(repo_root).as_posix()
-    checkpoint_task = target.path.relative_to(allowed_root).parts[0]
+    checkpoint_task = target.path.parents[4].name
     try:
         manifest_sha256 = _sha256_file(target.path / "manifest.json")
         marker_sha256 = _sha256_file(target.path / "_SUCCESS")
@@ -172,6 +183,8 @@ def completed_tasks(
             task_spec = (
                 static_plan.get("task") if isinstance(static_plan, dict) else None
             )
+            policy = static_plan.get("policy") if isinstance(static_plan, dict) else None
+            protocol = static_plan.get("protocol") if isinstance(static_plan, dict) else None
             publication = (
                 checkpoint.get("portable_publication")
                 if isinstance(checkpoint, dict)
@@ -179,10 +192,15 @@ def completed_tasks(
             )
             if (
                 contract.get("schema_version")
-                != "huge_humanoidarena_contract_v1"
+                != "huge_humanoidarena_contract_v2"
                 or contract_dir.name != contract_hash[:16]
                 or not isinstance(task_spec, dict)
                 or task_spec.get("cli_task") != task
+                or not isinstance(policy, dict)
+                or policy.get("execution_horizon") != execution_horizon
+                or not isinstance(protocol, dict)
+                or protocol.get("prediction_horizon") != 50
+                or protocol.get("execution_horizon") != execution_horizon
                 or not isinstance(checkpoint, dict)
                 or checkpoint.get("relative_path") != checkpoint_relative
                 or checkpoint.get("step") != target.step
@@ -487,6 +505,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         targets = discover_checkpoints(checkpoint_root, allowed_root)
         eval_root = _eval_root(repo_root)
+        try:
+            execution_horizon = int(os.environ.get("HUGE_EVAL_EXECUTION_HORIZON", "20"))
+        except ValueError as exc:
+            raise BatchConfigError("HUGE_EVAL_EXECUTION_HORIZON must be an integer") from exc
+        if not 1 <= execution_horizon <= 50:
+            raise BatchConfigError("HUGE_EVAL_EXECUTION_HORIZON must be in 1..50")
         skip_completed = _env_bool("HUGE_EVAL_RESUME", "1") and not _env_bool(
             "HUGE_EVAL_FORCE_NEW_RUN", "0"
         )
@@ -497,6 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[batch_eval] discovered={len(targets)} root={checkpoint_root} "
+        f"execution_horizon={execution_horizon} "
         f"order=parent_path_then_numeric_step report={report_dir}",
         flush=True,
     )
@@ -514,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo_root=repo_root,
                 allowed_root=allowed_root,
                 eval_root=eval_root,
+                execution_horizon=execution_horizon,
             )
             if skip_completed
             else set()

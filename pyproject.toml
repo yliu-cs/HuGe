@@ -40,6 +40,10 @@ dependencies = [
     "flash-attn",
     "mpi4py>=4.1.2",
     "modelscope>=1.38.1",
+    "h5py>=3.14,<3.15",
+    "zarr>=3,<4",
+    "tensorflow>=2.21,<2.22",
+    "tensorflow-datasets>=4.9,<5",
 ]
 
 [build-system]

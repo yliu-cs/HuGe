@@ -48,8 +48,8 @@ from huge.inference.humanoidarena_http_server import (
 )
 
 
-STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v1"
-CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v1"
+STATIC_PLAN_SCHEMA_VERSION = "huge_humanoidarena_static_plan_v2"
+CONTRACT_SCHEMA_VERSION = "huge_humanoidarena_contract_v2"
 MANIFEST_SCHEMA_VERSION = "huge_humanoidarena_attempt_v1"
 COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
@@ -77,7 +77,11 @@ KIT_MAP_SCHEMA_VERSION = "huge_kit_gpu_map_v1"
 WORKER_STATUS_SCHEMA_VERSION = "huge_ha_worker_status_v1"
 MODEL_IO_TRACE_SCHEMA_VERSION = "huge_humanoidarena_model_io_trace_v1"
 MODEL_IO_RECEIPT_SCHEMA_VERSION = "huge_humanoidarena_model_io_receipt_v1"
-MODEL_IO_TRACE_POLICY = "require_complete_v1"
+MODEL_IO_TRACE_POLICY = "disabled"
+MODEL_IO_REQUIRED_TRACE_POLICY = "require_complete_v1"
+MODEL_IO_TRACE_POLICIES = frozenset(
+    {MODEL_IO_TRACE_POLICY, MODEL_IO_REQUIRED_TRACE_POLICY}
+)
 CHECKPOINT_MANIFEST_VERSION = 1
 PORTABLE_CHECKPOINT_KIND = "huge_portable_model"
 EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
@@ -86,6 +90,7 @@ ALLOWED_TRAINING_ROOT_NAMES = (
     "full_all_stage",
     "stage3_humanoidarena_full_optimized",
     "stage3_humanoidarena",
+    "archive",
 )
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
 SONIC_ENCODER_SHA256 = "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
@@ -98,6 +103,8 @@ EXIT_SIM = 5
 EXIT_INTERRUPTED = 130
 DEFAULT_WORKERS_PER_GPU = 1
 MAX_WORKERS_PER_GPU = 2
+DEFAULT_EXECUTION_HORIZON = 20
+HAND_BINARY_THRESHOLD = 0.5
 
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[a-f0-9]{8}$")
@@ -166,11 +173,11 @@ TASK_SPECS: dict[str, TaskSpec] = {
     "doubledesk": TaskSpec(
         "doubledesk", "HOI_double_desk",
         "Isaac-Move-PickPlace-DoubleDesk-G129-Dex3-Wholebody", "doubledesk",
-        "move the object from one desk to the other", 2000, 10, 95,
+        "move the object from one desk to the other", 2000, 1, 95,
     ),
     "football": TaskSpec(
         "football", "HOI_football_v2", "Isaac-Move-Football-Single-G129-Dex3-Wholebody",
-        "football_single", "kick the football", 2000, 10,
+        "football_single", "kick the football", 2000, 1,
     ),
     "open_door": TaskSpec(
         "open_door", "HSI_open_door", "Isaac-Move-Open-Door-G129-Dex3-Wholebody",
@@ -315,7 +322,7 @@ UPSTREAM_COMPATIBILITY_BASELINE: dict[str, str] = {
     "isaaclab_twist2_g1/script/eval_scripts/sonic/eval_vla_suite.py": "7704b538c5eacc89cab408e4df7822faf5fee0fc99e11070f1be6a39bf2a00e4",
     "isaaclab_twist2_g1/script/eval_scripts/sonic/eval_vla_suite_parallel.py": "6e897d8f95b55c416aa1e094a9aa845ed8e2dcba803edff199928f56c434d5e4",
     "isaaclab_twist2_g1/action_provider/lerobot_vla_http_client.py": "e0232c4b17bd006a6fa0df22ba020c8231b13c94fc2ce459ce00d96996fc68c2",
-    "isaaclab_twist2_g1/action_provider/action_provider_sonic.py": "701b75f0effec0c28c215a813a10d70db0a33dbf01000c7f1c142d6a8a60568c",
+    "isaaclab_twist2_g1/action_provider/action_provider_sonic.py": "6b8d539e1ec33b051fddee6780fadcbe470cdb94723120b196ccafbba4bcc5a8",
     "isaaclab_twist2_g1/action_provider/vla_robot_current_local_runtime_v3.py": "4037db768fd2e3c885997c1c253b3a9f04976af273827c65742783a2ecba9bf2",
     "isaaclab_twist2_g1/action_provider/vla_smpl_runtime.py": "9c592194658ac759ec662fee3d6f583be22daad6545eeb998429ab5d6f7634e7",
     "isaaclab_twist2_g1/task_runtime_profiles.py": "a9d9893c1f01f22484f1d187cb6a6541e61db85cc0b1356da546497ea241e8c4",
@@ -665,10 +672,10 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
     trace_policy = environ.get(
         "HUGE_EVAL_MODEL_IO_TRACE_POLICY", MODEL_IO_TRACE_POLICY
     )
-    if trace_policy != MODEL_IO_TRACE_POLICY:
+    if trace_policy not in MODEL_IO_TRACE_POLICIES:
         raise ConfigError(
-            "HUGE_EVAL_MODEL_IO_TRACE_POLICY is frozen to "
-            f"{MODEL_IO_TRACE_POLICY}"
+            "HUGE_EVAL_MODEL_IO_TRACE_POLICY must be one of: "
+            + ", ".join(sorted(MODEL_IO_TRACE_POLICIES))
         )
     return {
         "test_mode": test_mode,
@@ -679,6 +686,12 @@ def parse_runtime_policy(task: TaskSpec, environ: Mapping[str, str]) -> dict[str
         "seeds_override": environ.get("SEEDS_OVERRIDE", ""),
         "repeats_override": environ.get("REPEATS_PER_SEED", ""),
         "max_steps": _parse_int("MAX_STEPS", environ.get("MAX_STEPS", str(task.default_max_steps)), minimum=1),
+        "execution_horizon": _parse_int(
+            "HUGE_EVAL_EXECUTION_HORIZON",
+            environ.get("HUGE_EVAL_EXECUTION_HORIZON", str(DEFAULT_EXECUTION_HORIZON)),
+            minimum=1,
+            maximum=50,
+        ),
         "video_fps": _parse_int("VIDEO_FPS", environ.get("VIDEO_FPS", "30"), minimum=1, maximum=240),
         "post_termination_record_steps": _parse_int(
             "POST_TERMINATION_RECORD_STEPS", environ.get("POST_TERMINATION_RECORD_STEPS", "10"), minimum=0
@@ -791,8 +804,12 @@ def _allowed_checkpoint_root(
     for name in ALLOWED_TRAINING_ROOT_NAMES:
         base = (repo / ".runs" / name).resolve()
         if _is_relative_to(checkpoint, base):
+            candidate_relative = checkpoint.relative_to(base)
+            if name == "archive" and len(candidate_relative.parts) >= 6:
+                base = checkpoint.parents[5]
+                candidate_relative = checkpoint.relative_to(base)
             matched_base = base
-            relative = checkpoint.relative_to(base)
+            relative = candidate_relative
             break
     if matched_base is None or relative is None:
         allowed = ", ".join(
@@ -1176,7 +1193,7 @@ def build_source_inventory(
     qwen_inventory = _directory_inventory(checkpoint.base_vlm_path)
     publication_required = any(
         _is_relative_to(checkpoint.checkpoint_dir, (repo / ".runs" / name).resolve())
-        for name in ("full_all_stage", "stage3_humanoidarena_full_optimized")
+        for name in ("full_all_stage", "stage3_humanoidarena_full_optimized", "archive")
     )
     checkpoint_publication = _portable_checkpoint_publication(
         checkpoint.checkpoint_dir,
@@ -1293,7 +1310,16 @@ def build_static_plan(
         },
         "yaml": dict(yaml_config),
         "policy": safe_policy,
-        "protocol": {"http": PROTOCOL_VERSION, "mapping": MAPPING_VERSION, "action": [50, 66], "latent": [50, 64]},
+        "protocol": {
+            "http": PROTOCOL_VERSION,
+            "mapping": MAPPING_VERSION,
+            "action": [50, 66],
+            "latent": [50, 64],
+            "prediction_horizon": 50,
+            "execution_horizon": policy["execution_horizon"],
+            "control_hz": 50,
+            "hand_binary_threshold": HAND_BINARY_THRESHOLD,
+        },
         "episode_seed_algorithm": EPISODE_SEED_FORMULA,
         "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
         "episodes": [asdict(job) for job in jobs],
@@ -2737,15 +2763,20 @@ def _validate_model_io_artifact(
     return artifact
 
 
-def _episode_requires_video(attempt: Path, job: EpisodeJob) -> bool:
+def _episode_artifact_requirements(
+    attempt: Path, job: EpisodeJob
+) -> tuple[bool, bool]:
     contract = _json_object(
         attempt.parent.parent / "contract.json",
-        label="video-policy executable contract",
+        label="artifact-policy executable contract",
     )
     static_plan = contract.get("static_plan")
     policy = static_plan.get("policy") if isinstance(static_plan, dict) else None
     episodes = static_plan.get("episodes") if isinstance(static_plan, dict) else None
     every = policy.get("record_video_every_n") if isinstance(policy, dict) else None
+    trace_policy = (
+        policy.get("model_io_trace_policy") if isinstance(policy, dict) else None
+    )
     if (
         contract.get("schema_version") != CONTRACT_SCHEMA_VERSION
         or not isinstance(static_plan, dict)
@@ -2754,9 +2785,13 @@ def _episode_requires_video(attempt: Path, job: EpisodeJob) -> bool:
         or asdict(job) not in episodes
         or type(every) is not int
         or every < 0
+        or trace_policy not in MODEL_IO_TRACE_POLICIES
     ):
-        raise ConfigError("record-video policy provenance is invalid")
-    return every > 0 and job.episode_index % every == 0
+        raise ConfigError("artifact policy provenance is invalid")
+    return (
+        every > 0 and job.episode_index % every == 0,
+        trace_policy == MODEL_IO_REQUIRED_TRACE_POLICY,
+    )
 
 
 def validate_completion_envelope(
@@ -2793,9 +2828,14 @@ def validate_completion_envelope(
     video_path_raw = payload.get("video_path")
     if not isinstance(video_recorded, bool) or not isinstance(video_path_raw, str):
         return None
+    worker_id = completion.get("worker_id")
+    if not isinstance(worker_id, str) or _WORKER_RE.fullmatch(worker_id) is None:
+        return None
     if classification == "task_complete":
         try:
-            requires_video = _episode_requires_video(attempt, job)
+            requires_video, requires_model_io = _episode_artifact_requirements(
+                attempt, job
+            )
         except ConfigError:
             return None
         if requires_video:
@@ -2814,24 +2854,24 @@ def validate_completion_envelope(
             }
         elif video_recorded is not False or video_path_raw != "":
             return None
-        if shadow_status is None:
-            return None
-        worker_id = completion.get("worker_id")
-        try:
-            artifacts["model_io"] = _validate_model_io_artifact(
-                attempt,
-                job,
-                payload,
-                str(worker_id),
-                shadow_status.get("model_io"),
-            )
-        except (ConfigError, OSError, RuntimeError, ValueError):
-            return None
+        if requires_model_io:
+            if shadow_status is None:
+                return None
+            try:
+                artifacts["model_io"] = _validate_model_io_artifact(
+                    attempt,
+                    job,
+                    payload,
+                    worker_id,
+                    shadow_status.get("model_io"),
+                )
+            except (ConfigError, OSError, RuntimeError, ValueError):
+                return None
     elif video_recorded is not False or video_path_raw != "" or artifacts:
         return None
     canonical = {
         "schema_version": EPISODE_SCHEMA_VERSION, "result_identity": job.result_identity,
-        "job": asdict(job), "payload": payload, "worker_id": completion.get("worker_id", ""),
+        "job": asdict(job), "payload": payload, "worker_id": worker_id,
         "classification": classification, "artifacts": artifacts,
         "completion_sha256": sha256_file(completion_path),
     }
@@ -2897,10 +2937,16 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
         if not isinstance(result, dict):
             return None
         try:
-            requires_video = _episode_requires_video(attempt, job)
+            requires_video, requires_model_io = _episode_artifact_requirements(
+                attempt, job
+            )
         except ConfigError:
             return None
-        expected_artifacts = {"model_io", "video"} if requires_video else {"model_io"}
+        expected_artifacts: set[str] = set()
+        if requires_video:
+            expected_artifacts.add("video")
+        if requires_model_io:
+            expected_artifacts.add("model_io")
         if set(artifacts) != expected_artifacts:
             return None
         if requires_video:
@@ -2927,19 +2973,20 @@ def _read_existing_episode(attempt: Path, job: EpisodeJob) -> dict[str, Any] | N
             or result.get("video_path") != ""
         ):
             return None
-        model_io = artifacts.get("model_io")
-        receipt = model_io.get("receipt") if isinstance(model_io, dict) else None
-        try:
-            _validate_model_io_artifact(
-                attempt,
-                job,
-                result,
-                worker_id,
-                receipt,
-                recorded_artifact=model_io,
-            )
-        except (ConfigError, OSError, RuntimeError, ValueError):
-            return None
+        if requires_model_io:
+            model_io = artifacts.get("model_io")
+            receipt = model_io.get("receipt") if isinstance(model_io, dict) else None
+            try:
+                _validate_model_io_artifact(
+                    attempt,
+                    job,
+                    result,
+                    worker_id,
+                    receipt,
+                    recorded_artifact=model_io,
+                )
+            except (ConfigError, OSError, RuntimeError, ValueError):
+                return None
     elif (
         artifacts != {}
         or not isinstance(result, dict)
@@ -3388,7 +3435,7 @@ def _reserve_ports(base: int, count: int) -> list[socket.socket]:
 
 def _server_command(
     args: argparse.Namespace, task: TaskSpec, checkpoint: CheckpointContract, binding: GpuBinding,
-    run_id: str, worker_id: str, attempt: Path, port: int, *,
+    run_id: str, worker_id: str, attempt: Path, port: int, policy: Mapping[str, Any], *,
     contract_hash: str, source_inventory_digest: str,
 ) -> list[str]:
     return [
@@ -3407,7 +3454,10 @@ def _server_command(
         "--run-id", run_id, "--worker-id", worker_id, "--attempt-dir", str(attempt),
         "--status-file", str(attempt / "status" / f"server-{worker_id}.json"),
         "--model-io-root", str(attempt / "model_io"), "--contract-hash", contract_hash,
+        "--model-io-trace-policy", str(policy["model_io_trace_policy"]),
         "--source-inventory-digest", source_inventory_digest,
+        "--execution-horizon", str(policy["execution_horizon"]),
+        "--hand-binary-threshold", str(HAND_BINARY_THRESHOLD),
         "--device", "cuda:0",
     ]
 
@@ -3416,6 +3466,7 @@ def _expected_server_health(
     task: TaskSpec,
     checkpoint: CheckpointContract,
     binding: GpuBinding,
+    policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "status": "ready",
@@ -3427,6 +3478,8 @@ def _expected_server_health(
         "action_dim": 66,
         "motion_token_dim": 64,
         "action_horizon": 50,
+        "execution_horizon": policy["execution_horizon"],
+        "hand_binary_threshold": HAND_BINARY_THRESHOLD,
         "control_hz": 50,
         "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
     }
@@ -3486,8 +3539,10 @@ def _shadow_command(
         "--sonic_encoder_path", str(args.repo / "resource/model/sonic/model_encoder.onnx"),
         "--sonic_decoder_path", str(args.repo / "resource/model/sonic/model_decoder.onnx"),
         "--sonic_vla_root_rot6d_layout", "row", "--sonic_vla_root_max_delta_deg", "26.0",
+        "--sonic-vla-execution-horizon", str(policy["execution_horizon"]),
         "--lerobot_server_url", f"http://127.0.0.1:{port}",
         "--lerobot_server_timeout", str(policy["server_timeout"]),
+        "--lerobot_gripper_threshold", str(HAND_BINARY_THRESHOLD),
         "--robot_type", str(policy["robot_type"]), "--video_fps", str(policy["video_fps"]),
         "--post_termination_record_steps", str(policy["post_termination_record_steps"]),
         "--record_video_every_n", str(policy["record_video_every_n"]),
@@ -4230,6 +4285,7 @@ def _restart_worker_server(
             worker.worker_id,
             attempt,
             worker.port,
+            policy,
             contract_hash=contract_hash,
             source_inventory_digest=source_inventory_digest,
         )
@@ -6169,7 +6225,7 @@ def _execute(
                                     attempt=attempt,
                                     run_id=run_id,
                                     expected_health=_expected_server_health(
-                                        task, checkpoint, worker.binding
+                                        task, checkpoint, worker.binding, policy
                                     ),
                                     ready_timeout_sec=float(
                                         policy["server_ready_timeout"]

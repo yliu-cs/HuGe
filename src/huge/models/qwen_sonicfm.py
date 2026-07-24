@@ -509,7 +509,7 @@ class QwenSonicFM(nn.Module):
             raise RuntimeError("Huge requires a loaded Qwen model")
         qwen_inputs = {k: v.to(next(self.qwen.parameters()).device) if torch.is_tensor(v) else v for k, v in qwen_inputs.items()}
         with torch.set_grad_enabled(self._qwen_grad_enabled()):
-            out = self.qwen(**qwen_inputs, output_hidden_states=True, return_dict=True)
+            out = self.qwen(**qwen_inputs, output_hidden_states=True, return_dict=True, logits_to_keep=1)
         attention_mask = qwen_inputs.get("attention_mask")
         return list(out.hidden_states), attention_mask
 

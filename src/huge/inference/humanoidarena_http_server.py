@@ -44,10 +44,9 @@ from huge.inference.humanoidarena_io_trace import (
     TraceFinishConflictError,
     TraceReceipt,
 )
-from huge.inference.sonic_adapter import HandHysteresis
 
 
-PROTOCOL_VERSION = "huge_humanoidarena_http_v1"
+PROTOCOL_VERSION = "huge_humanoidarena_http_v2"
 EXPECTED_ROBOT_TYPE = "unitree_g1_refpose_v3_1"
 SOURCE_STATE_DIM = 64
 MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
@@ -55,6 +54,8 @@ MAX_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_EDGE = 4096
 MAPPING_VERSION = "humanoidarena_rotlocal_v31_to_huge_proprio_v1"
 MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
+MODEL_IO_TRACE_POLICIES = ("disabled", "require_complete_v1")
+MODEL_IO_REQUIRED_TRACE_POLICY = "require_complete_v1"
 _MODEL_NOISE_SEED_MASK = (1 << 63) - 1
 REQUIRED_CHECKPOINT_FILES = (
     "config.json",
@@ -107,18 +108,22 @@ def derive_model_noise_seed(episode_seed: int) -> int:
 
 @dataclass
 class EpisodeState:
+    execution_horizon: int = ACTION_HORIZON
+    hand_binary_threshold: float = 0.5
     reset_generation: int = 0
     last_seeded_episode: int | None = None
     sequence: int = 0
     last_completed_sequence: int = 0
     has_reset: bool = False
-    hand_hysteresis: HandHysteresis = field(default_factory=HandHysteresis)
+    tracked_hand_state: np.ndarray = field(
+        default_factory=lambda: np.zeros((HAND_DIM,), dtype=np.float32)
+    )
     model_noise_seed: int | None = None
     model_noise_generator: torch.Generator | None = field(default=None, repr=False)
 
     @property
     def hand_state(self) -> np.ndarray:
-        return self.hand_hysteresis.state.copy()
+        return self.tracked_hand_state.copy()
 
     def reset(
         self,
@@ -136,7 +141,7 @@ class EpisodeState:
         self.sequence = 0
         self.last_completed_sequence = 0
         self.has_reset = True
-        self.hand_hysteresis.reset()
+        self.tracked_hand_state[:] = 0.0
         self.last_seeded_episode = None
         self.model_noise_seed = model_noise_seed
         self.model_noise_generator = model_noise_generator
@@ -153,10 +158,13 @@ class EpisodeState:
         return self.sequence
 
     def complete(self, sequence: int, action: np.ndarray) -> None:
-        terminal = np.asarray(action[-1, MOTION_TOKEN_DIM:ACTION_DIM], dtype=np.float32)
-        if terminal.min(initial=0.0) < 0.0 or terminal.max(initial=0.0) > 1.0:
-            terminal = 1.0 / (1.0 + np.exp(-terminal))
-        self.hand_hysteresis.update(terminal)
+        terminal = np.asarray(
+            action[self.execution_horizon - 1, MOTION_TOKEN_DIM:ACTION_DIM],
+            dtype=np.float32,
+        )
+        self.tracked_hand_state = (terminal >= self.hand_binary_threshold).astype(
+            np.float32
+        )
         self.last_completed_sequence = int(sequence)
 
 
@@ -171,9 +179,24 @@ class ServerContract:
     worker_id: str
     status_file: Path
     attempt_dir: Path
+    execution_horizon: int
+    hand_binary_threshold: float
     host: str = "127.0.0.1"
     port: int = 18080
     device: str = "cuda:0"
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.execution_horizon) is not int
+            or not 1 <= self.execution_horizon <= ACTION_HORIZON
+        ):
+            raise ValueError(f"execution_horizon must be an integer in 1..{ACTION_HORIZON}")
+        if (
+            isinstance(self.hand_binary_threshold, bool)
+            or not math.isfinite(self.hand_binary_threshold)
+            or not 0.0 <= self.hand_binary_threshold <= 1.0
+        ):
+            raise ValueError("hand_binary_threshold must be finite and in 0..1")
 
 
 class PolicyLike(Protocol):
@@ -429,6 +452,8 @@ def build_response(action: np.ndarray, episode: EpisodeState) -> dict[str, Any]:
         "episode_seed": episode.last_seeded_episode,
         "reset_generation": episode.reset_generation,
         "sequence": sequence,
+        "prediction_horizon": ACTION_HORIZON,
+        "execution_horizon": episode.execution_horizon,
         "action_chunk": array.tolist(),
         "latent64_chunk": array[:, :MOTION_TOKEN_DIM].tolist(),
         "action_shape": [ACTION_HORIZON, ACTION_DIM],
@@ -635,18 +660,21 @@ class InferenceRuntime:
         contract: ServerContract,
         policy: PolicyLike,
         *,
-        recorder: TraceRecorderLike,
+        recorder: TraceRecorderLike | None,
         cuda_uuid: str,
     ) -> None:
         self.contract = contract
         self.policy = policy
         self.recorder = recorder
         self.cuda_uuid = cuda_uuid
-        self.episode = EpisodeState()
+        self.episode = EpisodeState(
+            execution_horizon=contract.execution_horizon,
+            hand_binary_threshold=contract.hand_binary_threshold,
+        )
         self.state = "starting"
         self.fatal_error_code = ""
         self._lock = threading.Lock()
-        self._trace_status = "incomplete"
+        self._trace_status = "disabled" if recorder is None else "incomplete"
         self._trace_error = ""
         self._trace_session_active = False
         self._trace_recording_enabled = False
@@ -668,6 +696,9 @@ class InferenceRuntime:
             "task": self.contract.task,
             "isaac_task": self.contract.isaac_task,
             "checkpoint_sha256": self.contract.checkpoint.checkpoint_sha256,
+            "action_horizon": ACTION_HORIZON,
+            "execution_horizon": self.contract.execution_horizon,
+            "hand_binary_threshold": self.contract.hand_binary_threshold,
             "cuda_logical_device": 0,
             "cuda_uuid": self.cuda_uuid,
             "reset_generation": self.episode.reset_generation,
@@ -714,15 +745,17 @@ class InferenceRuntime:
         self._abandon_trace_locked("superseded by a new seeded reset")
         self._finish_key = None
         self._finish_receipt = None
-        self._trace_status = "incomplete"
+        self._trace_status = "disabled" if self.recorder is None else "incomplete"
         self._trace_error = ""
-        self._trace_session_active = True
+        self._trace_session_active = self.recorder is not None
         self._trace_recording_enabled = False
         self._trace_finished = False
         self._trace_seeded_reset_generation = self.episode.reset_generation
         self._trace_fallback_session_id = secrets.token_hex(16)
         self._trace_successful_record_count = 0
         self._trace_last_http_response_sequence = 0
+        if self.recorder is None:
+            return
         try:
             self.recorder.begin_episode(
                 episode_seed=episode_seed,
@@ -804,6 +837,8 @@ class InferenceRuntime:
                 "action_dim": ACTION_DIM,
                 "motion_token_dim": MOTION_TOKEN_DIM,
                 "action_horizon": ACTION_HORIZON,
+                "execution_horizon": self.contract.execution_horizon,
+                "hand_binary_threshold": self.contract.hand_binary_threshold,
                 "control_hz": CONTROL_FREQ_HZ,
                 "mapping_version": MAPPING_VERSION,
                 "mapping_source_sha256": _mapping_source_sha256(),
@@ -907,25 +942,33 @@ class InferenceRuntime:
                     "finish_episode replay does not match the current trace session",
                 )
 
-            try:
-                receipt = self.recorder.finish_episode(
-                    result_identity=result_identity,
-                    episode_seed=episode_seed,
-                    outcome_sha256=outcome_sha256,
-                )
-                receipt_payload = asdict(receipt)
-            except TraceFinishConflictError as exc:
-                raise ProtocolError(
-                    HTTPStatus.CONFLICT, "trace_finish_conflict", str(exc)
-                ) from exc
-            except Exception as exc:
-                self._mark_trace_degraded("finish_episode", exc)
+            if self.recorder is None:
                 receipt_payload = self._degraded_receipt_locked(
                     result_identity=result_identity,
                     episode_seed=episode_seed,
                     outcome_sha256=outcome_sha256,
-                    error=self._trace_exception_message("finish_episode", exc),
+                    error="model I/O trace disabled by evaluation policy",
                 )
+            else:
+                try:
+                    receipt = self.recorder.finish_episode(
+                        result_identity=result_identity,
+                        episode_seed=episode_seed,
+                        outcome_sha256=outcome_sha256,
+                    )
+                    receipt_payload = asdict(receipt)
+                except TraceFinishConflictError as exc:
+                    raise ProtocolError(
+                        HTTPStatus.CONFLICT, "trace_finish_conflict", str(exc)
+                    ) from exc
+                except Exception as exc:
+                    self._mark_trace_degraded("finish_episode", exc)
+                    receipt_payload = self._degraded_receipt_locked(
+                        result_identity=result_identity,
+                        episode_seed=episode_seed,
+                        outcome_sha256=outcome_sha256,
+                        error=self._trace_exception_message("finish_episode", exc),
+                    )
 
             trace_status = receipt_payload.get("trace_status")
             if trace_status not in {"complete", "degraded", "incomplete"}:
@@ -1076,7 +1119,7 @@ def create_server(
     contract: ServerContract,
     policy: PolicyLike,
     *,
-    recorder: TraceRecorderLike,
+    recorder: TraceRecorderLike | None,
     cuda_uuid: str,
     max_body_bytes: int = MAX_JSON_BODY_BYTES,
 ) -> HumanoidArenaHTTPServer:
@@ -1122,8 +1165,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attempt-dir", required=True)
     parser.add_argument("--status-file", required=True)
     parser.add_argument("--model-io-root", required=True)
+    parser.add_argument(
+        "--model-io-trace-policy",
+        choices=MODEL_IO_TRACE_POLICIES,
+        default="disabled",
+    )
     parser.add_argument("--contract-hash", required=True)
     parser.add_argument("--source-inventory-digest", required=True)
+    parser.add_argument("--execution-horizon", required=True, type=int)
+    parser.add_argument("--hand-binary-threshold", required=True, type=float)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-body-bytes", type=int, default=MAX_JSON_BODY_BYTES)
     return parser
@@ -1167,6 +1217,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         worker_id=args.worker_id,
         status_file=status_file,
         attempt_dir=attempt_dir,
+        execution_horizon=args.execution_horizon,
+        hand_binary_threshold=args.hand_binary_threshold,
         host=args.host,
         port=args.port,
         device=args.device,
@@ -1179,28 +1231,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         "task": args.task,
         "checkpoint_sha256": contract.checkpoint_sha256,
         "cuda_uuid": args.expected_cuda_uuid,
-        "trace_status": "incomplete",
+        "action_horizon": ACTION_HORIZON,
+        "execution_horizon": args.execution_horizon,
+        "hand_binary_threshold": args.hand_binary_threshold,
+        "trace_status": (
+            "incomplete"
+            if args.model_io_trace_policy == MODEL_IO_REQUIRED_TRACE_POLICY
+            else "disabled"
+        ),
         "trace_error": "",
         "model_noise_seed_algorithm": MODEL_NOISE_SEED_ALGORITHM,
         "updated_at": time.time(),
     }
     atomic_write_json(status_file, starting_status)
     try:
-        recorder = ModelIOTraceRecorder(
-            model_io_root=model_io_root,
-            run_id=args.run_id,
-            worker_id=args.worker_id,
-            task=args.task,
-            checkpoint_sha256=contract.checkpoint_sha256,
-            contract_hash=contract_hash,
-            source_inventory_digest=source_inventory_digest,
-            model_architecture=str(
-                contract.config.get("model_architecture", "qwenpi_v3") or "qwenpi_v3"
-            ),
-            action_horizon=int(contract.config.get("action_horizon", ACTION_HORIZON)),
-            num_inference_steps=int(contract.config.get("num_inference_steps", 4)),
-            mapping_version=MAPPING_VERSION,
-        )
+        recorder = None
+        if args.model_io_trace_policy == MODEL_IO_REQUIRED_TRACE_POLICY:
+            recorder = ModelIOTraceRecorder(
+                model_io_root=model_io_root,
+                run_id=args.run_id,
+                worker_id=args.worker_id,
+                task=args.task,
+                checkpoint_sha256=contract.checkpoint_sha256,
+                contract_hash=contract_hash,
+                source_inventory_digest=source_inventory_digest,
+                model_architecture=str(
+                    contract.config.get("model_architecture", "qwenpi_v3") or "qwenpi_v3"
+                ),
+                action_horizon=int(contract.config.get("action_horizon", ACTION_HORIZON)),
+                num_inference_steps=int(contract.config.get("num_inference_steps", 4)),
+                mapping_version=MAPPING_VERSION,
+            )
         policy = load_policy_strict(contract, device=args.device)
         cuda_uuid = detect_cuda_uuid(args.device)
     except Exception as exc:

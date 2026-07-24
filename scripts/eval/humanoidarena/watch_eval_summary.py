@@ -37,11 +37,16 @@ COMPLETION_SCHEMA_VERSION = "huge_humanoidarena_completion_v1"
 EPISODE_SCHEMA_VERSION = "huge_humanoidarena_episode_v1"
 SUMMARY_SCHEMA_VERSION = "huge_humanoidarena_summary_v1"
 SUMMARY_ROW_SCHEMA_VERSION = "huge_humanoidarena_summary_row_v1"
+DEFAULT_EXECUTION_HORIZON = 20
 
 _LEGAL_TASK_OUTCOMES = {"success", "fall", "timeout", "max_steps", "sim_stopped"}
 _EXECUTION_FAILED = "execution_failed"
 _WORKER_RE = re.compile(r"^w[0-9]{2}$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[a-f0-9]{8}$")
+_ARCHITECTURE_SORT_ORDER = {
+    architecture: index
+    for index, architecture in enumerate(("qwenpi_v3", "qwengr00t", "qwenoft"))
+}
 _TASK_SORT_ORDER = {
     task: index
     for index, task in enumerate(
@@ -1194,6 +1199,7 @@ def _strict_eligible_contracts(
     eval_root: Path,
     repo_root: Path,
     relative_path: str,
+    execution_horizon: int,
 ) -> list[tuple[Path, str, dict[str, Any]]]:
     current: list[tuple[Path, str, dict[str, Any]]] = []
     for contract_path in contract_paths:
@@ -1202,7 +1208,10 @@ def _strict_eligible_contracts(
             continue
         try:
             if not selector._matches_full_pp_box_contract(
-                contract, relative_path, repo_root=repo_root
+                contract,
+                relative_path,
+                repo_root=repo_root,
+                execution_horizon=execution_horizon,
             ):
                 continue
             static_plan = contract["static_plan"]
@@ -1296,7 +1305,9 @@ def _strict_error_from_base(
     )
 
 
-def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
+def _collect_strict_rows(
+    eval_root: Path, repo_root: Path, *, execution_horizon: int
+) -> list[EvalRow]:
     selector = _selector_module()
     groups, rows = _strict_contract_groups(eval_root, selector)
     if not groups:
@@ -1307,6 +1318,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
             set(groups),
             allowed_root=repo_root / ".runs",
             repo_root=repo_root,
+            execution_horizon=execution_horizon,
         )
     except selector.ShardConfigError as exc:
         rows.extend(
@@ -1326,6 +1338,7 @@ def _collect_strict_rows(eval_root: Path, repo_root: Path) -> list[EvalRow]:
             eval_root=eval_root,
             repo_root=repo_root,
             relative_path=relative_path,
+            execution_horizon=execution_horizon,
         )
         successes = _strict_success_candidates(
             selector,
@@ -1476,6 +1489,9 @@ def _sort_rows(rows: list[EvalRow]) -> list[EvalRow]:
     return sorted(
         rows,
         key=lambda row: (
+            _ARCHITECTURE_SORT_ORDER.get(
+                row.architecture, len(_ARCHITECTURE_SORT_ORDER)
+            ),
             row.architecture,
             row.step,
             row.mode,
@@ -1492,6 +1508,7 @@ def collect_rows(
     *,
     strict: bool = False,
     repo_root: Path | None = None,
+    execution_horizon: int = DEFAULT_EXECUTION_HORIZON,
 ) -> list[EvalRow]:
     if strict:
         resolved_repo = (
@@ -1500,7 +1517,11 @@ def collect_rows(
             else Path(__file__).resolve().parents[3]
         )
         resolved_eval = eval_root.expanduser().resolve()
-        return _collect_strict_rows(resolved_eval, resolved_repo)
+        return _collect_strict_rows(
+            resolved_eval,
+            resolved_repo,
+            execution_horizon=execution_horizon,
+        )
     rows = [
         _row_from_contract(path, eval_root)
         for path in eval_root.rglob("contract.json")
@@ -1622,6 +1643,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        choices=range(1, 51),
+        default=DEFAULT_EXECUTION_HORIZON,
+        help="actions executed from each 50-step prediction (default: %(default)s)",
+    )
+    parser.add_argument(
         "--output-format",
         choices=("table", "jsonl"),
         default="table",
@@ -1640,6 +1668,7 @@ def main() -> int:
                 eval_root,
                 strict=args.strict,
                 repo_root=repo_root,
+                execution_horizon=args.execution_horizon,
             )
             if eval_root.is_dir()
             else []
