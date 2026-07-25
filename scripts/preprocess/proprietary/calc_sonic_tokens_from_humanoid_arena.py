@@ -1,4 +1,4 @@
-"""Build the unified Stage 3 HumanoidArena cache and HE+WBT+HA stats."""
+"""Build HumanoidArena and HE+WBT+HIW+HA union stats."""
 
 from __future__ import annotations
 
@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         help="G1 WBT source/cache root used for union stats",
     )
     parser.add_argument(
+        "--hiw-source-root",
+        default="resource/datasets/HIW-500",
+        help="HIW source root used for union stats",
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help="atomically replace an existing cache even if its source inventory changed",
@@ -50,6 +55,7 @@ def main() -> None:
         out_root=Path(args.out_root),
         he_cache_root=Path(args.he_cache_root),
         wbt_source_root=Path(args.wbt_source_root),
+        hiw_source_root=Path(args.hiw_source_root),
         rebuild=args.rebuild,
     )
     counts = manifest["counts"]

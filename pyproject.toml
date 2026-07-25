@@ -44,6 +44,7 @@ dependencies = [
     "zarr>=3,<4",
     "tensorflow>=2.21,<2.22",
     "tensorflow-datasets>=4.9,<5",
+    "av>=17.0.1",
 ]
 
 [build-system]

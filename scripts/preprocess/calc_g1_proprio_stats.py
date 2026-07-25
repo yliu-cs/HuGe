@@ -1,4 +1,4 @@
-"""Compute grouped 34-D G1 proprio stats for HE + WBT caches."""
+"""Compute Stage 2 grouped 34-D proprio stats from HE + WBT + HIW."""
 
 from __future__ import annotations
 
@@ -36,15 +36,17 @@ def _stats(flat: np.ndarray) -> dict[str, dict[str, list[float]]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--he-cache-root", default="resource/dataset/humanoid-everyday-cache")
-    parser.add_argument("--wbt-source-root", default="resource/dataset/G1_WBT")
-    parser.add_argument("--wbt-cache-root", default="resource/dataset/G1_WBT-cache")
+    parser.add_argument("--he-cache-root", default="resource/datasets/humanoid-everyday-cache")
+    parser.add_argument("--wbt-source-root", default="resource/datasets/G1_WBT")
+    parser.add_argument("--hiw-source-root", default="resource/datasets/HIW-500")
+    parser.add_argument("--wbt-cache-root", default="resource/datasets/G1_WBT-cache")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     sources = {
         "HE": Path(args.he_cache_root) / "g1_proprio",
         "WBT": Path(args.wbt_source_root) / "g1_proprio",
+        "HIW": Path(args.hiw_source_root) / "g1_proprio",
     }
     arrays: list[np.ndarray] = []
     counts: dict[str, dict[str, int]] = {}

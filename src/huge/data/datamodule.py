@@ -3,20 +3,108 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import numpy as np
 from torch.utils.data import Dataset, Subset
 
 from huge.data.egodex_dataset import EgoDexDataset
 from huge.data.he_dataset import HEDataset
+from huge.data.hiw_dataset import HIWDataset
 from huge.data.humanoid_arena_dataset import HumanoidArenaDataset
 from huge.data.prop_dataset import PropDataset
 from huge.data.prop_ego_dataset import PropEgoDataset
 from huge.data.sonic_dataset import MixtureDataset
+from huge.data.stage1_cache_dataset import Behavior1KDataset, EgoVerseDataset, XperienceDataset
 from huge.data.state_normalizer import StateNormalizer
 from huge.data.wbt_dataset import WBTDataset
+
+@dataclass(frozen=True, slots=True)
+class DatasetSpec:
+    kind: str
+    root: Path
+
+
+STAGE1_SOURCE_ORDER = ("egodex", "egoverse", "behavior1k", "xperience")
+STAGE2_SOURCE_ORDER = ("he", "wbt", "hiw")
+
+
+def normalize_dataset_specs(
+    values: Sequence[Sequence[str] | DatasetSpec],
+    *,
+    stage: str,
+) -> list[DatasetSpec]:
+    order = STAGE1_SOURCE_ORDER if stage == "stage1" else STAGE2_SOURCE_ORDER
+    specs = [
+        value
+        if isinstance(value, DatasetSpec)
+        else DatasetSpec(kind=str(value[0]).lower(), root=Path(value[1]))
+        for value in values
+    ]
+    kinds = [spec.kind for spec in specs]
+    unknown = sorted(set(kinds) - set(order))
+    if unknown:
+        raise ValueError(f"unsupported {stage} dataset source kinds: {unknown}; expected {list(order)}")
+    duplicates = sorted({kind for kind in kinds if kinds.count(kind) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate {stage} dataset source kinds: {duplicates}")
+    return sorted(specs, key=lambda spec: order.index(spec.kind))
+
+
+def _build_egodex(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return EgoDexDataset(spec.root, **kwargs)
+
+
+def _build_egoverse(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return EgoVerseDataset(spec.root, **kwargs)
+
+
+def _build_behavior1k(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return Behavior1KDataset(spec.root, **kwargs)
+
+
+def _build_xperience(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return XperienceDataset(spec.root, **kwargs)
+
+
+STAGE1_DATASET_BUILDERS: dict[str, Callable[[DatasetSpec, dict[str, Any]], Dataset]] = {
+    "egodex": _build_egodex,
+    "egoverse": _build_egoverse,
+    "behavior1k": _build_behavior1k,
+    "xperience": _build_xperience,
+}
+
+def _build_he(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return HEDataset(
+        spec.root,
+        cache_root=spec.root.with_name(f"{spec.root.name}-cache"),
+        **kwargs,
+    )
+
+
+def _build_wbt(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return WBTDataset(spec.root, **kwargs)
+
+
+def _build_hiw(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
+    return HIWDataset(
+        spec.root,
+        sample_stride=kwargs["sample_stride"],
+        proprio_normalizer=kwargs["proprio_normalizer"],
+        max_episodes=kwargs["max_episodes"],
+    )
+
+
+STAGE2_DATASET_BUILDERS: dict[str, Callable[[DatasetSpec, dict[str, Any]], Dataset]] = {
+    "he": _build_he,
+    "wbt": _build_wbt,
+    "hiw": _build_hiw,
+}
+
+
+
 
 
 class EpisodeSubset(Subset):
@@ -138,6 +226,10 @@ def build_stage_dataset(
     max_episodes: int | None = None,
     proprio_stats_path: str | Path | None = None,
     egodex_root: str | Path | None = None,
+    stage1_sources: Sequence[Sequence[str] | DatasetSpec] | None = None,
+    stage2_sources: Sequence[Sequence[str] | DatasetSpec] | None = None,
+    episode_fraction: float | None = None,
+    episode_selection_seed: int = 7,
     prop_roots: list[str] | None = None,
     prop_ego_roots: list[str] | None = None,
     humanoid_arena_roots: list[str] | None = None,
@@ -148,22 +240,34 @@ def build_stage_dataset(
     stage = stage.lower()
     normalizer = StateNormalizer.from_json(proprio_stats_path) if proprio_stats_path else None
     if stage in {"stage1", "egodex", "pretrain_egodex"}:
-        return EgoDexDataset(egodex_root or data / "EgoDex", sample_stride=sample_stride, max_episodes=max_episodes)
+        if stage1_sources:
+            specs = normalize_dataset_specs(stage1_sources, stage="stage1")
+        else:
+            specs = [DatasetSpec("egodex", Path(egodex_root or data / "EgoDex"))]
+        kwargs = {
+            "sample_stride": sample_stride,
+            "max_episodes": max_episodes,
+            "episode_fraction": episode_fraction,
+            "episode_selection_seed": episode_selection_seed,
+        }
+        datasets = [STAGE1_DATASET_BUILDERS[spec.kind](spec, kwargs) for spec in specs]
+        return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     if stage in {"stage2", "he_wbt", "posttrain_he_wbt"}:
-        he = HEDataset(
-            data / "humanoid-everyday",
-            cache_root=data / "humanoid-everyday-cache",
-            sample_stride=sample_stride,
-            proprio_normalizer=normalizer,
-            max_episodes=max_episodes,
+        specs = (
+            normalize_dataset_specs(stage2_sources, stage="stage2")
+            if stage2_sources
+            else [
+                DatasetSpec("he", data / "humanoid-everyday"),
+                DatasetSpec("wbt", data / "G1_WBT"),
+            ]
         )
-        wbt = WBTDataset(
-            data / "G1_WBT",
-            sample_stride=sample_stride,
-            proprio_normalizer=normalizer,
-            max_episodes=max_episodes,
-        )
-        return MixtureDataset([he, wbt])
+        kwargs = {
+            "sample_stride": sample_stride,
+            "proprio_normalizer": normalizer,
+            "max_episodes": max_episodes,
+        }
+        datasets = [STAGE2_DATASET_BUILDERS[spec.kind](spec, kwargs) for spec in specs]
+        return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     if stage in {"stage3", "prop", "proprietary", "finetune_prop", "prop_ego", "proprietary_ego"}:
         datasets: list[Dataset] = []
         if stage in {"prop_ego", "proprietary_ego"}:

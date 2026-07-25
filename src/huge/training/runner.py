@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
 from huge.data.collator import HugeCollator
-from huge.data.datamodule import build_stage_dataset, limit_dataset
+from huge.data.datamodule import build_stage_dataset, limit_dataset, normalize_dataset_specs
 from huge.data.sampler import BlockShuffleSampler
 from huge.data.schemas import ActionSchema
 from huge.data.video_reader import set_frame_cache_size
@@ -72,6 +72,7 @@ class StageDefaults:
     epochs: int
     sample_stride: int
     checkpointing_steps: int
+    max_steps: int | None = None
     weight_decay: float = 0.01
     num_workers: int = 8
     freeze_qwen: bool = False
@@ -107,13 +108,13 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         learning_rate=1e-4,
         batch_size=96,
         epochs=1,
-        sample_stride=10,
+        sample_stride=1,
         checkpointing_steps=0,
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
-    # Main whole-body posttraining on HE + WBT. Denser sampling and stronger
-    # hand supervision because 66-D targets are fully available.
+    # Main whole-body posttraining on HE + WBT + HIW with shared 34-D proprio
+    # normalization and complete 66-D motion/hand supervision.
     "stage2": StageDefaults(
         learning_rate=1e-4,
         batch_size=96,
@@ -123,13 +124,15 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         warmup_ratio=0.05,
         max_text_tokens=48,
     ),
-    # Real-robot adaptation. Lower LR, denser sampling, frequent checkpoints.
+    # Final adaptation. Stop at 50k successful updates and publish only the
+    # final step unless a caller explicitly requests periodic checkpoints.
     "stage3": StageDefaults(
         learning_rate=3e-5,
         batch_size=32,
         epochs=30,
         sample_stride=1,
-        checkpointing_steps=10000,
+        checkpointing_steps=0,
+        max_steps=50_000,
         weight_decay=0.005,
         warmup_ratio=0.1,
         max_text_tokens=48,
@@ -203,6 +206,34 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
     args.resume_from_checkpoint = _optional_path(args.resume_from_checkpoint)
     if args.init_ckpt is not None and args.resume_from_checkpoint is not None:
         raise ValueError("--init-ckpt and --resume-from-checkpoint are mutually exclusive")
+
+    if args.sample_stride <= 0:
+        raise ValueError("--sample-stride must be > 0")
+    if args.max_episodes is not None and args.max_episodes <= 0:
+        raise ValueError("--max-episodes must be > 0")
+    if args.max_train_samples is not None and args.max_train_samples <= 0:
+        raise ValueError("--max-train-samples must be > 0")
+    if args.episode_selection_seed is None:
+        args.episode_selection_seed = args.seed
+    if args.episode_selection_seed < 0:
+        raise ValueError("--episode-selection-seed must be >= 0")
+    if args.episode_fraction is not None:
+        if not math.isfinite(args.episode_fraction) or not 0.0 < args.episode_fraction <= 1.0:
+            raise ValueError("--episode-fraction must satisfy 0 < fraction <= 1")
+        if args.max_episodes is not None:
+            raise ValueError("--episode-fraction and --max-episodes are mutually exclusive")
+        if args.stage != "stage1":
+            raise ValueError("--episode-fraction is only valid for Stage 1")
+    if args.stage1_sources:
+        if args.stage != "stage1":
+            raise ValueError("--stage1-source is only valid for Stage 1")
+        if args.egodex_root is not None:
+            raise ValueError("--stage1-source and --egodex-root are mutually exclusive")
+        normalize_dataset_specs(args.stage1_sources, stage="stage1")
+    if args.stage2_sources:
+        if args.stage != "stage2":
+            raise ValueError("--stage2-source is only valid for Stage 2")
+        normalize_dataset_specs(args.stage2_sources, stage="stage2")
 
     lr_names = ("vlm_learning_rate", "projector_learning_rate", "action_learning_rate")
     configured_lrs = [getattr(args, name) for name in lr_names]
@@ -792,6 +823,13 @@ def _resolved_training_contract(args: argparse.Namespace) -> dict[str, Any]:
         for key, value in sorted(vars(args).items())
         if key not in _RESUME_CONFIG_EXCLUDED_FIELDS
     }
+    for stage, field in (("stage1", "stage1_sources"), ("stage2", "stage2_sources")):
+        values = getattr(args, field)
+        if values:
+            resolved[field] = [
+                [spec.kind, str(spec.root)]
+                for spec in normalize_dataset_specs(values, stage=stage)
+            ]
     resolved.update(
         {
             "tuning_mode": _tuning_mode(args),
@@ -881,9 +919,12 @@ def _data_contract(
     stats_path: str | None,
 ) -> dict[str, Any]:
     roots: list[dict[str, Any]] = []
+    source_values = args.stage1_sources if args.stage == "stage1" else args.stage2_sources
+    normalized_specs = normalize_dataset_specs(source_values, stage=args.stage) if source_values else []
     root_values = [
         *(args.dataset_root and [args.dataset_root] or []),
         *(args.egodex_root and [args.egodex_root] or []),
+        *(spec.root for spec in normalized_specs),
         *(args.prop_roots or []),
         *(args.prop_ego_roots or []),
         *(args.humanoid_arena_roots or []),
@@ -898,19 +939,79 @@ def _data_contract(
             if marker is not None:
                 markers.append(marker)
         roots.append({"path": str(root), "markers": markers})
+    normalized_sources = [
+        {
+            "kind": spec.kind,
+            "logical_root": str(spec.root),
+            "resolved_root": str(spec.root.expanduser().resolve()),
+        }
+        for spec in normalized_specs
+    ]
+    spans_fn = getattr(dataset, "episode_spans", None)
+    spans_contract = None
+    if callable(spans_fn):
+        spans = spans_fn()
+        spans_contract = {
+            "count": len(spans),
+            "sha256": hashlib.sha256(spans.tobytes(order="C")).hexdigest(),
+        }
     payload = {
         "dataset_type": type(dataset).__name__,
+        "dataset_contract": (
+            dataset.data_contract()
+            if callable(getattr(dataset, "data_contract", None))
+            else None
+        ),
         "train_len": int(train_length),
+        "normalized_sources": normalized_sources,
+        "episode_spans": spans_contract,
         "roots": roots,
         "stats": _file_contract(stats_path, required=True) if stats_path else None,
         "sample_stride": int(args.sample_stride),
         "max_episodes": args.max_episodes,
+        "episode_fraction": args.episode_fraction,
+        "episode_selection_seed": args.episode_selection_seed,
         "max_train_samples": args.max_train_samples,
         "task": args.humanoid_arena_task,
         "block_shuffle_size": args.block_shuffle_size,
+        "action_horizon": args.action_horizon,
         "drop_last": bool(args.drop_last),
     }
     return {**payload, "fingerprint": _payload_fingerprint(payload)}
+
+
+def _data_summary_lines(contract: dict[str, Any]) -> list[str]:
+    dataset_contract = contract.get("dataset_contract")
+    if not isinstance(dataset_contract, dict):
+        return []
+    sources = (
+        dataset_contract.get("sources")
+        if isinstance(dataset_contract.get("sources"), list)
+        else [dataset_contract]
+    )
+    total = sum(int(source.get("samples", 0)) for source in sources)
+    lines: list[str] = []
+    for source in sources:
+        samples = int(source.get("samples", 0))
+        source_id = source.get("source_id", source.get("dataset_id", source.get("dataset_type")))
+        episodes = source.get("selected_episode_count", source.get("episodes", "unknown"))
+        ratio = samples / total if total else 0.0
+        digest = str(source.get("selected_episode_ids_sha256", ""))[:12] or "n/a"
+        segments = source.get("selected_segment_count", source.get("segments", "unknown"))
+        token_rows = source.get("selected_token_rows", "unknown")
+        line = (
+            f"source={source_id} episodes={episodes} segments={segments} "
+            f"token_rows={token_rows} samples={samples} ratio={ratio:.6f} "
+            f"selection_digest={digest}"
+        )
+        if "source_fps" in source:
+            line += (
+                f" source_fps={source['source_fps']} logical_control_hz={source['logical_control_hz']}"
+                f" motion_dim={source['motion_dim']} hand_mode={source['hand_mode']}"
+                f" state_mode={source['state_mode']} video_backend={source['video_backend']}"
+            )
+        lines.append(line)
+    return lines
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -1411,7 +1512,7 @@ def _prepare_loader_epoch(
         train_loader.set_epoch(epoch)
 
 
-def _batch_trace(batch: dict[str, Any]) -> tuple[str, str]:
+def _batch_trace(batch: dict[str, Any]) -> tuple[str, str, str]:
     identities = list(
         zip(
             batch.get("dataset_id", []),
@@ -1420,6 +1521,7 @@ def _batch_trace(batch: dict[str, Any]) -> tuple[str, str]:
             strict=False,
         )
     )
+    sources = ",".join(sorted({str(identity[0]) for identity in identities}))
     identity_sha256 = _payload_fingerprint(identities)
     digest = hashlib.sha256()
     for key in sorted(batch):
@@ -1439,7 +1541,7 @@ def _batch_trace(batch: dict[str, Any]) -> tuple[str, str]:
                     digest.update(str(tensor.dtype).encode("utf-8"))
                     digest.update(canonical_json_bytes(list(tensor.shape)))
                     digest.update(tensor.view(torch.uint8).numpy().tobytes())
-    return identity_sha256, digest.hexdigest()
+    return sources, identity_sha256, digest.hexdigest()
 
 
 def _new_staging_directory(destination: Path, accelerator: Any) -> Path:
@@ -1948,6 +2050,7 @@ class SaveCoordinator:
             "data": {
                 "seed": self.args.seed,
                 "loader_batches": len(self.train_loader),
+                "dataset_summary": self.data_contract.get("dataset_contract"),
                 "sample_stride": self.args.sample_stride,
                 "block_shuffle_size": self.args.block_shuffle_size,
                 "drop_last": bool(self.args.drop_last),
@@ -2062,8 +2165,16 @@ def _train_stage_impl(
         ),
     )
     stats = args.proprio_stats_path
-    if stats is None and args.stage in {"stage2", "posttrain_he_wbt"}:
-        stats = "resource/dataset/G1_WBT-cache/meta/g1_proprio_stats_sonic.json"
+    if stats is None and args.stage == "stage2":
+        source_kinds = {source[0].lower() for source in (args.stage2_sources or [])}
+        if source_kinds != {"hiw"}:
+            if args.dataset_root:
+                stage2_root = Path(args.dataset_root)
+            elif args.stage2_sources:
+                stage2_root = Path(args.stage2_sources[0][1]).parent
+            else:
+                stage2_root = Path("resource/dataset")
+            stats = str(stage2_root / "G1_WBT-cache/meta/g1_proprio_stats_sonic.json")
     if stats is None and args.stage in {"stage3", "finetune_prop"}:
         stats = "resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json"
     _log_main(
@@ -2080,6 +2191,10 @@ def _train_stage_impl(
         max_episodes=args.max_episodes,
         proprio_stats_path=stats,
         egodex_root=args.egodex_root,
+        stage1_sources=args.stage1_sources,
+        stage2_sources=args.stage2_sources,
+        episode_fraction=args.episode_fraction,
+        episode_selection_seed=args.episode_selection_seed,
         prop_roots=args.prop_roots,
         prop_ego_roots=args.prop_ego_roots,
         humanoid_arena_roots=args.humanoid_arena_roots,
@@ -2100,6 +2215,8 @@ def _train_stage_impl(
             resume_info["trainer_state"].get("data_fingerprint"),
             data_contract["fingerprint"],
         )
+    for summary_line in _data_summary_lines(data_contract):
+        _log_main(accelerator, f"[{args.stage}] data source: {summary_line}")
     _log_main(
         accelerator,
         (
@@ -2469,12 +2586,13 @@ def _train_stage_impl(
                 for batch_index, batch in enumerate(train_loader):
                     if batch_index < resume_offset:
                         if trace_batches:
-                            identity_sha256, batch_sha256 = _batch_trace(batch)
+                            sources, identity_sha256, batch_sha256 = _batch_trace(batch)
                             _log_rank(
                                 accelerator,
                                 (
                                     f"[{args.stage}] replay_discard epoch={epoch} batch={batch_index} "
-                                    f"identity_sha256={identity_sha256} batch_sha256={batch_sha256}"
+                                    f"sources={sources} identity_sha256={identity_sha256} "
+                                    f"batch_sha256={batch_sha256}"
                                 ),
                             )
                         continue
@@ -2486,12 +2604,13 @@ def _train_stage_impl(
                     progress.batches_consumed_in_epoch = batch_index + 1
                     epoch_completed = progress.batches_consumed_in_epoch >= len(train_loader)
                     if trace_batches:
-                        identity_sha256, batch_sha256 = _batch_trace(batch)
+                        sources, identity_sha256, batch_sha256 = _batch_trace(batch)
                         _log_rank(
                             accelerator,
                             (
                                 f"[{args.stage}] batch epoch={epoch} batch={batch_index} "
-                                f"identity_sha256={identity_sha256} batch_sha256={batch_sha256}"
+                                f"sources={sources} identity_sha256={identity_sha256} "
+                                f"batch_sha256={batch_sha256}"
                             ),
                         )
                     batch = move_batch(batch, device)
@@ -2702,6 +2821,11 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--proprio-stats-path", default=None)
     p.add_argument("--dataset-root", default=None)
     p.add_argument("--egodex-root", default=None)
+    p.add_argument("--stage1-source", dest="stage1_sources", action="append", nargs=2, metavar=("TYPE", "ROOT"))
+    p.add_argument("--stage2-source", dest="stage2_sources", action="append", nargs=2, metavar=("TYPE", "ROOT"))
+    p.add_argument("--sample-stride", type=int, default=None)
+    p.add_argument("--episode-fraction", type=float, default=None)
+    p.add_argument("--episode-selection-seed", type=int, default=None)
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)
     p.add_argument("--humanoid-arena-roots", nargs="*", default=None)
@@ -2724,7 +2848,6 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--frame-cache-size", type=int, default=None)
     p.add_argument("--block-shuffle-size", type=int, default=None)
     p.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--sample-stride", type=int, default=None)
     p.add_argument("--max-episodes", type=int, default=None)
     p.add_argument("--max-train-samples", type=int, default=None)
     p.add_argument("--checkpointing-steps", type=int, default=None)

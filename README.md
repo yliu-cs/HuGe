@@ -20,8 +20,8 @@ Training stages:
 
 | Stage | Data |
 | --- | --- |
-| `stage1` | EgoDex; 64-D actions are padded and hand dimensions are masked |
-| `stage2` | Humanoid-Everyday + G1-WBT |
+| `stage1` | EgoDex, EgoVerse, Behavior-1K, and Xperience adapters |
+| `stage2` | Humanoid-Everyday, G1-WBT, and HIW-500 |
 | `stage3` | proprietary real/sim data or the unified HumanoidArena cache |
 
 ## ⚙️ Requirements
@@ -183,6 +183,57 @@ bash scripts/train/train_huge.sh <stage> [options]
 The launcher configures Accelerate, DeepSpeed, GPU/process discovery, cuDNN,
 and previous-stage checkpoint selection.
 
+### Stage 1/2 multi-source data
+
+Repeated source arguments provide the common upper-level interface; each kind
+uses its own lower-level adapter. Omitting them preserves the legacy defaults:
+Stage 1 uses EgoDex only and Stage 2 uses HE + WBT.
+
+```bash
+bash scripts/train/train_huge.sh stage1 \
+  --stage1-source egodex resource/datasets/EgoDex \
+  --stage1-source egoverse resource/datasets/egoverse-cache \
+  --stage1-source behavior1k resource/datasets/behavior-1k-2025-challenge-cache \
+  --stage1-source xperience resource/datasets/xperience-10m-cache \
+  --episode-fraction 0.10 \
+  --episode-selection-seed 7 \
+  --sample-stride 10
+
+bash scripts/train/train_huge.sh stage2 \
+  --stage2-source he resource/datasets/humanoid-everyday \
+  --stage2-source wbt resource/datasets/G1_WBT \
+  --stage2-source hiw resource/datasets/HIW-500 \
+  --proprio-stats-path \
+    resource/datasets/G1_WBT-cache/meta/g1_proprio_stats_sonic.json
+```
+
+The full-pipeline launcher now defaults Stage 1 to EgoDex + EgoVerse +
+BEHAVIOR-1K + Xperience-10M and Stage 2 to Humanoid Everyday + G1_WBT +
+HIW-500. Stage 1 fractions select a deterministic, nested subset of complete
+source episodes; `sample_stride` is a deterministic within-episode time-step
+stride, not random episode sampling. `--max-episodes` remains a mutually
+exclusive per-source prefix limit for debugging. Sources are mixed in canonical
+order at their natural sample ratio.
+
+The HIW adapter reads `HIW-500/meta/episodes` directly; when that directory is
+absent, it downloads only the official `BitRobot/HIW-500-LeRobot` episode
+metadata into the standard Hugging Face cache. Publish the derived 34-D state
+after the in-place 66-D token upgrade:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/hiw/prepare_hiw_cache.py --publish-source-proprio
+```
+
+The existing `resource/datasets/HIW-500-cache` still contains only `_SUCCESS`
+and a validation manifest. Derived arrays live beside the source as
+`HIW-500/sonic_tokens/` and `HIW-500/g1_proprio/`; videos and Parquet files are
+not copied. HIW proprio uses the source 29 G1 joint positions, event-latched WBC
+hand state, and projected gravity derived from WBC pivot roll/pitch/yaw. Stage 2
+and Stage 3 union statistics include those valid HIW states. Head AV1 video is
+decoded strictly through PyAV/libdav1d.
+
+
 ### HumanoidArena single configuration
 
 ```bash
@@ -204,7 +255,7 @@ are recorded in `meta/conversion_manifest.json`.
 
 ### HumanoidArena experiment matrix
 
-`scripts/train/run_huge.sh` defaults to nine sequential runs:
+`scripts/train/run_huge.sh` defaults to three sequential Stage 3 full-tuning runs:
 
 - task: `HOI_pp_box`
 - architectures: `qwenpi_v3 qwengr00t qwenoft`
@@ -250,11 +301,11 @@ HUGE_HUMANOID_ARENA_TUNING_MODES=full \
 bash scripts/train/run_huge.sh
 ```
 
-Legacy matrix modes:
+Legacy pipeline modes:
 
-- `HUGE_STAGE3_DATA=sim` runs Stage 1 -> Stage 2 -> sim Stage 3 for strides
-  `1 2 5 10 50` and writes under `.runs/stage1_stride_abla`.
-- `HUGE_STAGE3_DATA=real` runs real Stage 3 for those strides, initializes from
+- `HUGE_STAGE3_DATA=sim` runs Stage 1 -> Stage 2 -> sim Stage 3 once over every
+  EgoDex time step and writes under `.runs/sim_pipeline`.
+- `HUGE_STAGE3_DATA=real` runs real Stage 3 once, initializes from
   `HUGE_STAGE2_SOURCE_ROOT`, and writes under `.runs/stage3_real_cola`.
 
 Both modes retain legacy `resource/dataset/` defaults and require path
@@ -279,13 +330,14 @@ Outputs:
 
 | Stage | LR | Batch/process | Epochs | Stride | Warmup | Weight decay | Periodic checkpoint |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `stage1` | `1e-4` | 96 | 1 | 10 | 0.05 | 0.01 | disabled |
+| `stage1` | `1e-4` | 96 | 1 | 1 | 0.05 | 0.01 | disabled |
 | `stage2` | `1e-4` | 96 | 1 | 1 | 0.05 | 0.01 | disabled |
-| `stage3` | `3e-5` | 32 | 30 | 1 | 0.1 | 0.005 | every 10000 steps |
+| `stage3` | `3e-5` | 32 | 50,000-step cap | 1 | 0.1 | 0.005 | disabled; final only |
 
 Shared defaults: `qwenpi_v3`, full Qwen training, bf16, DeepSpeed ZeRO-2,
 16 action layers, 1024 action hidden size, 16 attention heads, 4 inference
-steps, 8 workers, and no validation loop. A final checkpoint is always saved.
+steps, 8 workers, and no validation loop. Only the final checkpoint is saved
+unless a periodic interval is explicitly supplied.
 
 For explicit distributed settings:
 
@@ -301,9 +353,9 @@ bash scripts/train/train_huge.sh stage3 \
   --proprio-stats-path /path/to/proprio_stats_union_sonic.json
 ```
 
-Stage 1 and Stage 2, plus the legacy sim/real pipelines, still default to
-`resource/dataset/`. Stage 1 accepts `--egodex-root`; Stage 2 has no HE/WBT
-root override. See [Compatibility notes](#compatibility-notes).
+Stage 1 and Stage 2 retain legacy `resource/dataset/` defaults when no explicit
+roots are passed. Use repeated `--stage1-source`/`--stage2-source` arguments for
+the current plural tree. See [Compatibility notes](#compatibility-notes).
 
 ## 📊 Offline evaluation
 
@@ -501,9 +553,8 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 - Current data is stored under `resource/datasets/`. Stage 2, the general
   audit, and several legacy sim/real/preprocessing defaults still use
   `resource/dataset/`. Do not treat the paths as interchangeable.
-- Stage 1 accepts `--egodex-root resource/datasets/EgoDex`. Stage 2 has no
-  HE/WBT root override and requires path alignment before use with the plural
-  tree.
+- Stage 1 accepts `--egodex-root resource/datasets/EgoDex`; both Stage 1 and
+  Stage 2 accept repeated typed source arguments for the plural tree.
 - `scripts/download_humanoidarena_vision_navi.py` is not present. The
   ModelScope snippet above is the supported download command in this README.
 - `tests/test_download_humanoidarena_vision_navi.py` still imports the removed

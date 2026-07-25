@@ -5,16 +5,16 @@ set -euo pipefail
 # G1 recipe, with legacy tuning modes and sim/real pipelines available only
 # through explicit environment overrides.
 #
-# sim mode (HUGE_STAGE3_DATA=sim) runs one qwenpi_v3 pipeline per stage1 stride:
-#   stage1: EgoDex pretraining with sample_stride in {1,2,5,10,50}
-#   stage2: HE + WBT posttraining, initialized from stage1
+# sim mode (HUGE_STAGE3_DATA=sim) runs one qwenpi_v3 pipeline:
+#   stage1: EgoDex pretraining over every time step
+#   stage2: HE + WBT + HIW posttraining, initialized from stage1
 #   stage3: G1WholebodyPushOfficeChairTeleop sim finetuning, initialized from stage2
-#   writes to ${HUGE_RUN_ROOT:-./.runs/stage1_stride_abla}/stride_<stride>/<stage>/<ts>/
+#   writes to ${HUGE_RUN_ROOT:-./.runs/sim_pipeline}/pipeline/<stage>/<ts>/
 #
 # real mode (HUGE_STAGE3_DATA=real) reuses the existing sim stage1/stage2 and
-# only runs a real-robot stage3 per stride, initialized from the stage2 ckpt
+# only runs real-robot stage3, initialized from the stage2 checkpoint
 # found under HUGE_STAGE2_SOURCE_ROOT. The sim tree is never written to:
-#   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_real_cola}/stride_<stride>/stage3/<ts>/
+#   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_real_cola}/pipeline/stage3/<ts>/
 #
 # humanoid_arena mode (the default) trains all tasks with full tuning. Without an
 # architecture selector it uses the fixed order qwenoft -> qwenpi_v3 ->
@@ -29,7 +29,6 @@ set -euo pipefail
 #   HUGE_STAGE3_DATA=sim|real|humanoid_arena   experiment mode (default humanoid_arena)
 #   HUGE_RUN_ROOT=.runs/xxx        change the root for all experiments
 #   HUGE_STAGE2_SOURCE_ROOT=...    (real) existing stage1/stage2 runs to init from
-#   HUGE_STAGE1_SAMPLE_STRIDES=... space-separated stride values
 #   HUGE_SIM_STAGE3_EPOCHS=...     sim stage3 epochs (default 50)
 #   HUGE_SIM_STAGE3_CHECKPOINTING_STEPS=...   sim stage3 ckpt interval (default 500)
 #   HUGE_REAL_STAGE3_EPOCHS=...    real stage3 epochs (default 50)
@@ -49,8 +48,8 @@ set -euo pipefail
 #   HUGE_HUMANOID_ARENA_ACTION_LR=...         full action-head LR (default 1e-4)
 #   HUGE_HUMANOID_ARENA_WARMUP_RATIO=...      full warmup ratio (default 0.05)
 #   HUGE_HUMANOID_ARENA_MIN_LR_RATE=...       full cosine floor ratio (default 0.04)
-#   HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS=... full model/state interval (default 50000)
-#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 150000)
+#   HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS=... periodic model/state interval (default 0; final only)
+#   HUGE_HUMANOID_ARENA_MAX_STEPS=...             shared full hard cap (default 50000)
 #   HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS=...    optional qwenoft override
 #   HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS=...  optional qwenpi_v3 override
 #   HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS=...  optional qwengr00t override
@@ -67,9 +66,7 @@ set -euo pipefail
 #   scripts/train/run_huge.sh --full-pipeline --arch qwenoft  run one formal 8-GPU pipeline
 #   scripts/train/run_huge.sh --arch qwenoft    run one Stage 3-only architecture
 #   scripts/train/run_huge.sh                   run all three architectures sequentially
-#   HUGE_STAGE3_DATA=sim scripts/train/run_huge.sh   run all configured sim strides
-#   scripts/train/run_huge.sh 10           run only stride_10
-#   scripts/train/run_huge.sh --stride 10  run only stride_10
+#   HUGE_STAGE3_DATA=sim scripts/train/run_huge.sh   run the sim pipeline
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="$SCRIPT_DIR/train_huge.sh"
@@ -78,7 +75,7 @@ TRAIN_SCRIPT="$SCRIPT_DIR/train_huge.sh"
 # stage2 checkpoints (see STAGE2_SOURCE_ROOT below).
 STAGE3_DATA="${HUGE_STAGE3_DATA:-humanoid_arena}"
 case "$STAGE3_DATA" in
-  sim)  DEFAULT_RUN_ROOT="./.runs/stage1_stride_abla" ;;
+  sim)  DEFAULT_RUN_ROOT="./.runs/sim_pipeline" ;;
   real) DEFAULT_RUN_ROOT="./.runs/stage3_real_cola" ;;
   humanoid_arena) DEFAULT_RUN_ROOT="./.runs/full_all_stage" ;;
   *) echo "HUGE_STAGE3_DATA must be 'sim', 'real', or 'humanoid_arena', got '$STAGE3_DATA'" >&2; exit 2 ;;
@@ -103,7 +100,7 @@ REAL_STAGE3_EPOCHS="${HUGE_REAL_STAGE3_EPOCHS:-50}"
 REAL_STAGE3_CHECKPOINTING_STEPS="${HUGE_REAL_STAGE3_CHECKPOINTING_STEPS:-20000}"
 
 # Existing stage1/stage2 runs used to initialize real stage3 (read-only).
-STAGE2_SOURCE_ROOT="${HUGE_STAGE2_SOURCE_ROOT:-./.runs/stage1_stride_abla}"
+STAGE2_SOURCE_ROOT="${HUGE_STAGE2_SOURCE_ROOT:-./.runs/sim_pipeline/pipeline}"
 
 # --- humanoid_arena stage3 (full-only by default; legacy modes are opt-in) ---
 HUMANOID_ARENA_TASK="${HUGE_HUMANOID_ARENA_TASK:-all}"
@@ -112,14 +109,14 @@ HUMANOID_ARENA_STATS="${HUGE_STAGE3_HUMANOID_ARENA_PROPRIO_STATS:-$HUMANOID_AREN
 HUMANOID_ARENA_INIT_CKPT="${HUGE_HUMANOID_ARENA_INIT_CKPT:-none}"
 HUMANOID_ARENA_RESUME_STATE="${HUGE_HUMANOID_ARENA_RESUME_STATE:-}"
 HUMANOID_ARENA_STAGE3_EPOCHS="${HUGE_HUMANOID_ARENA_STAGE3_EPOCHS:-50}"
-HUMANOID_ARENA_CHECKPOINTING_STEPS="${HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS:-${HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS:-50000}}"
+HUMANOID_ARENA_CHECKPOINTING_STEPS="${HUGE_HUMANOID_ARENA_CHECKPOINTING_STEPS:-${HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS:-0}}"
 HUMANOID_ARENA_RESUME_STATE_KEEP="${HUGE_HUMANOID_ARENA_RESUME_STATE_KEEP:-2}"
 HUMANOID_ARENA_VLM_LR="${HUGE_HUMANOID_ARENA_VLM_LR:-1e-5}"
 HUMANOID_ARENA_PROJECTOR_LR="${HUGE_HUMANOID_ARENA_PROJECTOR_LR:-2.5e-5}"
 HUMANOID_ARENA_ACTION_LR="${HUGE_HUMANOID_ARENA_ACTION_LR:-1e-4}"
 HUMANOID_ARENA_WARMUP_RATIO="${HUGE_HUMANOID_ARENA_WARMUP_RATIO:-0.05}"
 HUMANOID_ARENA_MIN_LR_RATE="${HUGE_HUMANOID_ARENA_MIN_LR_RATE:-0.04}"
-HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-150000}"
+HUMANOID_ARENA_MAX_STEPS="${HUGE_HUMANOID_ARENA_MAX_STEPS:-50000}"
 HUMANOID_ARENA_QWENOFT_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENPI_V3_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENGR00T_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
@@ -134,22 +131,61 @@ STAGE2_PROPRIO_STATS="${HUGE_STAGE2_PROPRIO_STATS:-$STAGE12_DATA_ROOT/G1_WBT-cac
 STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-2e-5}"
 STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-5e-5}"
 STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-2e-4}"
+read -r -a STAGE1_SOURCES <<< "${HUGE_STAGE1_SOURCES:-egodex egoverse behavior1k xperience}"
+read -r -a STAGE2_SOURCES <<< "${HUGE_STAGE2_SOURCES:-he wbt hiw}"
+STAGE1_EPISODE_FRACTION="${HUGE_STAGE1_EPISODE_FRACTION:-}"
+STAGE1_EPISODE_SELECTION_SEED="${HUGE_STAGE1_EPISODE_SELECTION_SEED:-7}"
+STAGE1_SAMPLE_STRIDE="${HUGE_STAGE1_SAMPLE_STRIDE:-1}"
+STAGE1_MAX_STEPS="${HUGE_STAGE1_MAX_STEPS:-}"
+STAGE2_MAX_STEPS="${HUGE_STAGE2_MAX_STEPS:-}"
 
-read -r -a STAGE1_SAMPLE_STRIDES <<< "${HUGE_STAGE1_SAMPLE_STRIDES:-1 2 5 10 50}"
-SELECTED_STRIDE=""
+declare -A STAGE1_ROOT_BY_KIND=(
+  [egodex]="$STAGE12_DATA_ROOT/EgoDex"
+  [egoverse]="$STAGE12_DATA_ROOT/egoverse-cache"
+  [behavior1k]="$STAGE12_DATA_ROOT/behavior-1k-2025-challenge-cache"
+  [xperience]="$STAGE12_DATA_ROOT/xperience-10m-cache"
+)
+declare -A STAGE2_ROOT_BY_KIND=(
+  [he]="$STAGE12_DATA_ROOT/humanoid-everyday"
+  [wbt]="$STAGE12_DATA_ROOT/G1_WBT"
+  [hiw]="$STAGE12_DATA_ROOT/HIW-500"
+)
+STAGE1_SOURCE_ARGS=()
+for source_kind in "${STAGE1_SOURCES[@]}"; do
+  if [[ ! -v "STAGE1_ROOT_BY_KIND[$source_kind]" ]]; then
+    echo "invalid HUGE_STAGE1_SOURCES kind: $source_kind" >&2
+    exit 2
+  fi
+  STAGE1_SOURCE_ARGS+=(--stage1-source "$source_kind" "${STAGE1_ROOT_BY_KIND[$source_kind]}")
+done
+STAGE2_SOURCE_ARGS=()
+for source_kind in "${STAGE2_SOURCES[@]}"; do
+  if [[ ! -v "STAGE2_ROOT_BY_KIND[$source_kind]" ]]; then
+    echo "invalid HUGE_STAGE2_SOURCES kind: $source_kind" >&2
+    exit 2
+  fi
+  STAGE2_SOURCE_ARGS+=(--stage2-source "$source_kind" "${STAGE2_ROOT_BY_KIND[$source_kind]}")
+done
+STAGE1_DATA_ARGS=(
+  "${STAGE1_SOURCE_ARGS[@]}"
+  --episode-selection-seed "$STAGE1_EPISODE_SELECTION_SEED"
+  --sample-stride "$STAGE1_SAMPLE_STRIDE"
+)
+[[ -z "$STAGE1_EPISODE_FRACTION" ]] || STAGE1_DATA_ARGS+=(--episode-fraction "$STAGE1_EPISODE_FRACTION")
+[[ -z "$STAGE1_MAX_STEPS" ]] || STAGE1_DATA_ARGS+=(--max-steps "$STAGE1_MAX_STEPS")
+STAGE2_DATA_ARGS=("${STAGE2_SOURCE_ARGS[@]}")
+[[ -z "$STAGE2_MAX_STEPS" ]] || STAGE2_DATA_ARGS+=(--max-steps "$STAGE2_MAX_STEPS")
+
 SELECTED_ARCH=""
 FULL_PIPELINE=0
 
 usage() {
   cat <<EOF
 Usage: $0 [--full-pipeline] [--arch ARCH]
-       $0 [--stride STRIDE] [STRIDE]
 
 For HumanoidArena, --arch must be one of qwenoft, qwenpi_v3, or qwengr00t.
 Without --arch, run all three architectures. --full-pipeline adds Stage 1 and
 Stage 2 before HumanoidArena Stage 3 for each architecture.
-With HUGE_STAGE3_DATA=sim|real, optionally select one stride; configured strides:
-${STAGE1_SAMPLE_STRIDES[*]}
 EOF
 }
 
@@ -171,38 +207,17 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$SELECTED_ARCH" ]] || { echo "--arch requires a value" >&2; exit 2; }
       shift
       ;;
-    --stride)
-      [[ $# -ge 2 ]] || { echo "--stride requires a value" >&2; exit 2; }
-      SELECTED_STRIDE="$2"
-      shift 2
-      ;;
-    --stride=*)
-      SELECTED_STRIDE="${1#*=}"
-      shift
-      ;;
     -h|--help)
       usage
       exit 0
       ;;
-    -*)
+    *)
       echo "unknown argument: $1" >&2
       usage >&2
       exit 2
       ;;
-    *)
-      if [[ -n "$SELECTED_STRIDE" ]]; then
-        echo "only one stride can be selected per run_huge.sh process" >&2
-        exit 2
-      fi
-      SELECTED_STRIDE="$1"
-      shift
-      ;;
   esac
 done
-
-if [[ -n "$SELECTED_STRIDE" ]]; then
-  STAGE1_SAMPLE_STRIDES=("$SELECTED_STRIDE")
-fi
 
 if [[ -n "$SELECTED_ARCH" ]]; then
   if [[ "$STAGE3_DATA" != "humanoid_arena" ]]; then
@@ -214,10 +229,6 @@ if [[ -n "$SELECTED_ARCH" ]]; then
     *) echo "invalid HumanoidArena architecture: $SELECTED_ARCH" >&2; exit 2 ;;
   esac
   HUMANOID_ARENA_ARCHITECTURES=("$SELECTED_ARCH")
-fi
-if [[ "$STAGE3_DATA" == "humanoid_arena" && -n "$SELECTED_STRIDE" ]]; then
-  echo "--stride is not valid with HUGE_STAGE3_DATA=humanoid_arena" >&2
-  exit 2
 fi
 
 if [[ "$STAGE3_DATA" == "humanoid_arena" ]] &&
@@ -232,8 +243,6 @@ if [[ "$STAGE3_DATA" == "humanoid_arena" ]]; then
   if [[ "${#HUMANOID_ARENA_ARCHITECTURES[@]}" -eq 1 ]]; then
     LOCK_SCOPE="${LOCK_SCOPE}_${HUMANOID_ARENA_ARCHITECTURES[0]}"
   fi
-elif [[ "${#STAGE1_SAMPLE_STRIDES[@]}" -eq 1 ]]; then
-  LOCK_SCOPE="stride_${STAGE1_SAMPLE_STRIDES[0]}"
 fi
 LOCK_FILE="${HUGE_LOCK_FILE:-$RUN_ROOT/run_huge_${LOCK_SCOPE}.flag}"
 
@@ -375,12 +384,11 @@ run_exp() {
 }
 
 run_stage1() {
-  local sample_stride="$1"
-  run_exp stage1 --model-architecture "$MODEL_ARCHITECTURE" --sample-stride "$sample_stride"
+  run_exp stage1 --model-architecture "$MODEL_ARCHITECTURE" "${STAGE1_DATA_ARGS[@]}"
 }
 
 run_stage2() {
-  run_exp stage2 --model-architecture "$MODEL_ARCHITECTURE"
+  run_exp stage2 --model-architecture "$MODEL_ARCHITECTURE" "${STAGE2_DATA_ARGS[@]}"
 }
 
 run_sim_stage3() {
@@ -397,6 +405,7 @@ run_humanoid_arena_stage1() {
   run_exp stage1 \
     --model-architecture "$architecture" \
     --dataset-root "$STAGE12_DATA_ROOT" \
+    "${STAGE1_DATA_ARGS[@]}" \
     --vlm-learning-rate "$STAGE12_VLM_LR" \
     --projector-learning-rate "$STAGE12_PROJECTOR_LR" \
     --action-learning-rate "$STAGE12_ACTION_LR" \
@@ -410,6 +419,7 @@ run_humanoid_arena_stage2() {
   run_exp stage2 \
     --model-architecture "$architecture" \
     --dataset-root "$STAGE12_DATA_ROOT" \
+    "${STAGE2_DATA_ARGS[@]}" \
     --proprio-stats-path "$STAGE2_PROPRIO_STATS" \
     --vlm-learning-rate "$STAGE12_VLM_LR" \
     --projector-learning-rate "$STAGE12_PROJECTOR_LR" \
@@ -419,11 +429,10 @@ run_humanoid_arena_stage2() {
     --mixed-precision bf16
 }
 
-# Resolve the latest stage2 checkpoint for a stride under STAGE2_SOURCE_ROOT.
+# Resolve the latest stage2 checkpoint under STAGE2_SOURCE_ROOT.
 # Mirrors resolve_latest_stage_ckpt in train_huge.sh but reads the source root.
 resolve_stage2_ckpt() {
-  local sample_stride="$1"
-  local stage2_root="$STAGE2_SOURCE_ROOT/stride_${sample_stride}/stage2"
+  local stage2_root="$STAGE2_SOURCE_ROOT/stage2"
   [[ -d "$stage2_root" ]] || return 1
   local latest_run
   latest_run="$(find "$stage2_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
@@ -435,11 +444,10 @@ resolve_stage2_ckpt() {
 }
 
 run_real_stage3() {
-  local sample_stride="$1"
   local init_ckpt
-  if ! init_ckpt="$(resolve_stage2_ckpt "$sample_stride")"; then
-    echo "==> ERROR: no stage2 checkpoint for stride_${sample_stride} under $STAGE2_SOURCE_ROOT" >&2
-    echo "==>        expected $STAGE2_SOURCE_ROOT/stride_${sample_stride}/stage2/<run>/step_*" >&2
+  if ! init_ckpt="$(resolve_stage2_ckpt)"; then
+    echo "==> ERROR: no stage2 checkpoint under $STAGE2_SOURCE_ROOT" >&2
+    echo "==>        expected $STAGE2_SOURCE_ROOT/stage2/<run>/step_*" >&2
     exit 1
   fi
   run_exp stage3 \
@@ -539,17 +547,14 @@ run_all() {
     done
     return
   fi
-  local sample_stride
-  for sample_stride in "${STAGE1_SAMPLE_STRIDES[@]}"; do
-    EXPERIMENT_NAME="stride_${sample_stride}"
-    if [[ "$STAGE3_DATA" == "real" ]]; then
-      run_real_stage3 "$sample_stride"
-    else
-      run_stage1 "$sample_stride"
-      run_stage2
-      run_sim_stage3
-    fi
-  done
+  EXPERIMENT_NAME="pipeline"
+  if [[ "$STAGE3_DATA" == "real" ]]; then
+    run_real_stage3
+  else
+    run_stage1
+    run_stage2
+    run_sim_stage3
+  fi
 }
 
 acquire_run_lock

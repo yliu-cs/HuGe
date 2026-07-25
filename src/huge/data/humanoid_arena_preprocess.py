@@ -504,20 +504,26 @@ def preprocess_humanoid_arena(
     out_root: str | Path,
     he_cache_root: str | Path,
     wbt_source_root: str | Path,
+    hiw_source_root: str | Path,
     rebuild: bool = False,
 ) -> dict[str, Any]:
-    """Build one atomic HumanoidArena cache and HE+WBT+HA union stats."""
+    """Build one atomic HumanoidArena cache and HE+WBT+HIW+HA union stats."""
     raw = Path(raw_root)
     out = Path(out_root)
     he = Path(he_cache_root)
     wbt = Path(wbt_source_root)
+    hiw = Path(hiw_source_root)
     raw_resolved = raw.resolve()
     out_resolved = out.resolve()
     if out_resolved == raw_resolved or out_resolved.is_relative_to(raw_resolved):
         raise ValueError(f"output root must not be the raw root or inside it: {out}")
 
     episodes, raw_fingerprint = discover_and_preflight(raw)
-    base_stats_sources = {"HE": he / "g1_proprio", "WBT": wbt / "g1_proprio"}
+    base_stats_sources = {
+        "HE": he / "g1_proprio",
+        "WBT": wbt / "g1_proprio",
+        "HIW": hiw / "g1_proprio",
+    }
     stats_fingerprint = _stats_source_fingerprint(base_stats_sources)
     reusable = _load_reusable_manifest(
         out,

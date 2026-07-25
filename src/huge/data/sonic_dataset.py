@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
 from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM, pad_egodex_action, validate_action_array
+from huge.data.episode_selection import global_selected_episode_digest
 from huge.data.state_normalizer import StateNormalizer
 
 
@@ -256,6 +259,34 @@ class SonicTokenDataset:
             "image": None,
         }
 
+    def data_contract(self) -> dict[str, Any]:
+        inventory = hashlib.sha256()
+        tasks: Counter[str] = Counter()
+        for episode in self.episodes:
+            relative = episode.token_path.relative_to(self.cache_root).as_posix()
+            inventory.update(
+                f"{relative}\t{episode.token_path.stat().st_size}\t{episode.length}\n".encode()
+            )
+            tasks[self.language_map.get(episode.episode_id, self.language)] += 1
+        return {
+            "adapter_schema_version": 1,
+            "dataset_id": self.dataset_id,
+            "cache_root": str(self.cache_root),
+            "resolved_root": str(self.cache_root.resolve()),
+            "episodes": len(self.episodes),
+            "samples": len(self),
+            "sample_stride": self.sample_stride,
+            "action_horizon": self.action_horizon,
+            "state_required": self.state_required,
+            "motion_only_64d": self.egodex_64d,
+            "action_mode": "motion_64d_masked_hands" if self.egodex_64d else "action_66d",
+            "state_mode": "required" if self.state_required else "masked_absent",
+            "video_mode": self.video_len_hint_mode,
+            "task_histogram": dict(sorted(tasks.items())),
+            "token_inventory_digest": inventory.hexdigest(),
+        }
+
+
 
 class MixtureDataset:
     """Natural-frame-ratio mixture over multiple map-style datasets."""
@@ -290,3 +321,50 @@ class MixtureDataset:
         dataset_idx = int(np.searchsorted(self._cum, idx, side="right"))
         offset = 0 if dataset_idx == 0 else int(self._cum[dataset_idx - 1])
         return self.datasets[dataset_idx][idx - offset]
+
+    def selection_summary(self) -> dict[str, Any] | None:
+        summaries: list[dict[str, Any]] = []
+        selections: list[tuple[str, Sequence[str]]] = []
+        for dataset in self.datasets:
+            summary_fn = getattr(dataset, "selection_summary", None)
+            ids_fn = getattr(dataset, "selected_episode_ids", None)
+            if not callable(summary_fn) or not callable(ids_fn):
+                return None
+            summary = summary_fn()
+            source_id = str(summary["source_id"])
+            summaries.append(summary)
+            selections.append((source_id, ids_fn()))
+        fractions = {summary["requested_fraction"] for summary in summaries}
+        seeds = {summary["base_selection_seed"] for summary in summaries}
+        return {
+            "normalized_source_order": [summary["source_id"] for summary in summaries],
+            "requested_fraction": next(iter(fractions)) if len(fractions) == 1 else None,
+            "base_selection_seed": next(iter(seeds)) if len(seeds) == 1 else None,
+            "total_source_episodes": sum(summary["source_episode_count"] for summary in summaries),
+            "total_selected_episodes": sum(summary["selected_episode_count"] for summary in summaries),
+            "total_segments": sum(summary["source_segment_count"] for summary in summaries),
+            "total_selected_segments": sum(summary["selected_segment_count"] for summary in summaries),
+            "total_token_rows": sum(summary["source_token_rows"] for summary in summaries),
+            "total_selected_token_rows": sum(summary["selected_token_rows"] for summary in summaries),
+            "total_stride_samples": len(self),
+            "global_selected_episode_ids_sha256": global_selected_episode_digest(selections),
+            "per_source": summaries,
+        }
+
+    def data_contract(self) -> dict[str, Any]:
+        sources = []
+        for dataset in self.datasets:
+            contract = getattr(dataset, "data_contract", None)
+            sources.append(contract() if contract is not None else {"dataset_type": type(dataset).__name__})
+        payload = {
+            "dataset_type": type(self).__name__,
+            "samples": len(self),
+            "normalized_source_order": [
+                source.get("source_id", source.get("dataset_id", source.get("dataset_type"))) for source in sources
+            ],
+            "sources": sources,
+        }
+        selection = self.selection_summary()
+        if selection is not None:
+            payload["selection"] = selection
+        return payload

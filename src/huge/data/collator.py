@@ -170,8 +170,19 @@ class HugeCollator:
             if self.model_architecture == "qwenoft"
             else texts
         )
-        if actions.shape[-1] != ACTION_DIM:
-            raise ValueError(f"action dim {actions.shape[-1]} != {ACTION_DIM}")
+        expected_shapes = {
+            "actions": (len(items), self.action_horizon, ACTION_DIM),
+            "sonic_mask": (len(items), self.action_horizon, ACTION_DIM),
+            "state": (len(items), PROPRIO_DIM),
+            "state_mask": (len(items), 1),
+        }
+        for name, tensor in (("actions", actions), ("sonic_mask", sonic_mask), ("state", state), ("state_mask", state_mask)):
+            if tuple(tensor.shape) != expected_shapes[name]:
+                raise ValueError(f"{name} shape {tuple(tensor.shape)} != {expected_shapes[name]}")
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"{name} contains non-finite values")
+        if ((sonic_mask < 0) | (sonic_mask > 1)).any():
+            raise ValueError("sonic_mask values must be in [0, 1]")
         if self.processor is None:
             raise ValueError("Huge training requires use_qwen_processor=True")
         messages = [
