@@ -1,8 +1,8 @@
 """Compare sim-replayed pseudo proprio against real-robot ground truth for the
 SAME episode (see the validation plan in resource/info/ego_cola_pseudo_proprio_handoff.md
 session notes): real/cola_merged_cleaned_0530 episodes have both a real
-sonic_tokens/*.npy (fed back through the sim replay pipeline via
-prepare_real_validation_tokens.py + run_episode_pipeline.py) and a real
+sonic_tokens/*.npy (fed back through scripts/preprocess/calc_proprio/run.py)
+and a real
 g1_proprio/*.npy ground truth, so this is a direct numeric check instead of
 the self-check-only validation available for ego/cola.
 
@@ -14,8 +14,8 @@ offset) looks like instead: a non-zero best-lag, or a dimension that stays
 strongly anti-correlated/offset from the start.
 
 Hand dims (29:31) are excluded from the "signal" verdict: both sides derive
-hand state from the same recorded hand_binary action field (see
-export_pseudo_proprio.py's correct_hand_state_from_action), so a match there
+hand state from the same recorded hand_binary action field (reported as
+`action_proxy` by calc_proprio), so a match there
 mostly confirms data plumbing, not sim replay accuracy.
 """
 

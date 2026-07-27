@@ -288,12 +288,6 @@ def resolve_checkpoint_contract(
         raise CheckpointValidationError(f"checkpoint allowed root is not a directory: {root}")
     if not checkpoint.is_dir() or not _is_relative_to(checkpoint, root):
         raise CheckpointValidationError(f"checkpoint must resolve inside {root}: {checkpoint}")
-    relative = checkpoint.relative_to(root)
-    if not relative.parts or relative.parts[0] != checkpoint_task:
-        actual = relative.parts[0] if relative.parts else ""
-        raise CheckpointValidationError(
-            f"checkpoint task component {actual!r} does not match {checkpoint_task!r}"
-        )
     match = _STEP_RE.fullmatch(checkpoint.name)
     if match is None:
         raise CheckpointValidationError(f"checkpoint basename must be step_<N>: {checkpoint.name}")

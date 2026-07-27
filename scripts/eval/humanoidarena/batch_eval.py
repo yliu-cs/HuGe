@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serial HumanoidArena evaluation over checkpoint directories owned by Huge."""
+"""Serial HumanoidArena evaluation over user-selected checkpoint directories."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Sequence
 
 from shard_checkpoints import (
+    REQUIRED_CHECKPOINT_FILES,
     _canonical_sha256,
     _json_object,
     _sha256_file,
@@ -41,12 +42,6 @@ TASKS = (
 )
 EVAL_TASKS = TASKS[1:]
 INTERRUPTED_EXIT_CODES = {130, 143, -signal.SIGINT, -signal.SIGTERM}
-ALLOWED_TRAINING_ROOT_NAMES = (
-    "full_all_stage",
-    "stage3_humanoidarena_full_optimized",
-    "stage3_humanoidarena",
-    "archive",
-)
 
 
 class BatchConfigError(RuntimeError):
@@ -77,13 +72,11 @@ def _relative_to(path: Path, root: Path, *, label: str) -> Path:
         raise BatchConfigError(f"{label} escapes allowed root {root}: {path}") from exc
 
 
-def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarget]:
+def discover_checkpoints(root: Path) -> list[CheckpointTarget]:
     """Find step directories at or below root and order parent paths then numeric steps."""
-    allowed = allowed_root.expanduser().resolve()
     candidate_root = root.expanduser().resolve()
     if not candidate_root.is_dir():
         raise BatchConfigError(f"checkpoint batch root is not a directory: {candidate_root}")
-    _relative_to(candidate_root, allowed, label="checkpoint batch root")
 
     targets: list[CheckpointTarget] = []
     resolved_paths: set[Path] = set()
@@ -104,17 +97,17 @@ def discover_checkpoints(root: Path, allowed_root: Path) -> list[CheckpointTarge
         if not stat.S_ISDIR(info.st_mode):
             continue
         _relative_to(resolved, candidate_root, label="checkpoint")
-        allowed_relative = _relative_to(resolved, allowed, label="checkpoint")
-        if len(allowed_relative.parts) < 6 or allowed_relative.parts[-3] != "stage3":
-            continue
-        publication_files = (resolved / "manifest.json", resolved / "_SUCCESS")
+        checkpoint_files = tuple(
+            resolved / name
+            for name in (*REQUIRED_CHECKPOINT_FILES, "manifest.json", "_SUCCESS")
+        )
         try:
-            publication_stats = tuple(path.lstat() for path in publication_files)
+            checkpoint_stats = tuple(path.lstat() for path in checkpoint_files)
         except FileNotFoundError:
             continue
-        if any(not stat.S_ISREG(item.st_mode) for item in publication_stats):
+        if any(not stat.S_ISREG(item.st_mode) for item in checkpoint_stats):
             raise BatchConfigError(
-                f"checkpoint publication metadata must be real files: {resolved}"
+                f"checkpoint files must be real files: {resolved}"
             )
         if resolved in resolved_paths:
             raise BatchConfigError(f"multiple checkpoint paths resolve to the same directory: {resolved}")
@@ -137,13 +130,14 @@ def completed_tasks(
     target: CheckpointTarget,
     tasks: Sequence[str],
     repo_root: Path,
-    allowed_root: Path,
     eval_root: Path,
     execution_horizon: int,
 ) -> set[str]:
     """Return tasks with a valid success publication for this exact checkpoint."""
-    checkpoint_relative = target.path.relative_to(repo_root).as_posix()
-    checkpoint_task = target.path.parents[4].name
+    try:
+        checkpoint_relative = target.path.relative_to(repo_root).as_posix()
+    except ValueError:
+        checkpoint_relative = str(target.path)
     try:
         manifest_sha256 = _sha256_file(target.path / "manifest.json")
         marker_sha256 = _sha256_file(target.path / "_SUCCESS")
@@ -152,9 +146,9 @@ def completed_tasks(
 
     completed: set[str] = set()
     for task in tasks:
-        checkpoint_eval_root = eval_root / task / f"{checkpoint_task}-{target.path.name}"
+        task_root = eval_root / task
         try:
-            contract_dirs = tuple(checkpoint_eval_root.iterdir())
+            contract_dirs = tuple(task_root.glob(f"*-{target.path.name}/*"))
         except OSError:
             continue
         for contract_dir in contract_dirs:
@@ -486,24 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw_root = Path(args.checkpoint_root).expanduser()
     checkpoint_root = (repo_root / raw_root).resolve() if not raw_root.is_absolute() else raw_root.resolve()
     try:
-        allowed_roots = tuple(
-            (repo_root / ".runs" / name).resolve()
-            for name in ALLOWED_TRAINING_ROOT_NAMES
-        )
-        allowed_root = next(
-            (
-                candidate
-                for candidate in allowed_roots
-                if checkpoint_root == candidate or candidate in checkpoint_root.parents
-            ),
-            None,
-        )
-        if allowed_root is None:
-            raise BatchConfigError(
-                "checkpoint batch root must be inside one allowed training root: "
-                + ", ".join(str(path) for path in allowed_roots)
-            )
-        targets = discover_checkpoints(checkpoint_root, allowed_root)
+        targets = discover_checkpoints(checkpoint_root)
         eval_root = _eval_root(repo_root)
         try:
             execution_horizon = int(os.environ.get("HUGE_EVAL_EXECUTION_HORIZON", "20"))
@@ -537,7 +514,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target=target,
                 tasks=requested_tasks,
                 repo_root=repo_root,
-                allowed_root=allowed_root,
                 eval_root=eval_root,
                 execution_horizon=execution_horizon,
             )

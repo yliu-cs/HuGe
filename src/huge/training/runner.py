@@ -121,7 +121,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         epochs=1,
         sample_stride=1,
         checkpointing_steps=0,
-        warmup_ratio=0.05,
+        warmup_ratio=0.02,
         max_text_tokens=48,
     ),
     # Final adaptation. Stop at 50k successful updates and publish only the
@@ -134,7 +134,7 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
         checkpointing_steps=0,
         max_steps=50_000,
         weight_decay=0.005,
-        warmup_ratio=0.1,
+        warmup_ratio=0.01,
         max_text_tokens=48,
     ),
 }

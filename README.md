@@ -172,6 +172,86 @@ the raw tree. Do not move or delete `HumanoidArena_raw` after preprocessing.
 An unchanged completed cache is reused after validation. Use `--rebuild` only
 when intentionally replacing an existing cache.
 
+## 🦿 SONIC token replay to pseudo proprio
+
+`calc_proprio` is a file-level preprocessing tool. It does not load Dataset
+classes or infer a data source from directory names. Inputs must be `[T,64]` or
+`[T,66]` at 50 Hz; outputs are `[T,34] float32`.
+
+Single file:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/calc_proprio/run.py \
+  --token /path/to/token.npy \
+  --output /path/to/pseudo_proprio.npy
+```
+
+Recursive directory with mirrored output paths:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/calc_proprio/run.py \
+  --input-root /path/to/token-root \
+  --output-root /path/to/proprio-root \
+  --token-glob '**/*.npy' \
+  --resume
+```
+
+Live directory mode automatically starts one worker per visible GPU. It honors
+`CUDA_VISIBLE_DEVICES` order; `--workers N` limits the run to the first `N`
+visible devices and never starts multiple workers on one GPU. Worker `i` uses
+ZMQ ports `--zmq-port-base + 2*i` and `+ 2*i + 1`, plus DDS Domain
+`--dds-domain-base + i`. Override the bases when another process or node uses
+the defaults. GPUs and nodes sharing the same TensorRT model directory must use
+the same GPU model and compatible CUDA/TensorRT runtime.
+
+Capture, alignment and export are connected in memory. Successful and failed
+default runs do not create `frames.pkl` or `aligned.npz`; add `--keep-work` only
+when those debugging snapshots and per-stage logs are needed. Normal outputs
+are the proprio `.npy`, its `.report.json`, and, for directory mode,
+`pseudo_proprio_manifest.json` plus the append-only
+`pseudo_proprio_results.jsonl`. Work files default to `.runs/calc_proprio/work`.
+
+For 66-D input, hand proprio uses the two action-hand dimensions and is marked
+`action_proxy`. For 64-D input, it keeps the simulated default hand state and
+reports `input_has_no_hand_action`; this does not reconstruct human hand motion.
+Warnings produce a `complete-with-warnings` batch and a zero exit code; failed
+or interrupted Jobs remain nonzero.
+
+Use `--validate-only` for a preflight that does not require a GPU,
+`--resume` to revalidate and skip complete outputs, `--fail-fast` to stop after
+the first failure, and optional `--stats PATH` for a distribution warning. A
+live run requires the WBC `.venv_sim`, a deploy binary with `--domain-id`
+support, SONIC encoder/decoder and planner assets, plus fully resolved G1 meshes
+and reference-motion Git LFS files.
+
+Stage 1 source examples, intended for four independent GPU nodes:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
+  --input-root resource/datasets/EgoDex/episodes \
+  --output-root resource/datasets/EgoDex-cache/g1_proprio \
+  --token-glob '**/token_state.npy' --resume
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
+  --input-root resource/datasets/egoverse-cache/sonic_tokens \
+  --output-root resource/datasets/egoverse-cache/g1_proprio \
+  --token-glob '*.npy' --resume
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
+  --input-root resource/datasets/behavior-1k-2025-challenge-cache/sonic_tokens \
+  --output-root resource/datasets/behavior-1k-2025-challenge-cache/g1_proprio \
+  --token-glob '*.npy' --resume
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
+  --input-root resource/datasets/xperience-10m-cache/sonic_tokens \
+  --output-root resource/datasets/xperience-10m-cache/g1_proprio \
+  --token-glob '*.npy' --resume
+```
+
+Publishing these arrays into a Stage 1 Dataset remains a separate task.
+
 ## 🏋️ Training
 
 Training must use the launcher:

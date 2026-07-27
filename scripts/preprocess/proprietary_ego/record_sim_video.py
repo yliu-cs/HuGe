@@ -1,10 +1,11 @@
-"""Subscribe to a headless sim's ZMQ image-publish stream (see
-launch_headless_sim.py --enable-image-publish) and dump frames to an mp4.
+"""Subscribe to calc_proprio's headless sim ZMQ image stream (see
+../calc_proprio/launch_headless_sim.py --enable-image-publish) and dump frames
+to an mp4.
 
 Wire format matches GR00T-WholeBodyControl/gear_sonic/utils/mujoco_sim/sensor_server.py's
 SensorServer/ImageMessageSchema (PUB, msgpack, base64-JPEG per camera key) --
 reimplemented here (not imported) to keep this Huge-side script off the
-GR00T-WholeBodyControl Python path, matching align_sim_replay.py's precedent.
+GR00T-WholeBodyControl Python path.
 """
 
 from __future__ import annotations

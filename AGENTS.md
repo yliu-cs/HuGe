@@ -254,6 +254,22 @@ PYTHONPATH=src .venv/bin/python \
   scripts/preprocess/proprietary/calc_sonic_tokens_from_humanoid_arena.py
 ```
 
+Generic SONIC token replay to 34-D pseudo proprio:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/calc_proprio/run.py \
+  --token /path/to/token.npy \
+  --output /path/to/pseudo_proprio.npy
+```
+
+The entry point accepts file paths or `--input-root/--output-root` with a
+generic glob; it must not import Dataset classes or infer a data source from
+directory names. Inputs are `[T,64]` or `[T,66]`. A live run starts MuJoCo and
+WBC subprocesses, so use `--validate-only` for a side-effect-light preflight
+and start full replay only when explicitly requested. Live replay also requires
+resolved WBC G1 mesh and reference-motion Git LFS files plus the SONIC planner.
+
 The download script has side effects: running it without arguments starts a
 detached tmux download, and its hidden worker performs network downloads. Use
 `--help` for safe inspection; start it only when the user requests a download.

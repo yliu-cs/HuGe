@@ -356,9 +356,9 @@ class Behavior1KDataset(Stage1CacheDataset):
     def __init__(self, cache_root: str | Path, **kwargs: Any) -> None:
         super().__init__(cache_root, dataset_id="behavior1k", **kwargs)
 
-    def _load_image(self, segment: Stage1Segment, frame_idx: int) -> Image.Image:
+    def _video_path(self, segment: Stage1Segment) -> Path:
         source = Path(segment.source)
-        video = (
+        return (
             self.data_root
             / "v1"
             / "videos"
@@ -366,8 +366,27 @@ class Behavior1KDataset(Stage1CacheDataset):
             / "observation.images.rgb.head"
             / f"{source.stem}.mp4"
         )
+
+    def _read_segments(self, language_map: dict[str, str]) -> list[Stage1Segment]:
+        segments = super()._read_segments(language_map)
+        available = [segment for segment in segments if self._video_path(segment).is_file()]
+        missing = [segment for segment in segments if not self._video_path(segment).is_file()]
+        self._missing_video_episode_count = len({segment.source_episode for segment in missing})
+        self._missing_video_segment_count = len(missing)
+        self._missing_video_token_rows = sum(segment.length for segment in missing)
+        return available
+
+    def selection_summary(self) -> dict[str, Any]:
+        return {
+            **super().selection_summary(),
+            "missing_video_episode_count": self._missing_video_episode_count,
+            "missing_video_segment_count": self._missing_video_segment_count,
+            "missing_video_token_rows": self._missing_video_token_rows,
+        }
+
+    def _load_image(self, segment: Stage1Segment, frame_idx: int) -> Image.Image:
         return decode_video_frame(
-            video,
+            self._video_path(segment),
             segment.source_start_frame + frame_idx,
             missing_ok=False,
         )

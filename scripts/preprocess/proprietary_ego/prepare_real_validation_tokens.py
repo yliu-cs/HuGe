@@ -1,9 +1,6 @@
-"""One-off adapter: mirror a real-robot episode's 66d sonic token into the
-ego/cola on-disk layout (`<cola_root>/<episode_num>/*_latent_tokens_64d.npy`
-and `_66d.npy`) so the existing `run_episode_pipeline.py`/`export_pseudo_proprio.py`
-can be reused unmodified to sim-replay real-robot tokens for validation against
-their own ground-truth g1_proprio (see resource/info/ego_cola_pseudo_proprio_handoff.md
-and the validation plan in this session).
+"""Legacy validation adapter that splits a real-robot 66d SONIC token into
+paired 64d/66d files. The generic calc_proprio runner accepts the original 66d
+file directly; this adapter is retained only for historical comparison layouts.
 
 Real dataset's sonic_tokens/episode_NNNNNN.npy is already [T,66]
 (motion_token[:64] + hand_binary[64:66]); the 64d file is just a slice, not a

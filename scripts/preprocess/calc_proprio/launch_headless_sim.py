@@ -1,13 +1,12 @@
-"""Launch a headless MuJoCo G1 sim that a WBC deploy binary drives via cyclonedds
-(loopback), for cola token replay validation. Elastic band is disabled at
-runtime -- do NOT set ENABLE_ELASTIC_BAND: False in
+"""Launch the headless MuJoCo G1 sim used for SONIC token replay.
+
+The WBC deploy binary drives the sim over loopback CycloneDDS. Elastic band is
+disabled at runtime -- do not set ENABLE_ELASTIC_BAND: False in
 wbc_configs/g1_29dof_sonic_model12.yaml, since base_sim.py's else branch never
 initializes self.elastic_band, which raises AttributeError in sim_step().
 
 Must run from inside GR00T-WholeBodyControl/ with .venv_sim/bin/python (this
-script never edits any file under GR00T-WholeBodyControl/). See
-resource/info/ego_cola_full_stack_verification_and_headless_render.md for the
-full pipeline this is one stage of.
+script never edits files there).
 
 By default publishes no images -- only drives the g1_debug state stream
 consumed by align_sim_replay.py. Pass --enable-image-publish to also render
@@ -33,7 +32,10 @@ def main() -> None:
         help="offscreen EGL render + ZMQ PUB images (needs MUJOCO_GL=egl); off by default",
     )
     parser.add_argument("--camera-port", type=int, default=5555)
+    parser.add_argument("--domain-id", type=int, default=0)
     args = parser.parse_args()
+    if not 0 <= args.domain_id <= 232:
+        parser.error("--domain-id must be between 0 and 232")
 
     from gear_sonic.utils.mujoco_sim.base_sim import BaseSimulator
     from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
@@ -47,6 +49,12 @@ def main() -> None:
 
     wbc_config = config.load_wbc_yaml()
     wbc_config["ENV_NAME"] = config.env_name
+    wbc_config["DOMAIN_ID"] = args.domain_id
+    print(
+        f"headless sim DDS domain={args.domain_id} "
+        f"interface={wbc_config.get('INTERFACE', '<default>')}",
+        flush=True,
+    )
 
     init_channel(config=wbc_config)
 

@@ -1,8 +1,7 @@
-"""Replay a 64d latent-token .npy through the same sim + WBC deploy stack as
-run_episode_pipeline.py, but capture an ego-view video instead of numeric
-g1_debug state -- for visually inspecting a motion, not for pseudo-proprio
-export. Never touches any file under GR00T-WholeBodyControl/ (see handoff doc
-section 0); sim-side steps use .venv_sim/bin/python, never bare python3.
+"""Replay a 64d latent-token .npy through the calc_proprio sim + WBC stack,
+but capture an ego-view video instead of numeric g1_debug state. This is for
+visual inspection, not pseudo-proprio export. Sim-side steps use
+.venv_sim/bin/python, never bare python3.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 GR00T_DIR = REPO_ROOT / "GR00T-WholeBodyControl"
 VENV_SIM_PYTHON = GR00T_DIR / ".venv_sim" / "bin" / "python"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
-LAUNCH_SIM_SCRIPT = REPO_ROOT / "scripts" / "preprocess" / "proprietary_ego" / "launch_headless_sim.py"
+LAUNCH_SIM_SCRIPT = REPO_ROOT / "scripts" / "preprocess" / "calc_proprio" / "launch_headless_sim.py"
 RECORD_SCRIPT = REPO_ROOT / "scripts" / "preprocess" / "proprietary_ego" / "record_sim_video.py"
 DEPLOY_BINARY = GR00T_DIR / "gear_sonic_deploy" / "target" / "release" / "g1_deploy_onnx_ref"
 PLAYER_SCRIPT = "gear_sonic/scripts/sonic_encoder_input_player.py"

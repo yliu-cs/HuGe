@@ -86,12 +86,6 @@ CHECKPOINT_MANIFEST_VERSION = 1
 PORTABLE_CHECKPOINT_KIND = "huge_portable_model"
 EPISODE_SEED_FORMULA = "sha256(task_name|group_seed|repeat_idx)_positive_int32"
 MODEL_NOISE_SEED_ALGORITHM = "huge_ha_model_noise_v1"
-ALLOWED_TRAINING_ROOT_NAMES = (
-    "full_all_stage",
-    "stage3_humanoidarena_full_optimized",
-    "stage3_humanoidarena",
-    "archive",
-)
 UPSTREAM_SIM_SHA256 = "2c39e4eaa9024bc19020903c5cb58249f8a9a1c5048cbf29873b50db2b7047ea"
 SONIC_ENCODER_SHA256 = "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
 SONIC_DECODER_SHA256 = "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
@@ -793,83 +787,15 @@ def parse_gpu_selection(visible_count: int, count_raw: str, ids_raw: str) -> lis
     return list(range(visible_count))
 
 
-def _allowed_checkpoint_root(
-    repo: Path,
-    checkpoint: Path,
-    checkpoint_task: str,
-) -> Path:
-    checkpoint = checkpoint.expanduser().resolve()
-    matched_base: Path | None = None
-    relative: Path | None = None
-    for name in ALLOWED_TRAINING_ROOT_NAMES:
-        base = (repo / ".runs" / name).resolve()
-        if _is_relative_to(checkpoint, base):
-            candidate_relative = checkpoint.relative_to(base)
-            if name == "archive" and len(candidate_relative.parts) >= 6:
-                base = checkpoint.parents[5]
-                candidate_relative = checkpoint.relative_to(base)
-            matched_base = base
-            relative = candidate_relative
-            break
-    if matched_base is None or relative is None:
-        allowed = ", ".join(
-            str((repo / ".runs" / name).resolve())
-            for name in ALLOWED_TRAINING_ROOT_NAMES
-        )
-        raise ConfigError(
-            f"checkpoint must resolve inside an allowed training root "
-            f"({allowed}): {checkpoint}"
-        )
-
-    architectures = {"qwenpi_v3", "qwengr00t", "qwenoft"}
-    tuning_modes = {"full", "lora", "frozen_vlm"}
-    if (
-        not _SAFE_COMPONENT_RE.fullmatch(checkpoint_task)
-        or checkpoint_task in {".", ".."}
-        or len(relative.parts) != 6
-        or relative.parts[0] not in {checkpoint_task, "all"}
-        or relative.parts[1] not in architectures
-        or relative.parts[2] not in tuning_modes
-        or relative.parts[3] != "stage3"
-        or not _SAFE_COMPONENT_RE.fullmatch(relative.parts[4])
-        or relative.parts[4] in {".", "..", "_resume_states"}
-        or re.fullmatch(r"step_[0-9]+", relative.parts[5]) is None
-    ):
-        raise ConfigError(
-            "checkpoint must have the exact "
-            "<task>/<architecture>/<tuning_mode>/stage3/<run_id>/step_N "
-            f"shape for task {checkpoint_task} or all: {checkpoint}"
-        )
-    cursor = matched_base
-    for component in relative.parts[:-1]:
-        cursor = cursor / component
-        try:
-            info = cursor.lstat()
-        except OSError as exc:
-            raise ConfigError(
-                f"checkpoint run path is unavailable: {cursor}: {exc}"
-            ) from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ConfigError(
-                f"checkpoint run path must contain only real directories: "
-                f"{cursor}"
-            )
-    return matched_base
-
-
 def validate_checkpoint(checkpoint: str | Path, repo_root: str | Path, task: TaskSpec) -> CheckpointContract:
     repo = Path(repo_root).resolve()
     raw = Path(checkpoint).expanduser()
     candidate = (repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
-    allowed_root = _allowed_checkpoint_root(
-        repo, candidate, task.checkpoint_task
-    )
-    checkpoint_task = candidate.relative_to(allowed_root).parts[0]
     try:
         return resolve_checkpoint_contract(
             candidate,
-            allowed_root=allowed_root,
-            checkpoint_task=checkpoint_task,
+            allowed_root=candidate,
+            checkpoint_task=task.checkpoint_task,
             repo_root=repo,
         )
     except CheckpointValidationError as exc:
@@ -1019,14 +945,14 @@ def _directory_inventory(path: Path) -> dict[str, str]:
 def _portable_checkpoint_publication(
     checkpoint: Path,
     *,
-    required: bool,
-) -> dict[str, Any] | None:
+    model_architecture: str,
+    tuning_mode: str,
+    run_id: str,
+) -> dict[str, Any]:
     """Validate and bind the complete portable publication manifest."""
     root = checkpoint.resolve()
     manifest_path = checkpoint / "manifest.json"
     marker_path = checkpoint / "_SUCCESS"
-    if not manifest_path.exists() and not marker_path.exists() and not required:
-        return None
     for path, label in (
         (manifest_path, "portable checkpoint manifest"),
         (marker_path, "portable checkpoint success marker"),
@@ -1056,13 +982,12 @@ def _portable_checkpoint_publication(
         publication_metadata if isinstance(publication_metadata, dict) else manifest
     )
     step_match = re.fullmatch(r"step_([0-9]+)", checkpoint.name)
-    if required and (
+    if (
         step_match is None
         or publication_identity.get("global_step") != int(step_match.group(1))
-        or publication_identity.get("model_architecture")
-        != checkpoint.parents[3].name
-        or publication_identity.get("tuning_mode") != "full"
-        or publication_identity.get("run_id") != checkpoint.parent.name
+        or publication_identity.get("model_architecture") != model_architecture
+        or publication_identity.get("tuning_mode") != tuning_mode
+        or publication_identity.get("run_id") != run_id
     ):
         raise ConfigError(
             f"portable checkpoint manifest identity mismatch: {checkpoint}"
@@ -1191,13 +1116,11 @@ def build_source_inventory(
     _verify_hash(upstream_encoder, SONIC_ENCODER_SHA256, label="HumanoidArena SONIC encoder")
     _verify_hash(upstream_decoder, SONIC_DECODER_SHA256, label="HumanoidArena SONIC decoder")
     qwen_inventory = _directory_inventory(checkpoint.base_vlm_path)
-    publication_required = any(
-        _is_relative_to(checkpoint.checkpoint_dir, (repo / ".runs" / name).resolve())
-        for name in ("full_all_stage", "stage3_humanoidarena_full_optimized", "archive")
-    )
     checkpoint_publication = _portable_checkpoint_publication(
         checkpoint.checkpoint_dir,
-        required=publication_required,
+        model_architecture=str(checkpoint.config.get("model_architecture", "")),
+        tuning_mode=str(checkpoint.metadata.get("tuning_mode", "")),
+        run_id=str(checkpoint.metadata.get("run_id", "")),
     )
     payload = {
         "upstream_compatibility": upstream,
@@ -1294,10 +1217,18 @@ def build_static_plan(
         "schema_version": STATIC_PLAN_SCHEMA_VERSION,
         "task": asdict(task),
         "checkpoint": {
-            "relative_path": checkpoint.checkpoint_dir.relative_to(repo).as_posix(),
+            "relative_path": (
+                checkpoint.checkpoint_dir.relative_to(repo).as_posix()
+                if _is_relative_to(checkpoint.checkpoint_dir, repo)
+                else str(checkpoint.checkpoint_dir)
+            ),
             "step": checkpoint.step, "checkpoint_task": checkpoint.checkpoint_task,
             "checkpoint_sha256": checkpoint.checkpoint_sha256, "files": dict(checkpoint.file_sha256),
-            "qwen_path": str(checkpoint.base_vlm_path.relative_to(repo)),
+            "qwen_path": (
+                checkpoint.base_vlm_path.relative_to(repo).as_posix()
+                if _is_relative_to(checkpoint.base_vlm_path, repo)
+                else str(checkpoint.base_vlm_path)
+            ),
             "model_architecture": str(
                 checkpoint.config.get("model_architecture", "qwenpi_v3")
                 or "qwenpi_v3"
@@ -3441,13 +3372,7 @@ def _server_command(
     return [
         str(args.repo / ".venv/bin/python"), "-m", "huge.inference.humanoidarena_http_server",
         "--repo-root", str(args.repo), "--checkpoint", str(checkpoint.checkpoint_dir),
-        "--allowed-checkpoint-root", str(
-            _allowed_checkpoint_root(
-                args.repo,
-                checkpoint.checkpoint_dir,
-                checkpoint.checkpoint_task,
-            )
-        ),
+        "--allowed-checkpoint-root", str(checkpoint.checkpoint_dir),
         "--checkpoint-task", checkpoint.checkpoint_task, "--task", task.cli_task,
         "--isaac-task", task.isaac_task, "--instruction", task.instruction,
         "--host", "127.0.0.1", "--port", str(port), "--expected-cuda-uuid", binding.gpu.cuda_uuid,
