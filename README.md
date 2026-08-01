@@ -215,13 +215,30 @@ Live planner mode remains in planner control, uses local SONIC encoder mode 1,
 and exports the 66-D action and 34-D proprio from the same contiguous
 `g1_debug` ticks. It rejects missing/duplicate ticks and does not edge-fill.
 
-Live directory mode automatically starts one worker per visible GPU. It honors
-`CUDA_VISIBLE_DEVICES` order; `--workers N` limits the run to the first `N`
-visible devices and never starts multiple workers on one GPU. Worker `i` uses
-ZMQ ports `--zmq-port-base + 2*i` and `+ 2*i + 1`, plus DDS Domain
-`--dds-domain-base + i`. Override the bases when another process or node uses
-the defaults. GPUs and nodes sharing the same TensorRT model directory must use
-the same GPU model and compatible CUDA/TensorRT runtime.
+Live directory mode defaults to ten workers per visible GPU. It honors
+`CUDA_VISIBLE_DEVICES` order; `--workers N` selects an explicit total and
+`--workers-per-gpu N` selects a fixed per-GPU multiplier. Workers are assigned
+round-robin, so worker `i` uses GPU `i % G`, replica `i // G`, ZMQ ports
+`--zmq-port-base + 2*i` and `+ 2*i + 1`, and DDS Domain
+`--dds-domain-base + i`. Override the bases when another process uses the
+defaults.
+
+The default of ten was selected by a 19-episode retargeted EgoVerse pilot on a
+single RTX 4090. Including one same-configuration `--resume` pass, it completed
+all 19 episodes in 280.330 seconds versus 1282.286 seconds for one worker, a
+4.57x throughput increase. The first pass completed 16/19; all three strict
+alignment failures recovered on resume. wpg11 had statistically equivalent
+total time, while wpg12 and wpg13 sharply reduced first-pass success to 11/19
+and 10/19, so wpg10 is the selected stability/throughput tradeoff. Use
+`--workers-per-gpu 1` for a conservative node or pass another explicit value
+after a target-node pilot.
+BEHAVIOR planner replay remains at one worker per GPU until its separate
+real-time pilot passes. GrabGPU must not run during a throughput pilot. The
+measured replay utilization remained below the cluster keepalive threshold, so
+production jobs still need the external keepalive policy unless the target
+node pilot proves otherwise; account for its memory load separately. GPUs and
+nodes sharing the same TensorRT model directory must use the same GPU model
+and compatible CUDA/TensorRT runtime.
 
 Capture, alignment and export are connected in memory. Successful and failed
 default runs do not create `frames.pkl` or `aligned.npz`; add `--keep-work` only
@@ -285,7 +302,9 @@ PYTHONPATH=src .venv/bin/python \
 
 Pilot mode uses representative locomotion/trunk episodes and publishes to a
 unique `/tmp` cache unless `--cache-root` is explicit. Full mode scans every
-controller config, uses one worker per visible GPU, and atomically publishes:
+controller config, defaults to one worker per visible GPU, accepts the same
+mutually exclusive `--workers`/`--workers-per-gpu` controls, and atomically
+publishes:
 
 ```text
 resource/datasets/behavior-1k-2025-challenge-planner-cache/

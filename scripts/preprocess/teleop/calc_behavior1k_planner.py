@@ -40,6 +40,7 @@ from huge.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSIO
 DATA_ROOT = Path("resource/datasets/behavior-1k-2025-challenge")
 CACHE_ROOT = Path("resource/datasets/behavior-1k-2025-challenge-planner-cache")
 WORK_ROOT = Path(".runs/calc_proprio/behavior1k-planner")
+DEFAULT_WORKERS_PER_GPU = 1
 SOURCE_HZ = 30.0
 CONTROL_HZ = 50.0
 SPEED_MULTIPLIER = CONTROL_HZ / SOURCE_HZ
@@ -660,6 +661,7 @@ def _run_live(
     replay.validate_runtime_assets()
     devices, gpu_source = replay.discover_visible_gpus()
     specs = replay.build_worker_specs(devices, args, len(jobs))
+    print(json.dumps({"worker_plan": replay.worker_summary(specs)}, indent=2), flush=True)
     args.work_root = (args.work_root / mapping_hash[:12]).resolve()
     staging = cache_root.with_name(f".{cache_root.name}.staging")
     started = time.monotonic()
@@ -809,6 +811,7 @@ def _run_live(
             "runtime_asset_set_sha256": asset_hash,
             "gpu_discovery_source": gpu_source,
             "workers": replay.worker_inventory(specs),
+            "worker_summary": replay.worker_summary(specs),
             "elapsed_seconds": time.monotonic() - started,
             "counts": {
                 "eligible_episodes": len(preflight.episodes),
@@ -864,7 +867,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-source-frames", type=int, default=20)
     parser.add_argument("--max-timestamp-gap-factor", type=float, default=2.0)
     parser.add_argument("--confirm-source-schema", action="store_true")
-    parser.add_argument("--workers", type=int, help="default: one worker per visible GPU")
+    worker_group = parser.add_mutually_exclusive_group()
+    worker_group.add_argument("--workers", type=int, help="explicit total worker count")
+    worker_group.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=DEFAULT_WORKERS_PER_GPU,
+        help=f"workers per visible GPU (default: {DEFAULT_WORKERS_PER_GPU})",
+    )
     parser.add_argument("--work-root", type=Path, default=WORK_ROOT)
     parser.add_argument("--zmq-port-base", type=int, default=replay.DEFAULT_ZMQ_PORT_BASE)
     parser.add_argument("--dds-domain-base", type=int, default=0)
@@ -917,6 +927,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-timestamp-gap-factor must exceed 1")
     if args.workers is not None and args.workers <= 0:
         raise ValueError("--workers must be positive")
+    if args.workers_per_gpu <= 0:
+        raise ValueError("--workers-per-gpu must be positive")
     if not 1 <= args.zmq_port_base <= 65534:
         raise ValueError("--zmq-port-base must be in [1,65534]")
     if not 0 <= args.dds_domain_base <= replay.MAX_DDS_DOMAIN:
@@ -976,8 +988,54 @@ def _self_check() -> None:
     )
     assert aligned["token_state"].shape == (rows, 64)
     assert alignment["selected_frames"] == rows
+    original_port_free = replay.port_free
+    replay.port_free = lambda _port: True
+    try:
+        worker_args = argparse.Namespace(
+            workers=None,
+            workers_per_gpu=3,
+            zmq_port_base=6000,
+            dds_domain_base=20,
+        )
+        specs = replay.build_worker_specs(["GPU-a", "GPU-b"], worker_args, 5)
+        assert [spec.gpu_selector for spec in specs] == [
+            "GPU-a", "GPU-b", "GPU-a", "GPU-b", "GPU-a"
+        ]
+        assert [spec.gpu_replica for spec in specs] == [0, 0, 1, 1, 2]
+        assert len({spec.dds_domain for spec in specs}) == 5
+        assert len({spec.input_port for spec in specs}) == 5
+        assert len({spec.output_port for spec in specs}) == 5
+        worker_args.workers_per_gpu = None
+        specs = replay.build_worker_specs(["GPU-a", "GPU-b"], worker_args, 25)
+        assert len(specs) == 2 * replay.DEFAULT_WORKERS_PER_GPU
+        worker_args.workers_per_gpu = DEFAULT_WORKERS_PER_GPU
+        specs = replay.build_worker_specs(["GPU-a", "GPU-b"], worker_args, 10)
+        assert len(specs) == 2 * DEFAULT_WORKERS_PER_GPU
+        worker_args.workers = 3
+        specs = replay.build_worker_specs(["GPU-a", "GPU-b"], worker_args, 10)
+        assert len(specs) == 3
+        assert specs[-1].gpu_selector == "GPU-a"
+        assert specs[-1].gpu_replica == 1
+        worker_args.workers = 2
+        assert len(replay.build_worker_specs(["GPU-a"], worker_args, 1)) == 1
+        worker_args.zmq_port_base = 65535
+        try:
+            replay.build_worker_specs(["GPU-a"], worker_args, 1)
+            raise AssertionError("expected ZMQ port overflow")
+        except ValueError as error:
+            assert "ZMQ ports exceed" in str(error)
+        worker_args.zmq_port_base = 6000
+        worker_args.dds_domain_base = replay.MAX_DDS_DOMAIN
+        try:
+            replay.build_worker_specs(["GPU-a"], worker_args, 2)
+            raise AssertionError("expected DDS domain overflow")
+        except ValueError as error:
+            assert "DDS domains exceed" in str(error)
+    finally:
+        replay.port_free = original_port_free
     print(
-        "self-check passed: filtering, planner trajectory contract, and strict paired alignment"
+        "self-check passed: filtering, planner trajectory contract, strict paired alignment, "
+        "and multi-worker allocation"
     )
 
 

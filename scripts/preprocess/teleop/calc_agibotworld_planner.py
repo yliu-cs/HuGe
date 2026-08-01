@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Build AgiBotWorld gripper SONIC planner trajectory pilots.
+"""Build AgiBotWorld gripper SONIC planner trajectories and paired tokens.
 
 The default mode is read-only preflight. ``--pilot`` writes only dataset-neutral
-PlannerTrajectory ``.npz`` files and validation reports. It does not start the
-live SONIC planner replay and therefore does not require a GPU.
+PlannerTrajectory ``.npz`` files and validation reports. ``--publish-full`` runs
+the live SONIC planner replay and writes Behavior-cache-style 66-D action tokens,
+34-D pseudo proprio, and an optional LeRobot v2.1 symlink view.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import math
 import os
+import queue
 import signal
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -34,10 +40,13 @@ for path in (str(SRC_DIR), str(CALC_PROPRIO_DIR)):
 
 import calc_sonic_tokens as teleop
 import run as replay
+from huge.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSION
 
 
 DATA_ROOT = Path("resource/datasets/agibotworld-beta-rlds")
 CACHE_ROOT = Path("resource/datasets/agibotworld-beta-rlds-planner-trajectory-cache")
+TOKEN_CACHE_ROOT = Path("resource/datasets/agibotworld-beta-rlds-planner-cache")
+WORK_ROOT = Path(".runs/calc_proprio/agibotworld-planner")
 SOURCE_HZ = teleop.SOURCE_HZ
 CONTROL_HZ = 50.0
 DEFAULT_SOURCE_MINIMUM_WAIST_LIFT = 0.02
@@ -126,6 +135,164 @@ def _read_agibot_arrays(data_root: Path, episode: teleop.Episode) -> dict[str, A
         return teleop._decode_agibot_record(builder, record, tfds)
     raise IndexError(f"record {record_index} is absent from {shard}")
 
+
+
+
+def _preflight_agibot_sharded(
+    root: Path,
+    *,
+    max_episodes: int | None,
+    min_source_frames: int,
+    shard_count: int,
+    shard_index: int,
+) -> teleop.Preflight:
+    if shard_count == 1 and shard_index == 0:
+        return teleop._preflight_agibot(
+            root,
+            max_episodes=max_episodes,
+            min_source_frames=min_source_frames,
+        )
+    tf, tfds = teleop._import_tfds()
+    version_root = teleop._agibot_root(root)
+    if not version_root.is_dir():
+        raise FileNotFoundError(f"AgiBotWorld version root is missing: {version_root}")
+    builder = tfds.builder_from_directory(str(version_root))
+    all_shards = sorted(version_root.glob("*.tfrecord-*"))
+    if not all_shards:
+        raise FileNotFoundError(f"no AgiBotWorld TFRecord shards under {version_root}")
+    shards = [
+        shard
+        for absolute_index, shard in enumerate(all_shards)
+        if absolute_index % shard_count == shard_index
+    ]
+    if not shards:
+        raise ValueError(
+            f"AgiBot shard partition {shard_index}/{shard_count} selected no shards"
+        )
+    episodes: list[teleop.Episode] = []
+    exclusions: list[dict[str, str]] = []
+    scanned: list[Path] = [
+        version_root / "dataset_info.json",
+        version_root / "features.json",
+    ]
+    options = tf.data.Options()
+    options.threading.private_threadpool_size = 1
+    options.threading.max_intra_op_parallelism = 1
+    for selected_shard_index, shard in enumerate(shards):
+        absolute_shard_index = all_shards.index(shard)
+        scanned.append(shard)
+        records = tf.data.TFRecordDataset(
+            str(shard), num_parallel_reads=1
+        ).with_options(options)
+        for record_index, record in enumerate(records):
+            relative = f"{shard.name}#record={record_index}"
+            try:
+                arrays = teleop._decode_agibot_record(builder, record, tfds)
+                frames = len(arrays["end_position"])
+                if arrays["end_position"].shape != (frames, 2, 3):
+                    raise ValueError(
+                        f"unexpected end positions: {arrays['end_position'].shape}"
+                    )
+                if arrays["end_orientation"].shape != (frames, 2, 4):
+                    raise ValueError(
+                        f"unexpected end orientations: {arrays['end_orientation'].shape}"
+                    )
+                if arrays["gripper"].shape != (frames, 2):
+                    raise ValueError(f"unexpected gripper shape: {arrays['gripper'].shape}")
+                if np.any(arrays["is_dexhand"]):
+                    raise ValueError("dexhand episode is outside the gripper-only contract")
+                if not arrays["is_first"][0] or np.any(arrays["is_first"][1:]):
+                    raise ValueError("invalid RLDS is_first markers")
+                if not arrays["is_last"][-1] or np.any(arrays["is_last"][:-1]):
+                    raise ValueError("invalid RLDS is_last markers")
+                quaternion_norm = np.linalg.norm(arrays["end_orientation"], axis=-1)
+                valid = (
+                    np.isfinite(arrays["end_position"]).all(axis=(1, 2))
+                    & np.isfinite(arrays["end_orientation"]).all(axis=(1, 2))
+                    & np.isfinite(arrays["gripper"]).all(axis=1)
+                    & np.isfinite(arrays["head"]).all(axis=1)
+                    & np.isfinite(arrays["waist"]).all(axis=1)
+                    & (quaternion_norm > 1e-8).all(axis=1)
+                )
+                segments = teleop._segment_ranges(
+                    valid,
+                    None,
+                    min_source_frames=min_source_frames,
+                    max_gap_factor=2.0,
+                )
+                if not segments:
+                    raise ValueError("no valid continuous RLDS segment")
+                stats = {
+                    "record_index": record_index,
+                    "absolute_shard_index": absolute_shard_index,
+                    "shard_count": shard_count,
+                    "shard_index": shard_index,
+                    "episode_file_path": arrays["file_path"],
+                    "source_quaternion_order": "xyzw",
+                    "end_position_min": np.min(
+                        arrays["end_position"], axis=(0, 1)
+                    ).tolist(),
+                    "end_position_max": np.max(
+                        arrays["end_position"], axis=(0, 1)
+                    ).tolist(),
+                    "quaternion_norm_min": float(np.min(quaternion_norm)),
+                    "quaternion_norm_max": float(np.max(quaternion_norm)),
+                    "head_yaw_pitch_min": np.min(arrays["head"], axis=0).tolist(),
+                    "head_yaw_pitch_max": np.max(arrays["head"], axis=0).tolist(),
+                    "robot_position_min": np.min(
+                        arrays["robot_position"], axis=0
+                    ).tolist(),
+                    "robot_position_max": np.max(
+                        arrays["robot_position"], axis=0
+                    ).tolist(),
+                    "gripper_mm_min": np.min(arrays["gripper"], axis=0).tolist(),
+                    "gripper_mm_max": np.max(arrays["gripper"], axis=0).tolist(),
+                    "conversion_gate": (
+                        "head mount, flange-to-tracking-point offset, and gripper "
+                        "closed threshold require approved physical calibration"
+                    ),
+                }
+                episodes.append(
+                    teleop.Episode(
+                        dataset="agibotworld",
+                        source=shard,
+                        relative_source=relative,
+                        stable_base=(
+                            f"agibotworld__{teleop._safe_id(shard.name)}__"
+                            f"record{record_index:03d}"
+                        ),
+                        source_frames=frames,
+                        source_hz=SOURCE_HZ,
+                        main_task=str(arrays["language"] or arrays["task"]),
+                        segments=segments,
+                        valid_frames=sum(segment.end - segment.start for segment in segments),
+                        stats=stats,
+                    )
+                )
+            except (OSError, ValueError, KeyError, IndexError) as exc:
+                exclusions.append({"source": relative, "reason": str(exc)})
+            if max_episodes is not None and len(episodes) >= max_episodes:
+                break
+        if (selected_shard_index + 1) % 50 == 0:
+            print(
+                f"[agibot shard preflight] part={shard_index}/{shard_count} "
+                f"scanned_shards={selected_shard_index + 1}/{len(shards)} "
+                f"eligible={len(episodes)} excluded={len(exclusions)}",
+                flush=True,
+            )
+        if max_episodes is not None and len(episodes) >= max_episodes:
+            break
+    if not episodes:
+        raise ValueError(
+            f"preflight found no eligible AgiBotWorld gripper episodes in shard "
+            f"partition {shard_index}/{shard_count}"
+        )
+    return teleop.Preflight(
+        episodes=tuple(episodes),
+        exclusions=tuple(exclusions),
+        scanned_sources=tuple(scanned),
+        inventory_fingerprint=teleop._inventory_fingerprint(version_root, scanned),
+    )
 
 def _yaw_from_robot_orientation_xyzw(quaternions: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
     values = np.asarray(quaternions, dtype=np.float64)
@@ -617,6 +784,658 @@ def _row_and_report(
     return row, report
 
 
+def _live_schema(mapping: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "action": {
+            "shape": ["T", 66],
+            "dtype": "float32",
+            "motion_token_dimensions": [0, 64],
+            "left_hand_dimension": 64,
+            "right_hand_dimension": 65,
+            "closed_hand_value": 1,
+            "open_hand_value": 0,
+        },
+        "proprio": {
+            "shape": ["T", PROPRIO_DIM],
+            "dtype": "float32",
+            "layout": PROPRIO_LAYOUT_VERSION,
+        },
+        "planner_trajectory": {
+            "three_point_order": ["left_wrist", "right_wrist", "head"],
+            "quaternion_order": "wxyz",
+            "movement_frame": "mujoco_world",
+            "facing_frame": "mujoco_world",
+            "vr_target_frame": "planner_local",
+            "hand_convention": {"closed": 1, "open": 0},
+        },
+        "mapping": mapping,
+    }
+
+
+def _row_and_provenance(
+    job: AgibotJob,
+    trajectory: replay.PlannerTrajectory,
+    trajectory_check: dict[str, Any],
+    mapping_hash: str,
+    asset_hash: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    episode = job.episode
+    segment = job.segment
+    source_fingerprint = _source_fingerprint(episode.source, episode.relative_source)
+    episode_file_path = str(episode.stats.get("episode_file_path") or "")
+    shard_name, record_index = _parse_relative_source(episode.relative_source)
+    provenance = {
+        "source_path": episode.relative_source,
+        "source_fingerprint": source_fingerprint,
+        "source_episode_file_path": episode_file_path,
+        "source_start_frame": segment.start,
+        "source_end_frame_exclusive": segment.end,
+        "mapping_config_sha256": mapping_hash,
+        "runtime_asset_set_sha256": asset_hash,
+    }
+    row = {
+        "stable_id": job.stable_id,
+        "dataset": "agibotworld",
+        "source": episode.relative_source,
+        "source_episode": episode.stable_base,
+        "source_start_frame": segment.start,
+        "source_end_frame_exclusive": segment.end,
+        "source_frame_count": trajectory.rows,
+        "token_frame_count": trajectory.rows,
+        "proprio_frame_count": trajectory.rows,
+        "source_hz": episode.source_hz,
+        "control_hz": CONTROL_HZ,
+        "resampling": "none",
+        "frame_mapping": "one_source_frame_to_one_control_tick",
+        "duration_scale": SOURCE_HZ / CONTROL_HZ,
+        "main_task": episode.main_task,
+        "encoder_mode": "teleop_planner",
+        "lower_body_policy": "sonic_planner",
+        "calibration_method": "provisional_agibot_flange_relative_synth_head",
+        "calibration_start_frame": trajectory_check["pose"]["calibration_start_frame"],
+        "calibration_end_frame_exclusive": trajectory_check["pose"][
+            "calibration_end_frame_exclusive"
+        ],
+        "hand_state_method": "gripper_mm_threshold",
+        "left_closed_fraction": float(trajectory.hand_state[:, 0].mean()),
+        "right_closed_fraction": float(trajectory.hand_state[:, 1].mean()),
+        "trajectory_check": trajectory_check,
+        "source_path": episode.relative_source,
+        "source_tfrecord": shard_name,
+        "source_record_index": record_index,
+        "source_episode_file_path": episode_file_path,
+        "mapping_config_sha256": mapping_hash,
+        "runtime_asset_set_sha256": asset_hash,
+        "source_fingerprint": source_fingerprint,
+    }
+    return row, provenance
+
+
+def _write_stats(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    paths = [root / "g1_proprio" / f"{row['stable_id']}.npy" for row in rows]
+    total = sum(int(row["proprio_frame_count"]) for row in rows)
+    sample_limit = 1_000_000
+    stride = max(1, math.ceil(total / sample_limit))
+    minimum = np.full(PROPRIO_DIM, np.inf, dtype=np.float64)
+    maximum = np.full(PROPRIO_DIM, -np.inf, dtype=np.float64)
+    sums = np.zeros(PROPRIO_DIM, dtype=np.float64)
+    squares = np.zeros(PROPRIO_DIM, dtype=np.float64)
+    samples: list[np.ndarray] = []
+    seen = 0
+    for path in paths:
+        array = np.load(path, mmap_mode="r")
+        values = np.asarray(array, dtype=np.float64)
+        minimum = np.minimum(minimum, values.min(axis=0))
+        maximum = np.maximum(maximum, values.max(axis=0))
+        sums += values.sum(axis=0)
+        squares += np.square(values).sum(axis=0)
+        first = (-seen) % stride
+        samples.append(np.asarray(array[first::stride], dtype=np.float32))
+        seen += len(array)
+    sample = np.concatenate(samples, axis=0)
+    mean = sums / total
+    std = np.sqrt(np.maximum(0.0, squares / total - np.square(mean)))
+    q01, q99 = np.quantile(sample, (0.01, 0.99), axis=0)
+    grouped: dict[str, dict[str, list[float]]] = {}
+    for name, start, end in PROPRIO_LAYOUT:
+        grouped[name] = {
+            "min": minimum[start:end].tolist(),
+            "max": maximum[start:end].tolist(),
+            "mean": mean[start:end].tolist(),
+            "std": std[start:end].tolist(),
+            "q01": q01[start:end].tolist(),
+            "q99": q99[start:end].tolist(),
+        }
+    payload = {
+        "unitree_g1_sonic": {"state": grouped},
+        "_meta": {
+            "sources": {
+                "agibotworld_planner": {
+                    "n_episodes": len(paths),
+                    "n_frames": total,
+                }
+            },
+            "n_frames": total,
+            "layout": PROPRIO_LAYOUT_VERSION,
+            "g1_proprio_dim": PROPRIO_DIM,
+            "quantile_method": "deterministic_global_stride_sample",
+            "quantile_sample_rows": int(len(sample)),
+            "quantile_stride": stride,
+        },
+    }
+    replay.atomic_json(root / "meta/proprio_stats_sonic.json", payload)
+    return payload["_meta"]
+
+
+def _validate_live_cache(root: Path, rows: list[dict[str, Any]]) -> None:
+    parsed = [
+        json.loads(line)
+        for line in (root / "meta/episode_index.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line
+    ]
+    if parsed != rows:
+        raise ValueError("episode_index.jsonl failed round-trip validation")
+    for row in rows:
+        count = int(row["source_frame_count"])
+        token_path = root / "sonic_tokens" / f"{row['stable_id']}.npy"
+        proprio_path = root / "g1_proprio" / f"{row['stable_id']}.npy"
+        report_path = proprio_path.with_suffix(".report.json")
+        token = np.load(token_path, mmap_mode="r")
+        proprio = np.load(proprio_path, mmap_mode="r")
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if token.shape != (count, 66) or token.dtype != np.float32:
+            raise ValueError(f"invalid token output: {token_path}: {token.shape}/{token.dtype}")
+        if proprio.shape != (count, PROPRIO_DIM) or proprio.dtype != np.float32:
+            raise ValueError(
+                f"invalid proprio output: {proprio_path}: {proprio.shape}/{proprio.dtype}"
+            )
+        if not np.isfinite(token).all() or not np.isfinite(proprio).all():
+            raise ValueError(f"non-finite paired output for {row['stable_id']}")
+        if not np.array_equal(token[:, 64:66], proprio[:, 29:31]):
+            raise ValueError(f"token/proprio hands disagree for {row['stable_id']}")
+        if report.get("status") != "complete" or report.get("token_rows") != count:
+            raise ValueError(f"invalid planner report for {row['stable_id']}")
+
+
+def _build_worker_specs(
+    devices: list[str],
+    args: argparse.Namespace,
+    job_count: int,
+) -> list[replay.WorkerSpec]:
+    requested = args.workers if args.workers is not None else len(devices)
+    if requested > len(devices) and not args.allow_gpu_oversubscription:
+        raise ValueError(
+            f"--workers={requested} exceeds {len(devices)} visible GPU(s); "
+            "pass --allow-gpu-oversubscription to run multiple replay workers per GPU"
+        )
+    count = min(requested, job_count)
+    if args.zmq_port_base + 2 * count - 1 > 65535:
+        raise ValueError("worker ZMQ ports exceed 65535")
+    if args.dds_domain_base + count - 1 > replay.MAX_DDS_DOMAIN:
+        raise ValueError(f"worker DDS domains exceed {replay.MAX_DDS_DOMAIN}")
+    specs = [
+        replay.WorkerSpec(
+            index=index,
+            gpu_selector=devices[index % len(devices)],
+            gpu_index=index % len(devices),
+            gpu_replica=index // len(devices),
+            dds_domain=args.dds_domain_base + index,
+            input_port=args.zmq_port_base + 2 * index,
+            output_port=args.zmq_port_base + 2 * index + 1,
+        )
+        for index in range(count)
+    ]
+    busy = sorted(
+        port
+        for spec in specs
+        for port in (spec.input_port, spec.output_port)
+        if not replay.port_free(port)
+    )
+    if busy:
+        raise RuntimeError(f"replay port(s) already in use: {busy}")
+    return specs
+
+
+@contextmanager
+def _cache_lock(cache_root: Path) -> Iterator[None]:
+    lock_path = cache_root.with_name(f".{cache_root.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f"another AgiBot planner writer holds {cache_root}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _task_name(text: str, index: int) -> str:
+    words = []
+    for token in text.lower().split():
+        token = "".join(ch for ch in token if ch.isalnum())
+        if token:
+            words.append(token)
+        if len(words) >= 8:
+            break
+    return "_".join(words) if words else f"task_{index:06d}"
+
+
+def _ensure_symlink(target: Path, link: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    desired = os.path.relpath(target, link.parent)
+    if link.is_symlink():
+        existing = os.readlink(link)
+        if existing == desired or (link.parent / existing).resolve() == target.resolve():
+            return
+        raise FileExistsError(f"stale symlink {link} -> {existing}, expected {desired}")
+    if link.exists():
+        raise FileExistsError(f"refusing to replace non-symlink path: {link}")
+    os.symlink(desired, link)
+
+
+def _write_lerobot_v2_1(root: Path, rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    view = root / "lerobot_v2_1"
+    chunk_size = int(args.lerobot_chunk_size)
+    video_key = str(args.lerobot_video_key)
+    video_file = str(args.lerobot_video_file)
+    task_to_index: dict[str, int] = {}
+    task_rows: list[dict[str, Any]] = []
+    episode_rows: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]] = []
+    stats_rows: list[dict[str, Any]] = []
+    skipped_video: list[dict[str, Any]] = []
+
+    def task_index(task: str) -> int:
+        if task not in task_to_index:
+            index = len(task_to_index)
+            task_to_index[task] = index
+            task_rows.append(
+                {"task": task, "task_index": index, "task_name": _task_name(task, index)}
+            )
+        return task_to_index[task]
+
+    for row in rows:
+        source_dir = Path(str(row.get("source_episode_file_path") or ""))
+        original_video = source_dir / "videos" / video_file
+        if not original_video.is_file():
+            skipped_video.append(
+                {
+                    "stable_id": row["stable_id"],
+                    "source_episode_file_path": str(source_dir),
+                    "missing_video": str(original_video),
+                }
+            )
+            continue
+        episode_index = len(episode_rows)
+        chunk = episode_index // chunk_size
+        token_rel = Path("sonic_tokens") / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.npy"
+        proprio_rel = Path("g1_proprio") / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.npy"
+        video_rel = Path("videos") / f"chunk-{chunk:03d}" / video_key / f"episode_{episode_index:06d}.mp4"
+        data_rel = Path("data") / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.json"
+        _ensure_symlink(root / "sonic_tokens" / f"{row['stable_id']}.npy", view / token_rel)
+        _ensure_symlink(root / "g1_proprio" / f"{row['stable_id']}.npy", view / proprio_rel)
+        _ensure_symlink(original_video, view / video_rel)
+        teleop._atomic_write_json(
+            view / data_rel,
+            {
+                "stable_id": row["stable_id"],
+                "source": row["source"],
+                "source_tfrecord": row.get("source_tfrecord"),
+                "source_record_index": row.get("source_record_index"),
+                "source_episode_file_path": row.get("source_episode_file_path"),
+                "source_start_frame": row["source_start_frame"],
+                "source_end_frame_exclusive": row["source_end_frame_exclusive"],
+            },
+        )
+        task = str(row.get("main_task") or "perform the task")
+        t_index = task_index(task)
+        item = {
+            "data_path": data_rel.as_posix(),
+            "episode_index": episode_index,
+            "g1_proprio_path": proprio_rel.as_posix(),
+            "length": int(row["token_frame_count"]),
+            "original_video_path": str(original_video),
+            "proprio_frame_count": int(row["proprio_frame_count"]),
+            "sonic_token_path": token_rel.as_posix(),
+            "source_end_frame_exclusive": int(row["source_end_frame_exclusive"]),
+            "source_episode": row["source_episode"],
+            "source_episode_file_path": row.get("source_episode_file_path"),
+            "source_frame_count": int(row["source_frame_count"]),
+            "source_path": row["source"],
+            "source_record_index": row.get("source_record_index"),
+            "source_start_frame": int(row["source_start_frame"]),
+            "source_tfrecord": row.get("source_tfrecord"),
+            "stable_id": row["stable_id"],
+            "task": task,
+            "task_index": t_index,
+            "tasks": [task],
+            "token_frame_count": int(row["token_frame_count"]),
+            "video_path": video_rel.as_posix(),
+        }
+        episode_rows.append(item)
+        source_rows.append({k: v for k, v in item.items() if k != "tasks"})
+        stats_rows.append(
+            {
+                "episode_index": episode_index,
+                "stats": {
+                    "num_frames": int(row["token_frame_count"]),
+                    "proprio_frame_count": int(row["proprio_frame_count"]),
+                    "source_frame_count": int(row["source_frame_count"]),
+                    "token_frame_count": int(row["token_frame_count"]),
+                },
+            }
+        )
+
+    meta = view / "meta"
+    teleop._atomic_write_jsonl(meta / "tasks.jsonl", task_rows)
+    teleop._atomic_write_jsonl(meta / "episodes.jsonl", episode_rows)
+    teleop._atomic_write_jsonl(meta / "episodes_stats.jsonl", stats_rows)
+    teleop._atomic_write_jsonl(meta / "source_id_map.jsonl", source_rows)
+    teleop._atomic_write_jsonl(
+        meta / "skipped_missing_head_rgb_video.jsonl", skipped_video
+    )
+    total_frames = sum(int(row["length"]) for row in episode_rows)
+    info = {
+        "codebase_version": "v2.1",
+        "view_type": "symlinked_agibotworld_sonic_head_rgb",
+        "robot_type": "G1",
+        "source_robot_type": "AgiBotWorld gripper",
+        "total_episodes": len(episode_rows),
+        "source_total_episodes": len(rows),
+        "skipped_missing_head_rgb_video": len(skipped_video),
+        "total_frames": total_frames,
+        "total_tasks": len(task_rows),
+        "total_videos": len(episode_rows),
+        "chunks_size": chunk_size,
+        "fps": 30,
+        "control_hz": CONTROL_HZ,
+        "splits": {"train": f"0:{len(episode_rows)}"},
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.json",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "sonic_token_path": "sonic_tokens/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.npy",
+        "g1_proprio_path": "g1_proprio/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.npy",
+        "source_id_map_path": "meta/source_id_map.jsonl",
+        "video_keys": [video_key],
+        "frame_mapping": "one_source_frame_to_one_control_tick",
+        "resampling": "none",
+        "features": {
+            video_key: {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+                "names": ["height", "width", "rgb"],
+                "info": {
+                    "video.fps": 30.0,
+                    "video.height": 480,
+                    "video.width": 640,
+                    "video.channels": 3,
+                    "video.codec": "h264",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "has_audio": False,
+                },
+            },
+            "action.sonic_token": {
+                "dtype": "float32",
+                "shape": ["T", 66],
+                "names": None,
+                "path": "sonic_tokens/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.npy",
+            },
+            "observation.g1_proprio": {
+                "dtype": "float32",
+                "shape": ["T", PROPRIO_DIM],
+                "names": None,
+                "path": "g1_proprio/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.npy",
+            },
+            "source.agibotworld_rlds": {
+                "dtype": "json",
+                "path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.json",
+            },
+        },
+    }
+    teleop._atomic_write_json(meta / "info.json", info)
+    return {
+        "path": str(view),
+        "episodes": len(episode_rows),
+        "skipped_missing_head_rgb_video": len(skipped_video),
+        "total_frames": total_frames,
+    }
+
+
+def _run_live(
+    preflight: teleop.Preflight,
+    args: argparse.Namespace,
+    cache_root: Path,
+) -> dict[str, Any]:
+    teleop._validate_roots(
+        args.data_root,
+        cache_root,
+        pilot=bool(args.allow_cross_root_cache),
+    )
+    if cache_root.exists():
+        raise FileExistsError(f"cache already exists; refusing to overwrite: {cache_root}")
+    mapping = _mapping_config(args)
+    mapping_hash = _json_hash(mapping)
+    asset_hashes = _asset_hashes()
+    asset_hash = _json_hash(asset_hashes)
+    jobs = _jobs(preflight)
+    jobs.sort(key=lambda item: (-(item.segment.end - item.segment.start), item.stable_id))
+    estimated_bytes = sum(
+        (job.segment.end - job.segment.start) * (66 + PROPRIO_DIM) * 4
+        for job in jobs
+    )
+    required_bytes = math.ceil(estimated_bytes * 1.3)
+    available_bytes = (
+        os.statvfs(cache_root.parent).f_bavail
+        * os.statvfs(cache_root.parent).f_frsize
+    )
+    if available_bytes < required_bytes:
+        raise OSError(f"insufficient cache space: need {required_bytes}, have {available_bytes}")
+
+    replay.validate_runtime_assets()
+    devices, gpu_source = replay.discover_visible_gpus()
+    specs = _build_worker_specs(devices, args, len(jobs))
+    args.work_root = (args.work_root / mapping_hash[:12]).resolve()
+    staging = cache_root.with_name(f".{cache_root.name}.staging")
+    started = time.monotonic()
+    stop_event = threading.Event()
+    with _cache_lock(cache_root):
+        if staging.exists() and not args.resume:
+            raise FileExistsError(f"staging exists; pass --resume after inspection: {staging}")
+        if not staging.exists():
+            (staging / "sonic_tokens").mkdir(parents=True)
+            (staging / "g1_proprio").mkdir()
+            (staging / "meta").mkdir()
+        journal_path = staging / "meta/execution_results.jsonl"
+        task_queue: queue.Queue[AgibotJob] = queue.Queue()
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        for job in jobs:
+            task_queue.put(job)
+        gate = replay.TensorRTInitGate(replay.TRT_LOCK_PATH)
+
+        def worker(spec: replay.WorkerSpec) -> None:
+            while not stop_event.is_set():
+                try:
+                    job = task_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    trajectory, trajectory_check = _trajectory_for_job(job, args)
+                    row, provenance = _row_and_provenance(
+                        job,
+                        trajectory,
+                        trajectory_check,
+                        mapping_hash,
+                        asset_hash,
+                    )
+                    planner_job = replay.PlannerJob(
+                        trajectory_source=None,
+                        token_output=staging / "sonic_tokens" / f"{job.stable_id}.npy",
+                        proprio_output=staging / "g1_proprio" / f"{job.stable_id}.npy",
+                        episode_id=job.stable_id,
+                    )
+                    existing = replay.resume_planner_report(
+                        planner_job, trajectory, provenance=provenance
+                    )
+                    if existing is not None:
+                        if not args.resume:
+                            raise FileExistsError(f"output already exists for {job.stable_id}")
+                        status = "skipped"
+                        report = existing
+                    else:
+                        report = replay.run_planner_job(
+                            planner_job,
+                            trajectory,
+                            args,
+                            spec,
+                            gate,
+                            stop_event,
+                            provenance=provenance,
+                        )
+                        status = "complete-with-warnings" if report["warnings"] else "complete"
+                    result_queue.put(
+                        {
+                            "status": status,
+                            "stable_id": job.stable_id,
+                            "row": row,
+                            "report": report,
+                        }
+                    )
+                except BaseException as error:
+                    result_queue.put(
+                        {
+                            "status": "failed",
+                            "stable_id": job.stable_id,
+                            "error": f"{type(error).__name__}: {error}",
+                            "runtime_assignment": replay.runtime_assignment(spec),
+                        }
+                    )
+                    if args.fail_fast:
+                        stop_event.set()
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(spec,),
+                name=f"agibot-planner-worker-{spec.index}",
+            )
+            for spec in specs
+        ]
+        results: list[dict[str, Any]] = []
+        interrupted = False
+        try:
+            for thread in threads:
+                thread.start()
+            with journal_path.open("a", encoding="utf-8") as journal:
+                while any(thread.is_alive() for thread in threads) or not result_queue.empty():
+                    try:
+                        result = result_queue.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
+                    results.append(result)
+                    journal.write(
+                        json.dumps(
+                            {"recorded_at": replay.now_utc(), **teleop._jsonable(result)}
+                        )
+                        + "\n"
+                    )
+                    journal.flush()
+                    print(
+                        f"[{len(results)}/{len(jobs)}] {result['status']} {result['stable_id']}",
+                        flush=True,
+                    )
+                    if result["status"] == "failed":
+                        print(result["error"], file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            interrupted = True
+            stop_event.set()
+        finally:
+            for thread in threads:
+                thread.join()
+            while True:
+                try:
+                    results.append(result_queue.get_nowait())
+                except queue.Empty:
+                    break
+        failures = [result for result in results if result["status"] == "failed"]
+        if interrupted:
+            raise KeyboardInterrupt
+        if failures or len(results) != len(jobs):
+            raise RuntimeError(
+                f"planner conversion incomplete: results={len(results)}/{len(jobs)}, failures={len(failures)}"
+            )
+
+        rows_by_id = {result["stable_id"]: result["row"] for result in results}
+        expected_ids = sorted(job.stable_id for job in jobs)
+        if set(rows_by_id) != set(expected_ids):
+            raise ValueError("worker results do not match expected stable IDs")
+        rows = [rows_by_id[stable_id] for stable_id in expected_ids]
+        language_map = {row["stable_id"]: row["main_task"] for row in rows}
+        teleop._atomic_write_json(staging / "meta/schema.json", _live_schema(mapping))
+        teleop._atomic_write_json(staging / "meta/language_map.json", language_map)
+        teleop._atomic_write_jsonl(staging / "meta/episode_index.jsonl", rows)
+        stats_meta = _write_stats(staging, rows)
+        status_counts: dict[str, int] = {}
+        for result in results:
+            status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
+        lerobot_summary = None
+        if not args.skip_lerobot_v2_1:
+            lerobot_summary = _write_lerobot_v2_1(staging, rows, args)
+        manifest = {
+            "format_version": 1,
+            "dataset": "agibotworld",
+            "pipeline": "sonic_planner_vr3_paired_token_proprio",
+            "pilot": False,
+            "data_root": str(args.data_root),
+            "cache_root": str(cache_root),
+            "raw_inventory_fingerprint": preflight.inventory_fingerprint,
+            "mapping": mapping,
+            "mapping_config_sha256": mapping_hash,
+            "runtime_asset_hashes": asset_hashes,
+            "runtime_asset_set_sha256": asset_hash,
+            "gpu_discovery_source": gpu_source,
+            "workers": replay.worker_inventory(specs),
+            "gpu_oversubscription": bool(args.allow_gpu_oversubscription),
+            "sharding": {
+                "shard_count": args.shard_count,
+                "shard_index": args.shard_index,
+                "method": "tfrecord_shard_index_modulo",
+            },
+            "elapsed_seconds": time.monotonic() - started,
+            "counts": {
+                "eligible_episodes": len(preflight.episodes),
+                "excluded_scanned_episodes": len(preflight.exclusions),
+                "segments": len(rows),
+                "source_frames": sum(int(row["source_frame_count"]) for row in rows),
+                "token_frames": sum(int(row["token_frame_count"]) for row in rows),
+                "proprio_frames": sum(int(row["proprio_frame_count"]) for row in rows),
+                "statuses": status_counts,
+            },
+            "output_space": {
+                "estimated_bytes": estimated_bytes,
+                "required_free_bytes": required_bytes,
+                "available_free_bytes_at_start": available_bytes,
+            },
+            "stats": stats_meta,
+            "lerobot_v2_1": lerobot_summary,
+            "exclusions": list(preflight.exclusions),
+            "cli_resolved_config": teleop._jsonable(vars(args)),
+        }
+        teleop._atomic_write_json(staging / "meta/conversion_manifest.json", manifest)
+        teleop._atomic_write_json(
+            staging / "meta/execution_report.json",
+            {"status_counts": status_counts, "workers": replay.worker_inventory(specs)},
+        )
+        _validate_live_cache(staging, rows)
+        (staging / "_SUCCESS").write_text("ok\n", encoding="utf-8")
+        os.replace(staging, cache_root)
+        return manifest
+
+
 def _preflight_summary(preflight: teleop.Preflight, args: argparse.Namespace) -> dict[str, Any]:
     mapping = _mapping_config(args)
     mapping_hash = _json_hash(mapping)
@@ -655,6 +1474,11 @@ def _preflight_summary(preflight: teleop.Preflight, args: argparse.Namespace) ->
         "segments": sum(len(episode.segments) for episode in preflight.episodes),
         "valid_source_frames": sum(episode.valid_frames for episode in preflight.episodes),
         "raw_inventory_fingerprint": preflight.inventory_fingerprint,
+        "sharding": {
+            "shard_count": args.shard_count,
+            "shard_index": args.shard_index,
+            "method": "tfrecord_shard_index_modulo",
+        },
         "mapping": mapping,
         "mapping_config_sha256": mapping_hash,
         "trajectory_summary": trajectory_summary,
@@ -803,6 +1627,7 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight-only", action="store_true")
     mode.add_argument("--pilot", action="store_true")
+    mode.add_argument("--publish-full", action="store_true")
     calibration = parser.add_mutually_exclusive_group()
     calibration.add_argument("--confirm-calibration", action="store_true")
     calibration.add_argument("--allow-provisional-calibration", action="store_true")
@@ -813,6 +1638,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preflight-workers", type=_workers, default="auto")
     parser.add_argument("--min-source-frames", type=int, default=20)
     parser.add_argument("--confirm-source-schema", action="store_true")
+    parser.add_argument("--workers", type=int, help="default: one worker per visible GPU")
+    parser.add_argument("--work-root", type=Path, default=WORK_ROOT)
+    parser.add_argument("--zmq-port-base", type=int, default=replay.DEFAULT_ZMQ_PORT_BASE)
+    parser.add_argument("--dds-domain-base", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--allow-gpu-oversubscription", action="store_true")
+    parser.add_argument("--keep-work", action="store_true")
+    parser.add_argument("--stats", type=Path)
+    parser.add_argument("--deploy-timeout", type=float, default=150.0)
+    parser.add_argument("--capture-startup-margin", type=float, default=2.0)
+    parser.add_argument("--capture-tail-margin", type=float, default=15.0)
+    parser.add_argument("--startup-settle-margin", type=float, default=11.0)
+    parser.add_argument("--planner-mode-timeout", type=float, default=30.0)
+    parser.add_argument("--planner-echo-tol", type=float, default=1e-4)
+    parser.add_argument("--anchor-max-offset", type=int, default=5)
+    parser.add_argument("--anchor-tol", type=float, default=1e-5)
+    parser.add_argument("--max-edge-fill", type=int, default=0)
+    parser.add_argument("--allow-cross-root-cache", action="store_true")
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--skip-lerobot-v2-1", action="store_true")
+    parser.add_argument("--lerobot-chunk-size", type=int, default=1000)
+    parser.add_argument("--lerobot-video-key", default="observation.images.rgb.head")
+    parser.add_argument("--lerobot-video-file", default="head_color.mp4")
     parser.add_argument("--calibration-label", default="agibotworld_gripper_provisional_v1")
     parser.add_argument("--base-axis-scale", nargs=3, type=float, default=(1.0, 1.0, 1.0))
     parser.add_argument("--base-filter-alpha", type=float, default=0.2)
@@ -843,14 +1693,31 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if (args.pilot and not args.confirm_source_schema):
-        raise ValueError("pilot requires --confirm-source-schema")
-    if args.pilot and not (
+    write_mode = bool(args.pilot or args.publish_full)
+    if write_mode and not args.confirm_source_schema:
+        raise ValueError("pilot/full requires --confirm-source-schema")
+    if write_mode and not (
         args.confirm_calibration or args.allow_provisional_calibration
     ):
         raise ValueError(
-            "pilot requires --confirm-calibration or --allow-provisional-calibration"
+            "pilot/full requires --confirm-calibration or --allow-provisional-calibration"
         )
+    if args.resume and not args.publish_full:
+        raise ValueError("--resume is only valid with --publish-full")
+    if args.workers is not None and args.workers <= 0:
+        raise ValueError("--workers must be positive")
+    if args.shard_count <= 0:
+        raise ValueError("--shard-count must be positive")
+    if not 0 <= args.shard_index < args.shard_count:
+        raise ValueError("--shard-index must be in [0, shard_count)")
+    if not 1 <= args.zmq_port_base <= 65534:
+        raise ValueError("--zmq-port-base must be in [1,65534]")
+    if not 0 <= args.dds_domain_base <= replay.MAX_DDS_DOMAIN:
+        raise ValueError(f"--dds-domain-base must be in [0,{replay.MAX_DDS_DOMAIN}]")
+    if args.max_edge_fill != 0:
+        raise ValueError("planner mode forbids edge fill; --max-edge-fill must be 0")
+    if args.lerobot_chunk_size <= 0:
+        raise ValueError("--lerobot-chunk-size must be positive")
     if args.max_episodes < 0 or args.min_source_frames < 2:
         raise ValueError("episode limits are invalid")
     if args.calibration_frames < 2:
@@ -928,21 +1795,32 @@ def main() -> int:
     _validate_args(args)
     args.data_root = _resolve(args.data_root)
     args.cache_root = _resolve(args.cache_root)
-    limit = None if args.max_episodes == 0 else args.max_episodes
-    preflight = teleop._preflight_agibot(
+    args.work_root = _resolve(args.work_root)
+    args.stats = _resolve(args.stats) if args.stats else None
+    if args.stats is not None and not args.stats.is_file():
+        raise FileNotFoundError(f"--stats does not exist: {args.stats}")
+    limit = None if (args.publish_full or args.max_episodes == 0) else args.max_episodes
+    preflight = _preflight_agibot_sharded(
         args.data_root,
         max_episodes=limit,
         min_source_frames=args.min_source_frames,
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
     )
-    if not args.pilot:
+    if not (args.pilot or args.publish_full):
         print(json.dumps(_preflight_summary(preflight, args), indent=2, sort_keys=True))
         return 0
     cache_root = args.cache_root
-    if cache_root == _resolve(CACHE_ROOT):
-        cache_root = Path(tempfile.gettempdir()) / (
-            f"huge-agibotworld-planner-trajectory-pilot-{os.getpid()}"
-        )
-    manifest = _write_pilot(preflight, args, cache_root)
+    if args.pilot:
+        if cache_root == _resolve(CACHE_ROOT):
+            cache_root = Path(tempfile.gettempdir()) / (
+                f"huge-agibotworld-planner-trajectory-pilot-{os.getpid()}"
+            )
+        manifest = _write_pilot(preflight, args, cache_root)
+    else:
+        if cache_root == _resolve(CACHE_ROOT):
+            cache_root = _resolve(TOKEN_CACHE_ROOT)
+        manifest = _run_live(preflight, args, cache_root)
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0
 

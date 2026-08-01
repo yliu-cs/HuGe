@@ -50,6 +50,7 @@ OUTPUT_LOCK_ROOT = RUN_ROOT / "locks"
 
 CONTROL_HZ = 50.0
 DEFAULT_ZMQ_PORT_BASE = 5556
+DEFAULT_WORKERS_PER_GPU = 10
 MAX_DDS_DOMAIN = 232
 DEPLOY_INIT_PATTERN = re.compile(r"Init Done")
 TELEOP_MODE_PATTERN = re.compile(
@@ -101,6 +102,8 @@ class PlannerJob:
 class WorkerSpec:
     index: int
     gpu_selector: str
+    gpu_index: int
+    gpu_replica: int
     dds_domain: int
     input_port: int
     output_port: int
@@ -533,9 +536,14 @@ def build_worker_specs(
     args: argparse.Namespace,
     job_count: int,
 ) -> list[WorkerSpec]:
-    requested = args.workers if args.workers is not None else len(devices)
-    if requested > len(devices):
-        raise ValueError(f"--workers={requested} exceeds {len(devices)} visible GPU(s)")
+    if not devices:
+        raise ValueError("at least one visible GPU is required")
+    workers_per_gpu = getattr(args, "workers_per_gpu", None)
+    requested = (
+        args.workers
+        if args.workers is not None
+        else len(devices) * (workers_per_gpu or DEFAULT_WORKERS_PER_GPU)
+    )
     count = min(requested, job_count)
     if args.zmq_port_base + 2 * count - 1 > 65535:
         raise ValueError("worker ZMQ ports exceed 65535")
@@ -544,7 +552,9 @@ def build_worker_specs(
     specs = [
         WorkerSpec(
             index=index,
-            gpu_selector=devices[index],
+            gpu_selector=devices[index % len(devices)],
+            gpu_index=index % len(devices),
+            gpu_replica=index // len(devices),
             dds_domain=args.dds_domain_base + index,
             input_port=args.zmq_port_base + 2 * index,
             output_port=args.zmq_port_base + 2 * index + 1,
@@ -567,6 +577,8 @@ def worker_inventory(specs: list[WorkerSpec]) -> list[dict[str, Any]]:
         {
             "worker": spec.index,
             "gpu_selector": spec.gpu_selector,
+            "gpu_index": spec.gpu_index,
+            "gpu_replica": spec.gpu_replica,
             "dds_domain": spec.dds_domain,
             "zmq_input_port": spec.input_port,
             "zmq_output_port": spec.output_port,
@@ -577,6 +589,21 @@ def worker_inventory(specs: list[WorkerSpec]) -> list[dict[str, Any]]:
 
 def runtime_assignment(spec: WorkerSpec) -> dict[str, Any]:
     return worker_inventory([spec])[0]
+
+
+def worker_summary(specs: list[WorkerSpec]) -> dict[str, Any]:
+    per_gpu: dict[str, int] = {}
+    for spec in specs:
+        per_gpu[spec.gpu_selector] = per_gpu.get(spec.gpu_selector, 0) + 1
+    logical_cpus = os.cpu_count()
+    return {
+        "total_workers": len(specs),
+        "workers_per_gpu": per_gpu,
+        "logical_cpus": logical_cpus,
+        "logical_cpus_per_worker": (
+            logical_cpus / len(specs) if logical_cpus is not None and specs else None
+        ),
+    }
 
 
 def resume_report(job: Job, rows: int, width: int) -> dict[str, Any] | None:
@@ -1307,6 +1334,8 @@ def replay_parameters(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "control_hz": CONTROL_HZ,
         "workers": args.workers,
+        "workers_per_gpu": getattr(args, "workers_per_gpu", None),
+        "default_workers_per_gpu": DEFAULT_WORKERS_PER_GPU,
         "zmq_port_base": args.zmq_port_base,
         "dds_domain_base": args.dds_domain_base,
         "deploy_timeout": args.deploy_timeout,
@@ -1383,7 +1412,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-glob", default="**/*.npy")
     parser.add_argument("--episode", action="append", help="exact relative path without .npy; repeatable")
     parser.add_argument("--work-root", default=".runs/calc_proprio/work")
-    parser.add_argument("--workers", type=int, help="directory live mode; default: all visible GPUs")
+    worker_group = parser.add_mutually_exclusive_group()
+    worker_group.add_argument(
+        "--workers", type=int, help="directory live mode: explicit total worker count"
+    )
+    worker_group.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        help=f"directory live mode: workers per visible GPU (default: {DEFAULT_WORKERS_PER_GPU})",
+    )
     parser.add_argument("--zmq-port-base", type=int, default=DEFAULT_ZMQ_PORT_BASE)
     parser.add_argument("--dds-domain-base", type=int, default=0)
     parser.add_argument("--keep-work", action="store_true")
@@ -1426,8 +1463,8 @@ def parse_args() -> argparse.Namespace:
         )
     if not directory and args.episode:
         parser.error("--episode is only valid in directory mode")
-    if not directory and args.workers is not None:
-        parser.error("--workers is only valid in directory mode")
+    if not directory and (args.workers is not None or args.workers_per_gpu is not None):
+        parser.error("--workers and --workers-per-gpu are only valid in directory mode")
     if args.output and Path(args.output).suffix != ".npy":
         parser.error("--output must end in .npy")
     if args.planner_trajectory and Path(args.planner_trajectory).suffix != ".npz":
@@ -1440,6 +1477,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--token-output and --proprio-output must differ")
     if args.workers is not None and args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.workers_per_gpu is not None and args.workers_per_gpu < 1:
+        parser.error("--workers-per-gpu must be at least 1")
     if not 1 <= args.zmq_port_base <= 65534:
         parser.error("--zmq-port-base must be between 1 and 65534")
     if not 0 <= args.dds_domain_base <= MAX_DDS_DOMAIN:
@@ -1569,6 +1608,7 @@ def build_manifest(
         "parameters": replay_parameters(args),
         "gpu_discovery_source": gpu_source,
         "workers": worker_inventory(specs),
+        "worker_summary": worker_summary(specs),
         "job_count": job_count,
         "processed_jobs": processed,
         "pending_jobs": job_count - processed,
@@ -1841,6 +1881,7 @@ def main() -> int:
         devices, gpu_source = discover_visible_gpus()
         worker_jobs = 1 if roots is None else len(jobs)
         specs = build_worker_specs(devices, args, worker_jobs)
+        print(json.dumps({"worker_plan": worker_summary(specs)}, indent=2), flush=True)
 
     if roots is None:
         return run_single(jobs[0], args, specs[0] if specs else None, stop_event)
