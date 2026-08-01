@@ -59,7 +59,9 @@ def capture_g1_debug_frames(
             frame = msgpack.unpackb(payload, raw=False)
             if not isinstance(frame, dict):
                 raise ValueError(f"expected a mapping in g1_debug payload, got {type(frame).__name__}")
-            frame["_recv_time"] = time.monotonic() - started
+            received = time.monotonic()
+            frame["_recv_time"] = received - started
+            frame["_recv_monotonic"] = received
             frames.append(frame)
     finally:
         socket.close()

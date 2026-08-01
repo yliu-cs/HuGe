@@ -2,8 +2,8 @@
 
 The default mode is read-only preflight. ``--pilot`` writes a small cache
 under ``/tmp`` and ``--publish-full`` is required for a full atomic cache.
-Source frames are never resampled: one 30 Hz source frame becomes one token
-that downstream code interprets at 50 Hz.
+EgoVerse is retargeted into the G1 three-point frame and resampled to 50 Hz
+before SONIC encoding; existing BEHAVIOR semantics remain unchanged.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,11 @@ from scipy.spatial.transform import Rotation
 sys.dont_write_bytecode = True
 
 from huge.data.preprocess import atomic_save_npy
+from huge.data.transforms import (
+    fixed_hz_target_seconds,
+    resample_linear_at_times,
+    resample_quat_wxyz_at_times,
+)
 
 
 ENCODER_INPUT_DIM = 1762
@@ -46,6 +52,13 @@ TORSO_LINK_OFFSET_Z = 0.05
 # The G1 shoulder-to-tracking-point chain reaches about 0.73 m from the
 # canonical head point. Keep a small tolerance for retargeting and head tilt.
 DEFAULT_BEHAVIOR_MAX_WRIST_HEAD_REACH = 0.80
+DEFAULT_EGOVERSE_MIN_DURATION_SECONDS = 1.0
+DEFAULT_EGOVERSE_CALIBRATION_FRAMES = 15
+DEFAULT_EGOVERSE_CALIBRATION_MAX_POSITION_DELTA = 0.04
+DEFAULT_EGOVERSE_CALIBRATION_MAX_ANGLE_DEGREES = 10.0
+DEFAULT_EGOVERSE_MAX_WRIST_SPEED = 3.0
+DEFAULT_EGOVERSE_MAX_WRIST_ANGULAR_SPEED = 720.0
+DEFAULT_EGOVERSE_MAX_WRIST_HEAD_REACH = 0.80
 G1_WRIST_REFERENCE_POSITIONS = np.asarray(
     [
         [0.3797694914, 0.1236269337, 0.0952214277],
@@ -84,7 +97,7 @@ DATASET_DEFAULTS = {
     ),
     "egoverse": (
         Path("resource/datasets/egoverse"),
-        Path("resource/datasets/egoverse-cache"),
+        Path("resource/datasets/egoverse-retargeted-cache"),
     ),
     "agibotworld": (
         Path("resource/datasets/agibotworld-beta-rlds"),
@@ -219,7 +232,7 @@ def _mean_quaternions_wxyz(quaternions: np.ndarray) -> np.ndarray:
     return (means / norms).astype(np.float32)
 
 
-def _behavior_calibration_segment(
+def _stable_calibration_segment(
     poses: np.ndarray,
     segment: Segment,
     *,
@@ -254,39 +267,58 @@ def _behavior_calibration_segment(
     )
 
 
-def _calibrate_behavior_three_points(
-    poses: np.ndarray,
+def _retarget_three_points_to_g1(
+    source_positions: np.ndarray,
+    source_orientations_wxyz: np.ndarray,
     segment: Segment,
     *,
     canonical_head_z: float,
     max_wrist_head_reach: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     if segment.calibration_start is None or segment.calibration_end is None:
-        raise ValueError("BEHAVIOR segment is missing a calibration window")
-    source = np.asarray(poses[segment.start : segment.end], dtype=np.float32)
-    quaternions = _to_wxyz(source[:, :, 3:7], "xyzw")
-    calibration = slice(
-        segment.calibration_start - segment.start,
-        segment.calibration_end - segment.start,
-    )
+        raise ValueError("segment is missing a calibration window")
+    all_positions = np.asarray(source_positions, dtype=np.float32)
+    all_orientations = _normalize_quaternions(source_orientations_wxyz)
+    if not (
+        0 <= segment.start < segment.end <= len(all_positions)
+        and 0
+        <= segment.calibration_start
+        < segment.calibration_end
+        <= len(all_positions)
+    ):
+        raise ValueError("segment/calibration range is outside the source episode")
+    positions = all_positions[segment.start : segment.end].copy()
+    orientations = all_orientations[segment.start : segment.end].copy()
+    calibration_positions = all_positions[
+        segment.calibration_start : segment.calibration_end
+    ]
+    calibration_orientations = all_orientations[
+        segment.calibration_start : segment.calibration_end
+    ]
     head_inverse = _quat_conjugate(
-        _mean_quaternions_wxyz(quaternions[calibration, 2])
+        _mean_quaternions_wxyz(calibration_orientations[:, 2])
     )
     head_inverse_rotation = Rotation.from_quat(head_inverse, scalar_first=True)
     positions = np.einsum(
+        "ij,tpj->tpi", head_inverse_rotation.as_matrix(), positions
+    ).astype(np.float32)
+    calibration_positions = np.einsum(
         "ij,tpj->tpi",
         head_inverse_rotation.as_matrix(),
-        source[:, :, :3],
+        calibration_positions,
     ).astype(np.float32)
-    orientations = _quat_multiply(head_inverse[None, None, :], quaternions)
+    orientations = _quat_multiply(head_inverse[None, None, :], orientations)
+    calibration_orientations = _quat_multiply(
+        head_inverse[None, None, :], calibration_orientations
+    )
 
     wrist_relative_to_head = positions[:, :2] - positions[:, 2:3]
     calibration_relative = np.median(
-        wrist_relative_to_head[calibration], axis=0
+        calibration_positions[:, :2] - calibration_positions[:, 2:3], axis=0
     )
     source_reach = np.linalg.norm(calibration_relative, axis=-1)
     if np.any(source_reach < 1e-6):
-        raise ValueError("BEHAVIOR calibration wrist-to-head reach is degenerate")
+        raise ValueError("calibration wrist-to-head reach is degenerate")
     canonical_head = np.asarray(
         [0.0, 0.0, canonical_head_z], dtype=np.float32
     )
@@ -298,14 +330,13 @@ def _calibrate_behavior_three_points(
         wrist_scales[None, :, None]
         * (wrist_relative_to_head - calibration_relative[None, :, :])
     )
-    wrist_initial = _mean_quaternions_wxyz(orientations[calibration, :2])
+    wrist_initial = _mean_quaternions_wxyz(calibration_orientations[:, :2])
     wrist_rotation_offsets = _quat_multiply(
         G1_WRIST_REFERENCE_ORIENTATIONS,
         _quat_conjugate(wrist_initial),
     )
     orientations[:, :2] = _quat_multiply(
-        wrist_rotation_offsets[None, :, :],
-        orientations[:, :2],
+        wrist_rotation_offsets[None, :, :], orientations[:, :2]
     )
 
     head_rotation = Rotation.from_quat(orientations[:, 2], scalar_first=True)
@@ -314,17 +345,36 @@ def _calibrate_behavior_three_points(
         neck_length * head_rotation.apply([0.0, 0.0, 1.0])
     )
     max_reach = float(
-        np.linalg.norm(
-            positions[:, :2] - positions[:, 2:3], axis=-1
-        ).max()
+        np.linalg.norm(positions[:, :2] - positions[:, 2:3], axis=-1).max()
     )
     if max_reach > max_wrist_head_reach:
         raise ValueError(
-            "retargeted BEHAVIOR wrist-to-head reach "
+            "retargeted wrist-to-head reach "
             f"{max_reach:.3f} m exceeds {max_wrist_head_reach:.3f} m"
         )
     return positions, _normalize_quaternions(orientations)
 
+def _calibrate_behavior_three_points(
+    poses: np.ndarray,
+    segment: Segment,
+    *,
+    canonical_head_z: float,
+    max_wrist_head_reach: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    source = np.asarray(poses[segment.start : segment.end], dtype=np.float32)
+    local_segment = Segment(
+        0,
+        len(source),
+        int(segment.calibration_start) - segment.start,
+        int(segment.calibration_end) - segment.start,
+    )
+    return _retarget_three_points_to_g1(
+        source[:, :, :3],
+        _to_wxyz(source[:, :, 3:7], "xyzw"),
+        local_segment,
+        canonical_head_z=canonical_head_z,
+        max_wrist_head_reach=max_wrist_head_reach,
+    )
 
 def _canonicalize_three_points(
     positions: np.ndarray,
@@ -401,6 +451,7 @@ def _segment_ranges(
     *,
     min_source_frames: int,
     max_gap_factor: float,
+    break_after: np.ndarray | None = None,
 ) -> tuple[Segment, ...]:
     valid = np.asarray(valid, dtype=bool)
     gap_after = np.zeros(max(0, len(valid) - 1), dtype=bool)
@@ -411,6 +462,13 @@ def _segment_ranges(
             gap_after = (deltas <= 0) | (deltas > np.median(positive) * max_gap_factor)
         else:
             gap_after[:] = True
+    if break_after is not None:
+        extra_breaks = np.asarray(break_after, dtype=bool)
+        if extra_breaks.shape != gap_after.shape:
+            raise ValueError(
+                f"break_after must have shape {gap_after.shape}, got {extra_breaks.shape}"
+            )
+        gap_after |= extra_breaks
     segments: list[Segment] = []
     start = 0
     while start < len(valid):
@@ -587,7 +645,7 @@ def _preflight_behavior_job(job: dict[str, Any]) -> dict[str, Any]:
         retargeted_reach_maxima: list[float] = []
         for segment in segments:
             try:
-                calibrated = _behavior_calibration_segment(
+                calibrated = _stable_calibration_segment(
                     poses,
                     segment,
                     frames=int(job["calibration_frames"]),
@@ -849,6 +907,174 @@ def _legacy_egoverse_orientations(source_xyzw: np.ndarray) -> np.ndarray:
     return _normalize_quaternions(orientations)
 
 
+def _egoverse_quality_segments(
+    poses: np.ndarray,
+    timestamps_ns: np.ndarray,
+    segments: tuple[Segment, ...],
+    *,
+    source: str,
+    legacy: bool,
+    min_source_frames: int,
+    min_duration_seconds: float,
+    calibration_frames: int,
+    calibration_max_position_delta: float,
+    calibration_max_angle_degrees: float,
+    canonical_head_z: float,
+    max_wrist_speed: float,
+    max_wrist_angular_speed: float,
+    max_wrist_head_reach: float,
+) -> tuple[tuple[Segment, ...], list[dict[str, str]], list[dict[str, Any]]]:
+    accepted: list[Segment] = []
+    exclusions: list[dict[str, str]] = []
+    quality: list[dict[str, Any]] = []
+    valid_end = max(segment.end for segment in segments)
+    episode_poses = poses[:valid_end]
+    episode_orientations = (
+        _legacy_egoverse_orientations(episode_poses[:, :, 3:7])
+        if legacy
+        else _to_wxyz(episode_poses[:, :, 3:7], "xyzw")
+    )
+    calibration: Segment | None = None
+    for source_segment in segments:
+        if source_segment.end - source_segment.start < calibration_frames:
+            continue
+        try:
+            calibration = _stable_calibration_segment(
+                poses,
+                source_segment,
+                frames=calibration_frames,
+                max_position_delta=calibration_max_position_delta,
+                max_angle_degrees=calibration_max_angle_degrees,
+            )
+        except ValueError:
+            continue
+        break
+    if calibration is None:
+        return (
+            (),
+            [
+                {
+                    "source": source,
+                    "reason_code": "calibration_window_missing",
+                    "reason": "no source segment contains a stable calibration window",
+                }
+            ],
+            [],
+        )
+
+    for source_segment in segments:
+        source_poses = episode_poses[source_segment.start : source_segment.end]
+        source_timestamps = timestamps_ns[source_segment.start : source_segment.end]
+        orientations = episode_orientations[
+            source_segment.start : source_segment.end
+        ]
+        relative_positions = source_poses[:, :2, :3] - source_poses[:, 2:3, :3]
+        relative_orientations = _quat_multiply(
+            _quat_conjugate(orientations[:, 2:3]), orientations[:, :2]
+        )
+        delta_seconds = np.diff(source_timestamps).astype(np.float64) * 1e-9
+        wrist_speed = (
+            np.linalg.norm(np.diff(relative_positions, axis=0), axis=-1)
+            / delta_seconds[:, None]
+        )
+        dots = np.abs(
+            np.sum(
+                relative_orientations[:-1] * relative_orientations[1:], axis=-1
+            )
+        )
+        wrist_angular_speed = (
+            np.degrees(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)))
+            / delta_seconds[:, None]
+        )
+        discontinuity = (wrist_speed > max_wrist_speed).any(axis=1) | (
+            wrist_angular_speed > max_wrist_angular_speed
+        ).any(axis=1)
+        if discontinuity.any():
+            exclusions.append(
+                {
+                    "source": source,
+                    "reason_code": "tracking_discontinuity",
+                    "reason": f"split at {int(discontinuity.sum())} motion discontinuities",
+                }
+            )
+        local_segments = _segment_ranges(
+            np.ones(len(source_poses), dtype=bool),
+            (source_timestamps - source_timestamps[0]).astype(np.float64) * 1e-9,
+            min_source_frames=2,
+            max_gap_factor=float("inf"),
+            break_after=discontinuity,
+        )
+        for local in local_segments:
+            start = source_segment.start + local.start
+            end = source_segment.start + local.end
+            duration = float((timestamps_ns[end - 1] - timestamps_ns[start]) * 1e-9)
+            if end - start < min_source_frames or duration < min_duration_seconds:
+                exclusions.append(
+                    {
+                        "source": source,
+                        "reason_code": "segment_too_short",
+                        "reason": (
+                            f"[{start},{end}) has {end - start} frames/{duration:.3f}s; "
+                            f"requires {min_source_frames} frames/{min_duration_seconds:.3f}s"
+                        ),
+                    }
+                )
+                continue
+            candidate = Segment(
+                start,
+                end,
+                calibration.calibration_start,
+                calibration.calibration_end,
+            )
+            try:
+                retargeted_positions, _ = _retarget_three_points_to_g1(
+                    episode_poses[:, :, :3],
+                    episode_orientations,
+                    candidate,
+                    canonical_head_z=canonical_head_z,
+                    max_wrist_head_reach=max_wrist_head_reach,
+                )
+            except ValueError as exc:
+                exclusions.append(
+                    {
+                        "source": source,
+                        "reason_code": "retarget_failed",
+                        "reason": f"[{start},{end}): {exc}",
+                    }
+                )
+                continue
+            local_slice = slice(local.start, local.end)
+            local_speed = wrist_speed[local.start : local.end - 1]
+            local_angular = wrist_angular_speed[local.start : local.end - 1]
+            source_seconds = (
+                source_timestamps[local_slice] - source_timestamps[local.start]
+            ).astype(np.float64) * 1e-9
+            target_frames = len(
+                fixed_hz_target_seconds(source_seconds, INTERPRETED_HZ)
+            )
+            accepted.append(candidate)
+            quality.append(
+                {
+                    "source_start_frame": start,
+                    "source_end_frame_exclusive": end,
+                    "source_duration_seconds": duration,
+                    "target_frames": target_frames,
+                    "max_wrist_speed_mps": float(local_speed.max()),
+                    "max_wrist_angular_speed_deg_s": float(local_angular.max()),
+                    "max_source_wrist_head_reach_m": float(
+                        np.linalg.norm(relative_positions[local_slice], axis=-1).max()
+                    ),
+                    "max_retargeted_wrist_head_reach_m": float(
+                        np.linalg.norm(
+                            retargeted_positions[:, :2]
+                            - retargeted_positions[:, 2:3],
+                            axis=-1,
+                        ).max()
+                    ),
+                }
+            )
+    return tuple(accepted), exclusions, quality
+
 def _preflight_egoverse(
     root: Path,
     *,
@@ -856,6 +1082,14 @@ def _preflight_egoverse(
     min_source_frames: int,
     max_gap_factor: float,
     allow_legacy: bool,
+    min_duration_seconds: float,
+    calibration_frames: int,
+    calibration_max_position_delta: float,
+    calibration_max_angle_degrees: float,
+    canonical_head_z: float,
+    max_wrist_speed: float,
+    max_wrist_angular_speed: float,
+    max_wrist_head_reach: float,
 ) -> Preflight:
     version_root = _egoverse_root(root)
     if not version_root.is_dir():
@@ -958,13 +1192,13 @@ def _preflight_egoverse(
             relative_timestamps = (
                 timestamps_ns - timestamps_ns[0]
             ).astype(np.float64) * 1e-9
-            segments = _segment_ranges(
+            source_segments = _segment_ranges(
                 valid,
                 relative_timestamps,
-                min_source_frames=min_source_frames,
+                min_source_frames=2,
                 max_gap_factor=max_gap_factor,
             )
-            if not segments:
+            if not source_segments:
                 raise ValueError("no valid continuous segment")
             timestamp_deltas = np.diff(timestamps_ns)
             adjacent_valid = valid[:-1] & valid[1:]
@@ -974,6 +1208,27 @@ def _preflight_egoverse(
             if not positive_deltas.size:
                 raise ValueError("no positive adjacent RGB timestamp deltas")
             source_hz = float(1e9 / np.median(positive_deltas))
+            segments, segment_exclusions, segment_quality = (
+                _egoverse_quality_segments(
+                    poses,
+                    timestamps_ns,
+                    source_segments,
+                    source=source.relative_to(version_root).as_posix(),
+                    legacy=legacy,
+                    min_source_frames=min_source_frames,
+                    min_duration_seconds=min_duration_seconds,
+                    calibration_frames=calibration_frames,
+                    calibration_max_position_delta=calibration_max_position_delta,
+                    calibration_max_angle_degrees=calibration_max_angle_degrees,
+                    canonical_head_z=canonical_head_z,
+                    max_wrist_speed=max_wrist_speed,
+                    max_wrist_angular_speed=max_wrist_angular_speed,
+                    max_wrist_head_reach=max_wrist_head_reach,
+                )
+            )
+            exclusions.extend(segment_exclusions)
+            if not segments:
+                raise ValueError("no segment passed EgoVerse quality and calibration gates")
             tip_indices = LEGACY_ARIA_TIPS if legacy else MANO_TIPS
             hands = np.stack(
                 (
@@ -988,6 +1243,28 @@ def _preflight_egoverse(
             stats["timestamp_source_hz"] = source_hz
             stats["keypoint_layout"] = "aria_legacy" if legacy else "mano"
             stats["legacy_right_wrist_orientation_corrected"] = legacy
+            stats["source_schema"] = (
+                "aria_bimanual_legacy" if legacy else "human_bimanual"
+            )
+            stats["quality_segments"] = segment_quality
+            stats["calibration"] = {
+                "scope": "episode",
+                "start_frame": segments[0].calibration_start,
+                "end_frame_exclusive": segments[0].calibration_end,
+                "window_frames": calibration_frames,
+            }
+            stats["target_frames"] = sum(
+                int(item["target_frames"]) for item in segment_quality
+            )
+            stats["quality_gates"] = {
+                "min_duration_seconds": min_duration_seconds,
+                "calibration_frames": calibration_frames,
+                "calibration_max_position_delta_m": calibration_max_position_delta,
+                "calibration_max_angle_degrees": calibration_max_angle_degrees,
+                "max_wrist_speed_mps": max_wrist_speed,
+                "max_wrist_angular_speed_deg_s": max_wrist_angular_speed,
+                "max_wrist_head_reach_m": max_wrist_head_reach,
+            }
             episodes.append(
                 Episode(
                     dataset="egoverse",
@@ -1297,9 +1574,10 @@ def _episode_payload(
     *,
     frame_limit: int | None = None,
     arrays: dict[str, Any] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     end = min(segment.end, segment.start + frame_limit) if frame_limit else segment.end
     selection = slice(segment.start, end)
+    metadata: dict[str, Any] = {"target_frames": end - segment.start}
     if episode.dataset == "behavior1k":
         if arrays is None:
             arrays = _read_behavior_arrays(episode.source)
@@ -1325,30 +1603,92 @@ def _episode_payload(
             ]
             <= float(config["behavior_gripper_closed_max"])
         ).astype(np.float32)
-        quaternion_order = "wxyz"
     elif episode.dataset == "egoverse":
         legacy = bool(config["allow_legacy_egoverse"])
         if arrays is None:
             arrays = _read_egoverse_arrays(episode.source, allow_padded=legacy)
-        poses = arrays["poses"][selection]
-        positions = poses[:, :, :3]
-        if legacy:
-            source_orientations = _legacy_egoverse_orientations(poses[:, :, 3:7])
-            quaternion_order = "wxyz"
-        else:
-            source_orientations = poses[:, :, 3:7]
-            quaternion_order = "xyzw"
+        valid_end = (
+            int(arrays["total_frames"]) if legacy else len(arrays["poses"])
+        )
+        episode_poses = arrays["poses"][:valid_end]
+        episode_orientations = (
+            _legacy_egoverse_orientations(episode_poses[:, :, 3:7])
+            if legacy
+            else _to_wxyz(episode_poses[:, :, 3:7], "xyzw")
+        )
+        segment_poses = episode_poses[segment.start : segment.end]
+        segment_orientations = episode_orientations[segment.start : segment.end]
+        positions, source_orientations = _retarget_three_points_to_g1(
+            episode_poses[:, :, :3],
+            episode_orientations,
+            segment,
+            canonical_head_z=float(config["canonical_head_z"]),
+            max_wrist_head_reach=float(config["egoverse_max_wrist_head_reach"]),
+        )
+        source_frames = end - segment.start
+        positions = positions[:source_frames]
+        source_orientations = source_orientations[:source_frames]
+        timestamps_ns = arrays["timestamps_ns"][selection]
+        source_seconds = (timestamps_ns - timestamps_ns[0]).astype(np.float64) * 1e-9
+        target_hz = float(config["egoverse_target_hz"])
+        target_seconds = fixed_hz_target_seconds(source_seconds, target_hz)
+        positions = resample_linear_at_times(
+            positions, source_seconds, target_seconds
+        )
+        source_orientations = resample_quat_wxyz_at_times(
+            source_orientations, source_seconds, target_seconds
+        )
         tip_indices = LEGACY_ARIA_TIPS if legacy else MANO_TIPS
-        hands = np.stack(
+        hand_distances = np.stack(
             (
                 _hand_tip_distance(arrays["left_hand"][selection], tip_indices),
                 _hand_tip_distance(arrays["right_hand"][selection], tip_indices),
             ),
             axis=1,
         )
-        hands = (hands <= float(config["egoverse_hand_distance_threshold"])).astype(
-            np.float32
+        hand_distances = resample_linear_at_times(
+            hand_distances, source_seconds, target_seconds
         )
+        hands = (
+            hand_distances <= float(config["egoverse_hand_distance_threshold"])
+        ).astype(np.float32)
+        relative_positions = segment_poses[:source_frames, :2, :3] - segment_poses[
+            :source_frames, 2:3, :3
+        ]
+        relative_orientations = _quat_multiply(
+            _quat_conjugate(segment_orientations[:source_frames, 2:3]),
+            segment_orientations[:source_frames, :2],
+        )
+        delta_seconds = np.diff(source_seconds)
+        wrist_speed = (
+            np.linalg.norm(np.diff(relative_positions, axis=0), axis=-1)
+            / delta_seconds[:, None]
+        )
+        dots = np.abs(
+            np.sum(
+                relative_orientations[:-1] * relative_orientations[1:], axis=-1
+            )
+        )
+        wrist_angular_speed = (
+            np.degrees(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)))
+            / delta_seconds[:, None]
+        )
+        metadata = {
+            "source_start_timestamp_ns": int(timestamps_ns[0]),
+            "source_end_timestamp_ns": int(timestamps_ns[-1]),
+            "source_duration_seconds": float(source_seconds[-1]),
+            "target_duration_seconds": float(target_seconds[-1]),
+            "target_hz": target_hz,
+            "target_frames": len(target_seconds),
+            "max_wrist_speed_mps": float(wrist_speed.max()),
+            "max_wrist_angular_speed_deg_s": float(wrist_angular_speed.max()),
+            "max_source_wrist_head_reach_m": float(
+                np.linalg.norm(relative_positions, axis=-1).max()
+            ),
+            "max_retargeted_wrist_head_reach_m": float(
+                np.linalg.norm(positions[:, :2] - positions[:, 2:3], axis=-1).max()
+            ),
+        }
     else:
         raise RuntimeError(
             "AgiBotWorld conversion requires approved head/flange calibration values"
@@ -1357,12 +1697,12 @@ def _episode_payload(
     positions, orientations = _canonicalize_three_points(
         positions,
         source_orientations,
-        quaternion_order=quaternion_order,
+        quaternion_order="wxyz",
         canonical_head_z=float(config["canonical_head_z"]),
     )
     if hands.shape != (len(positions), 2) or not np.isin(hands, (0.0, 1.0)).all():
         raise ValueError(f"invalid binary hand state shape/values: {hands.shape}")
-    return positions, orientations, hands
+    return positions, orientations, hands, metadata
 
 
 def _provider_list(gpu_id: int | None) -> list[Any]:
@@ -1491,7 +1831,7 @@ def _benchmark_job(job: dict[str, Any]) -> dict[str, Any]:
     config = job["config"]
     session = _create_onnx_session(Path(config["encoder_model"]), gpu_id)
     segment = episode.segments[0]
-    positions, orientations, _ = _episode_payload(
+    positions, orientations, _, _ = _episode_payload(
         episode,
         segment,
         config,
@@ -1507,7 +1847,7 @@ def _benchmark_job(job: dict[str, Any]) -> dict[str, Any]:
     )
     free_ratio = _gpu_free_ratio(gpu_id)
     started = time.monotonic()
-    positions, orientations, _ = _episode_payload(
+    positions, orientations, _, _ = _episode_payload(
         episode,
         segment,
         config,
@@ -1662,7 +2002,7 @@ def _process_episode(
         )
     )
     for segment_index, segment in enumerate(episode.segments):
-        positions, orientations, hands = _episode_payload(
+        positions, orientations, hands, metadata = _episode_payload(
             episode, segment, config, arrays=arrays
         )
         latent = _encode_teleop(
@@ -1674,48 +2014,80 @@ def _process_episode(
         )
         token = np.concatenate((latent, hands), axis=1).astype(np.float32, copy=False)
         stable_id = f"{episode.stable_base}__seg{segment_index:03d}"
-        if token.shape != (segment.end - segment.start, ACTION_DIM):
+        expected_frames = int(metadata["target_frames"])
+        if token.shape != (expected_frames, ACTION_DIM):
             raise ValueError(f"unexpected token shape for {stable_id}: {token.shape}")
         atomic_save_npy(staging / "sonic_tokens" / f"{stable_id}.npy", token)
-        rows.append(
-            {
-                "stable_id": stable_id,
-                "dataset": episode.dataset,
-                "source": episode.relative_source,
-                "source_episode": episode.stable_base,
-                "source_start_frame": segment.start,
-                "source_end_frame_exclusive": segment.end,
-                "source_frame_count": segment.end - segment.start,
-                "token_frame_count": len(token),
-                "source_hz": episode.source_hz,
-                "interpreted_hz": INTERPRETED_HZ,
-                "resampling": "none",
-                "frame_mapping": "one_source_frame_to_one_token",
-                "duration_scale": episode.source_hz / INTERPRETED_HZ,
-                "speed_multiplier": INTERPRETED_HZ / episode.source_hz,
-                "main_task": episode.main_task,
-                "encoder_mode": "teleop",
-                "lower_body_policy": "fixed_g1_standing",
-                "calibration_method": (
-                    "sonic_live_rigid_offset"
-                    if episode.dataset == "behavior1k"
-                    else "none"
-                ),
-                "calibration_start_frame": segment.calibration_start,
-                "calibration_end_frame_exclusive": segment.calibration_end,
-                "hand_state_method": (
-                    "r1pro_action_threshold"
-                    if episode.dataset == "behavior1k"
-                    else (
-                        "aria21_thumb_to_fingertips_absolute"
+        row: dict[str, Any] = {
+            "stable_id": stable_id,
+            "dataset": episode.dataset,
+            "source": episode.relative_source,
+            "source_episode": episode.stable_base,
+            "source_start_frame": segment.start,
+            "source_end_frame_exclusive": segment.end,
+            "source_frame_count": segment.end - segment.start,
+            "token_frame_count": len(token),
+            "source_hz": episode.source_hz,
+            "interpreted_hz": INTERPRETED_HZ,
+            "main_task": episode.main_task,
+            "encoder_mode": "teleop",
+            "lower_body_policy": "fixed_g1_standing",
+            "calibration_start_frame": segment.calibration_start,
+            "calibration_end_frame_exclusive": segment.calibration_end,
+            "left_closed_fraction": float(hands[:, 0].mean()),
+            "right_closed_fraction": float(hands[:, 1].mean()),
+        }
+        if episode.dataset == "egoverse":
+            row.update(
+                {
+                    "source_start_timestamp_ns": metadata[
+                        "source_start_timestamp_ns"
+                    ],
+                    "source_end_timestamp_ns": metadata["source_end_timestamp_ns"],
+                    "source_duration_seconds": metadata["source_duration_seconds"],
+                    "target_duration_seconds": metadata["target_duration_seconds"],
+                    "target_hz": metadata["target_hz"],
+                    "target_frames": expected_frames,
+                    "resampling": "position_linear_quaternion_slerp",
+                    "frame_mapping": "source_timestamp_to_50hz",
+                    "duration_scale": 1.0,
+                    "speed_multiplier": 1.0,
+                    "source_schema": (
+                        "aria_bimanual_legacy"
                         if config["allow_legacy_egoverse"]
-                        else "mano21_thumb_to_fingertips_absolute"
-                    )
-                ),
-                "left_closed_fraction": float(hands[:, 0].mean()),
-                "right_closed_fraction": float(hands[:, 1].mean()),
-            }
-        )
+                        else "human_bimanual"
+                    ),
+                    "calibration_method": "episode_stable_window_g1_reference_retargeting",
+                    "retarget_method": "per_episode_g1_reference_position_orientation",
+                    "hand_state_method": (
+                        "aria21_distance_linear_then_threshold"
+                        if config["allow_legacy_egoverse"]
+                        else "mano21_distance_linear_then_threshold"
+                    ),
+                    "max_wrist_speed_mps": metadata["max_wrist_speed_mps"],
+                    "max_wrist_angular_speed_deg_s": metadata[
+                        "max_wrist_angular_speed_deg_s"
+                    ],
+                    "max_source_wrist_head_reach_m": metadata[
+                        "max_source_wrist_head_reach_m"
+                    ],
+                    "max_retargeted_wrist_head_reach_m": metadata[
+                        "max_retargeted_wrist_head_reach_m"
+                    ],
+                }
+            )
+        else:
+            row.update(
+                {
+                    "resampling": "none",
+                    "frame_mapping": "one_source_frame_to_one_token",
+                    "duration_scale": episode.source_hz / INTERPRETED_HZ,
+                    "speed_multiplier": INTERPRETED_HZ / episode.source_hz,
+                    "calibration_method": "sonic_live_rigid_offset",
+                    "hand_state_method": "r1pro_action_threshold",
+                }
+            )
+        rows.append(row)
         if verify_chunking and chunk_error is None:
             check_frames = min(200, len(positions))
             whole = _encode_teleop(
@@ -2107,13 +2479,45 @@ def _validate_cache(root: Path, rows: list[dict[str, Any]]) -> None:
     for row in rows:
         path = root / "sonic_tokens" / f"{row['stable_id']}.npy"
         token = np.load(path, mmap_mode="r")
-        expected_frames = int(row["source_frame_count"])
+        expected_frames = int(row.get("target_frames", row["source_frame_count"]))
         if token.shape != (expected_frames, ACTION_DIM) or token.dtype != np.float32:
             raise ValueError(f"invalid token file {path}: {token.shape}/{token.dtype}")
         if not np.isfinite(token).all():
             raise ValueError(f"non-finite token values in {path}")
         if not np.isin(token[:, 64:66], (0.0, 1.0)).all():
             raise ValueError(f"non-binary hand state in {path}")
+        if "target_frames" in row:
+            required = (
+                "source_start_timestamp_ns",
+                "source_end_timestamp_ns",
+                "source_duration_seconds",
+                "target_duration_seconds",
+                "target_hz",
+                "calibration_start_frame",
+                "calibration_end_frame_exclusive",
+            )
+            missing = [key for key in required if row.get(key) is None]
+            if missing:
+                raise ValueError(f"{row['stable_id']} lacks metadata: {missing}")
+            if int(row["source_start_timestamp_ns"]) >= int(
+                row["source_end_timestamp_ns"]
+            ):
+                raise ValueError(f"invalid timestamp span for {row['stable_id']}")
+            duration_error = abs(
+                float(row["source_duration_seconds"])
+                - float(row["target_duration_seconds"])
+            )
+            if duration_error > 1.0 / float(row["target_hz"]):
+                raise ValueError(
+                    f"duration mismatch for {row['stable_id']}: {duration_error}"
+                )
+
+
+def _preflight_target_frames(preflight: Preflight) -> int:
+    return sum(
+        int(episode.stats.get("target_frames", episode.valid_frames))
+        for episode in preflight.episodes
+    )
 
 
 def _validate_roots(data_root: Path, cache_root: Path, *, pilot: bool) -> None:
@@ -2167,11 +2571,7 @@ def convert(
         )
     else:
         estimated_token_bytes = (
-            sum(
-                segment.end - segment.start
-                for episode in preflight.episodes
-                for segment in episode.segments
-            )
+            _preflight_target_frames(preflight)
             * ACTION_DIM
             * np.dtype(np.float32).itemsize
         )
@@ -2221,7 +2621,7 @@ def convert(
                 config=config,
             )
         estimated_token_bytes = (
-            sum(episode.valid_frames for episode in preflight.episodes)
+            _preflight_target_frames(preflight)
             * ACTION_DIM
             * np.dtype(np.float32).itemsize
         )
@@ -2332,6 +2732,49 @@ def convert(
                 },
             },
         }
+        if args.dataset == "egoverse":
+            schema["source_schema"] = (
+                "aria_bimanual_legacy"
+                if args.allow_legacy_egoverse
+                else "human_bimanual"
+            )
+            schema["source_calibration"]["egoverse"] = {
+                "method": "episode_stable_window_g1_reference_retargeting",
+                "window_frames": args.egoverse_calibration_frames,
+                "max_position_delta_m": (
+                    args.egoverse_calibration_max_position_delta
+                ),
+                "max_angle_delta_degrees": (
+                    args.egoverse_calibration_max_angle_degrees
+                ),
+                "max_wrist_speed_mps": args.egoverse_max_wrist_speed,
+                "max_wrist_angular_speed_deg_s": (
+                    args.egoverse_max_wrist_angular_speed
+                ),
+                "max_wrist_head_reach_m": args.egoverse_max_wrist_head_reach,
+                "min_duration_seconds": args.egoverse_min_duration_seconds,
+                "position_reference": "wrist_tracking_relative_to_head_tracking",
+                "position_scale": "per_episode_g1_to_source_calibration_reach_ratio",
+                "g1_wrist_reference_positions": G1_WRIST_REFERENCE_POSITIONS.tolist(),
+                "g1_wrist_reference_orientations_wxyz": (
+                    G1_WRIST_REFERENCE_ORIENTATIONS.tolist()
+                ),
+                "torso_link_offset_z": TORSO_LINK_OFFSET_Z,
+            }
+            schema["frequency"] = {
+                "source_hz": "per_episode_rgb_timestamps",
+                "target_hz": args.egoverse_target_hz,
+                "interpreted_hz": args.egoverse_target_hz,
+                "resampling": "position_linear_quaternion_slerp",
+                "hand_resampling": "distance_linear_then_threshold",
+                "frame_mapping": "source_timestamp_to_50hz",
+                "duration_scale": 1.0,
+                "speed_multiplier": 1.0,
+            }
+            schema["stage1_image_mapping"] = (
+                "nearest_obs_rgb_timestamp_tie_earlier"
+            )
+
         language_map = {
             str(row["stable_id"]): str(row["main_task"]) for row in rows
         }
@@ -2374,8 +2817,35 @@ def convert(
                 "excluded_scanned_episodes": len(preflight.exclusions),
                 "segments": len(rows),
                 "source_frames": sum(int(row["source_frame_count"]) for row in rows),
+                "target_frames": sum(int(row["token_frame_count"]) for row in rows),
                 "token_frames": sum(int(row["token_frame_count"]) for row in rows),
             },
+            "duration_preservation": {
+                "max_abs_error_seconds": (
+                    max(
+                        abs(
+                            float(row.get("source_duration_seconds", 0.0))
+                            - float(row.get("target_duration_seconds", 0.0))
+                        )
+                        for row in rows
+                    )
+                    if args.dataset == "egoverse"
+                    else None
+                ),
+                "target_hz": (
+                    args.egoverse_target_hz
+                    if args.dataset == "egoverse"
+                    else None
+                ),
+            },
+            "exclusion_reason_histogram": dict(
+                sorted(
+                    Counter(
+                        item.get("reason_code", "source_metadata_or_schema")
+                        for item in preflight.exclusions
+                    ).items()
+                )
+            ),
             "exclusions": list(preflight.exclusions),
         }
         _atomic_write_json(staging / "meta/conversion_manifest.json", manifest)
@@ -2398,7 +2868,11 @@ def _ensure_cuda_library_path() -> None:
     nvidia_root = Path(sys.prefix) / "lib" / python_version / "site-packages/nvidia"
     preferred = [
         str(path.resolve())
-        for path in (nvidia_root / "cudnn/lib", nvidia_root / "cublas/lib")
+        for path in (
+            nvidia_root / "nvjitlink/lib",
+            nvidia_root / "cudnn/lib",
+            nvidia_root / "cublas/lib",
+        )
         if path.is_dir()
     ]
     current = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
@@ -2445,6 +2919,44 @@ def _self_check(model_path: Path) -> None:
     )
     assert timestamp_segments == (Segment(0, 3), Segment(3, 5))
 
+    explicit_break_segments = _segment_ranges(
+        np.ones(5, dtype=bool),
+        np.arange(5, dtype=np.float64) / 30.0,
+        min_source_frames=2,
+        max_gap_factor=2.0,
+        break_after=np.asarray([False, True, False, False]),
+    )
+    assert explicit_break_segments == (Segment(0, 2), Segment(2, 5))
+
+    source_seconds = np.asarray([0.0, 0.033, 0.068, 0.1], dtype=np.float64)
+    target_seconds = fixed_hz_target_seconds(source_seconds, INTERPRETED_HZ)
+    assert np.allclose(target_seconds, [0.0, 0.02, 0.04, 0.06, 0.08, 0.1])
+    values = source_seconds[:, None]
+    assert np.allclose(
+        resample_linear_at_times(values, source_seconds, target_seconds)[:, 0],
+        target_seconds,
+    )
+    start_quaternion = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    end_quaternion = Rotation.from_euler("z", 90, degrees=True).as_quat(
+        scalar_first=True
+    )
+    quaternion_pair = np.stack((start_quaternion, -end_quaternion))
+    quaternion_batch = np.repeat(quaternion_pair[:, None, :], 3, axis=1)
+    quaternion_target = fixed_hz_target_seconds(
+        np.asarray([0.0, 0.04]), INTERPRETED_HZ
+    )
+    resampled_quaternions = resample_quat_wxyz_at_times(
+        quaternion_batch,
+        np.asarray([0.0, 0.04]),
+        quaternion_target,
+    )
+    assert resampled_quaternions.shape == (3, 3, 4)
+    assert np.allclose(np.linalg.norm(resampled_quaternions, axis=-1), 1.0)
+    middle_angle = Rotation.from_quat(
+        resampled_quaternions[1, 0], scalar_first=True
+    ).as_euler("xyz", degrees=True)[2]
+    assert np.isclose(middle_angle, 45.0)
+
     source_pose = np.zeros((4, 3, 7), dtype=np.float32)
     source_pose[:, :, :3] = np.asarray(
         [[0.7, 0.4, 0.8], [0.7, -0.4, 0.8], [0.0, 0.0, 1.0]],
@@ -2456,7 +2968,7 @@ def _self_check(model_path: Path) -> None:
     source_pose[:, :, 3:7] = source_orientation[[1, 2, 3, 0]]
     source_pose[-1, :, :3] += [0.2, -0.1, 0.3]
     bad_prefixed_pose = np.concatenate((np.zeros_like(source_pose[:1]), source_pose))
-    calibration_segment = _behavior_calibration_segment(
+    calibration_segment = _stable_calibration_segment(
         bad_prefixed_pose,
         Segment(1, 5),
         frames=3,
@@ -2531,7 +3043,7 @@ def _self_check(model_path: Path) -> None:
     assert whole.shape == (2, LATENT_DIM)
     assert np.allclose(whole, chunked, rtol=1e-5, atol=1e-6)
     print(
-        "self-check passed: EgoVerse snapshot/timestamp gates, head-relative retargeting, "
+        "self-check passed: EgoVerse snapshot/timestamp/50 Hz SLERP gates, G1 retargeting, "
         "teleop layout [2,1762], encoder output [2,64], chunk equality"
     )
 
@@ -2605,6 +3117,44 @@ def _add_dataset_parser(subparsers: Any, dataset: str) -> None:
         default=DEFAULT_BEHAVIOR_MAX_WRIST_HEAD_REACH,
     )
     parser.add_argument("--egoverse-hand-distance-threshold", type=float, default=0.045)
+    parser.add_argument(
+        "--egoverse-min-duration-seconds",
+        type=float,
+        default=DEFAULT_EGOVERSE_MIN_DURATION_SECONDS,
+    )
+    parser.add_argument(
+        "--egoverse-calibration-frames",
+        type=int,
+        default=DEFAULT_EGOVERSE_CALIBRATION_FRAMES,
+    )
+    parser.add_argument(
+        "--egoverse-calibration-max-position-delta",
+        type=float,
+        default=DEFAULT_EGOVERSE_CALIBRATION_MAX_POSITION_DELTA,
+    )
+    parser.add_argument(
+        "--egoverse-calibration-max-angle-degrees",
+        type=float,
+        default=DEFAULT_EGOVERSE_CALIBRATION_MAX_ANGLE_DEGREES,
+    )
+    parser.add_argument(
+        "--egoverse-max-wrist-speed",
+        type=float,
+        default=DEFAULT_EGOVERSE_MAX_WRIST_SPEED,
+    )
+    parser.add_argument(
+        "--egoverse-max-wrist-angular-speed",
+        type=float,
+        default=DEFAULT_EGOVERSE_MAX_WRIST_ANGULAR_SPEED,
+    )
+    parser.add_argument(
+        "--egoverse-max-wrist-head-reach",
+        type=float,
+        default=DEFAULT_EGOVERSE_MAX_WRIST_HEAD_REACH,
+    )
+    parser.add_argument(
+        "--egoverse-target-hz", type=float, default=INTERPRETED_HZ
+    )
     parser.add_argument("--allow-legacy-egoverse", action="store_true")
 
 
@@ -2657,6 +3207,28 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--behavior-max-wrist-head-reach must be positive")
     if args.egoverse_hand_distance_threshold <= 0:
         raise ValueError("--egoverse-hand-distance-threshold must be positive")
+    if args.egoverse_min_duration_seconds <= 0:
+        raise ValueError("--egoverse-min-duration-seconds must be positive")
+    if args.egoverse_calibration_frames < 2:
+        raise ValueError("--egoverse-calibration-frames must be >= 2")
+    if args.egoverse_calibration_max_position_delta <= 0:
+        raise ValueError(
+            "--egoverse-calibration-max-position-delta must be positive"
+        )
+    if args.egoverse_calibration_max_angle_degrees <= 0:
+        raise ValueError(
+            "--egoverse-calibration-max-angle-degrees must be positive"
+        )
+    if args.egoverse_max_wrist_speed <= 0:
+        raise ValueError("--egoverse-max-wrist-speed must be positive")
+    if args.egoverse_max_wrist_angular_speed <= 0:
+        raise ValueError("--egoverse-max-wrist-angular-speed must be positive")
+    if args.egoverse_max_wrist_head_reach <= 0:
+        raise ValueError("--egoverse-max-wrist-head-reach must be positive")
+    if args.egoverse_target_hz != INTERPRETED_HZ:
+        raise ValueError(
+            f"--egoverse-target-hz must remain the SONIC control rate {INTERPRETED_HZ}"
+        )
     if (args.pilot or args.publish_full) and not args.confirm_source_schema:
         raise ValueError(
             "pilot/full conversion requires --confirm-source-schema after visual schema review"
@@ -2682,6 +3254,20 @@ def _conversion_config(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "behavior_max_wrist_head_reach": args.behavior_max_wrist_head_reach,
         "egoverse_hand_distance_threshold": args.egoverse_hand_distance_threshold,
+        "egoverse_min_duration_seconds": args.egoverse_min_duration_seconds,
+        "egoverse_calibration_frames": args.egoverse_calibration_frames,
+        "egoverse_calibration_max_position_delta": (
+            args.egoverse_calibration_max_position_delta
+        ),
+        "egoverse_calibration_max_angle_degrees": (
+            args.egoverse_calibration_max_angle_degrees
+        ),
+        "egoverse_max_wrist_speed": args.egoverse_max_wrist_speed,
+        "egoverse_max_wrist_angular_speed": (
+            args.egoverse_max_wrist_angular_speed
+        ),
+        "egoverse_max_wrist_head_reach": args.egoverse_max_wrist_head_reach,
+        "egoverse_target_hz": args.egoverse_target_hz,
         "allow_legacy_egoverse": args.allow_legacy_egoverse,
     }
 
@@ -2691,23 +3277,47 @@ def _preflight_summary(
     *,
     execution: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "eligible_episodes": len(result.episodes),
-        "excluded_scanned_episodes": len(result.exclusions),
-        "segments": sum(len(episode.segments) for episode in result.episodes),
-        "valid_source_frames": sum(episode.valid_frames for episode in result.episodes),
-        "estimated_token_bytes": sum(episode.valid_frames for episode in result.episodes)
-        * ACTION_DIM
-        * np.dtype(np.float32).itemsize,
-        "inventory_fingerprint": result.inventory_fingerprint,
-        "frequency_contract": {
+    dataset = result.episodes[0].dataset
+    target_frames = _preflight_target_frames(result)
+    frequency_contract = (
+        {
+            "source_hz": "per_episode_rgb_timestamps",
+            "target_hz": INTERPRETED_HZ,
+            "resampling": "position_linear_quaternion_slerp",
+            "hand_resampling": "distance_linear_then_threshold",
+            "frame_mapping": "source_timestamp_to_50hz",
+            "duration_scale": 1.0,
+            "speed_multiplier": 1.0,
+        }
+        if dataset == "egoverse"
+        else {
             "source_hz": SOURCE_HZ,
             "interpreted_hz": INTERPRETED_HZ,
             "resampling": "none",
             "frame_mapping": "one_source_frame_to_one_token",
             "duration_scale": SOURCE_HZ / INTERPRETED_HZ,
             "speed_multiplier": INTERPRETED_HZ / SOURCE_HZ,
-        },
+        }
+    )
+    return {
+        "eligible_episodes": len(result.episodes),
+        "excluded_scanned_episodes": len(result.exclusions),
+        "segments": sum(len(episode.segments) for episode in result.episodes),
+        "valid_source_frames": sum(episode.valid_frames for episode in result.episodes),
+        "estimated_target_frames": target_frames,
+        "estimated_token_bytes": (
+            target_frames * ACTION_DIM * np.dtype(np.float32).itemsize
+        ),
+        "inventory_fingerprint": result.inventory_fingerprint,
+        "frequency_contract": frequency_contract,
+        "exclusion_reason_histogram": dict(
+            sorted(
+                Counter(
+                    item.get("reason_code", "source_metadata_or_schema")
+                    for item in result.exclusions
+                ).items()
+            )
+        ),
         "execution": execution,
         "episodes": [
             {
@@ -2715,7 +3325,18 @@ def _preflight_summary(
                 "source_frames": episode.source_frames,
                 "source_hz": episode.source_hz,
                 "valid_frames": episode.valid_frames,
-                "segments": [[segment.start, segment.end] for segment in episode.segments],
+                "target_frames": int(
+                    episode.stats.get("target_frames", episode.valid_frames)
+                ),
+                "segments": [
+                    [
+                        segment.start,
+                        segment.end,
+                        segment.calibration_start,
+                        segment.calibration_end,
+                    ]
+                    for segment in episode.segments
+                ],
                 "main_task": episode.main_task,
                 "stats": episode.stats,
             }
@@ -2723,7 +3344,6 @@ def _preflight_summary(
         ],
         "exclusions": list(result.exclusions),
     }
-
 
 def main() -> None:
     args = parse_args()
@@ -2790,6 +3410,18 @@ def main() -> None:
             min_source_frames=args.min_source_frames,
             max_gap_factor=args.max_timestamp_gap_factor,
             allow_legacy=args.allow_legacy_egoverse,
+            min_duration_seconds=args.egoverse_min_duration_seconds,
+            calibration_frames=args.egoverse_calibration_frames,
+            calibration_max_position_delta=(
+                args.egoverse_calibration_max_position_delta
+            ),
+            calibration_max_angle_degrees=(
+                args.egoverse_calibration_max_angle_degrees
+            ),
+            canonical_head_z=args.canonical_head_z,
+            max_wrist_speed=args.egoverse_max_wrist_speed,
+            max_wrist_angular_speed=args.egoverse_max_wrist_angular_speed,
+            max_wrist_head_reach=args.egoverse_max_wrist_head_reach,
         )
     else:
         preflight = _preflight_agibot(

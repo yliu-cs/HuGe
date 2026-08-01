@@ -2635,6 +2635,19 @@ def _train_stage_impl(
                             batch["normalized_actions"],
                             sonic_mask=batch["sonic_mask"],
                         )
+                    loss_is_nonfinite = (~torch.isfinite(losses["loss"].detach())).to(torch.int32)
+                    loss_is_nonfinite = accelerator.reduce(loss_is_nonfinite, reduction="sum")
+                    if bool(loss_is_nonfinite.item()):
+                        sources, identity_sha256, batch_sha256 = _batch_trace(batch)
+                        _log_rank(
+                            accelerator,
+                            (
+                                f"[{args.stage}] non-finite loss: epoch={epoch} batch={batch_index} "
+                                f"sources={sources} identity_sha256={identity_sha256} "
+                                f"batch_sha256={batch_sha256}"
+                            ),
+                        )
+                        raise FloatingPointError("non-finite training loss")
                     if scaler.is_enabled():
                         scaler.scale(losses["loss"]).backward()
                         scaler.unscale_(optimizer)
@@ -2649,24 +2662,16 @@ def _train_stage_impl(
                     update_skipped = bool(accelerator.optimizer_step_was_skipped)
                     if update_skipped:
                         progress.skipped_updates += 1
-                        _log_main(
+                        sources, identity_sha256, batch_sha256 = _batch_trace(batch)
+                        _log_rank(
                             accelerator,
                             (
-                                f"[{args.stage}] optimizer update skipped: attempted={progress.attempted_batches} "
-                                f"successful={progress.global_step} skipped={progress.skipped_updates}"
+                                f"[{args.stage}] non-finite gradients: epoch={epoch} batch={batch_index} "
+                                f"sources={sources} identity_sha256={identity_sha256} "
+                                f"batch_sha256={batch_sha256}"
                             ),
                         )
-                        if epoch_completed:
-                            progress.epoch = epoch + 1
-                            progress.batches_consumed_in_epoch = 0
-                            if args.save_epoch_checkpoints and progress.global_step > 0:
-                                save_coordinator.request(
-                                    progress,
-                                    reasons=["epoch"],
-                                    portable=True,
-                                    resume=True,
-                                )
-                        continue
+                        raise FloatingPointError("optimizer skipped a non-finite gradient update")
 
                     lr_scheduler.step()
                     progress.global_step += 1

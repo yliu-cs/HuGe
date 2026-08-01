@@ -198,6 +198,23 @@ PYTHONPATH=src .venv/bin/python \
   --resume
 ```
 
+Dataset-neutral planner trajectory preflight (the `.npz` arrays are `mode`,
+`movement`, `facing`, `speed`, `height`, `vr_position`, `vr_orientation`, and
+`hand_state`):
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/calc_proprio/run.py \
+  --planner-trajectory /path/to/planner_trajectory.npz \
+  --token-output /path/to/action_66d.npy \
+  --proprio-output /path/to/proprio_34d.npy \
+  --validate-only
+```
+
+Live planner mode remains in planner control, uses local SONIC encoder mode 1,
+and exports the 66-D action and 34-D proprio from the same contiguous
+`g1_debug` ticks. It rejects missing/duplicate ticks and does not edge-fill.
+
 Live directory mode automatically starts one worker per visible GPU. It honors
 `CUDA_VISIBLE_DEVICES` order; `--workers N` limits the run to the first `N`
 visible devices and never starts multiple workers on one GPU. Worker `i` uses
@@ -249,6 +266,44 @@ PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
   --output-root resource/datasets/xperience-10m-cache/g1_proprio \
   --token-glob '*.npy' --resume
 ```
+
+The BEHAVIOR command-aware rebuild has a dedicated adapter; the default command
+is read-only and does not start a GPU runtime:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/teleop/calc_behavior1k_planner.py --preflight-only
+
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/teleop/calc_behavior1k_planner.py \
+  --pilot --confirm-source-schema
+
+PYTHONPATH=src .venv/bin/python \
+  scripts/preprocess/teleop/calc_behavior1k_planner.py \
+  --publish-full --confirm-source-schema
+```
+
+Pilot mode uses representative locomotion/trunk episodes and publishes to a
+unique `/tmp` cache unless `--cache-root` is explicit. Full mode scans every
+controller config, uses one worker per visible GPU, and atomically publishes:
+
+```text
+resource/datasets/behavior-1k-2025-challenge-planner-cache/
+  _SUCCESS
+  sonic_tokens/          # paired [T,66]
+  g1_proprio/            # paired [T,34] plus per-segment reports
+  meta/                  # schema, index, language, stats, manifest, execution report
+```
+
+One 30 Hz source frame remains one 50 Hz control row; base speed and yaw are
+scaled by `50/30`. Movement direction and facing are world-frame unit vectors.
+Stationary low-height rows use planner squat mode; when locomotion and low
+height coincide, locomotion takes precedence and the conflict count is recorded
+for pilot review. The current fixed-standing
+`behavior-1k-2025-challenge-cache` is never overwritten. Training does not
+switch to the planner cache automatically; pass the new root explicitly only
+after pilot/full validation. An interrupted staging cache is retained and can
+be continued with the same command plus `--resume`.
 
 Publishing these arrays into a Stage 1 Dataset remains a separate task.
 

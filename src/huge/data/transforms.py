@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 from scipy.spatial.transform import Rotation as Rotation
+from scipy.spatial.transform import Slerp
 
 
 def atomic_save_npy(path: str | Path, array: np.ndarray) -> None:
@@ -67,6 +68,79 @@ def resample_quat_wxyz(quat_wxyz: np.ndarray, source_fps: float, target_fps: flo
         if np.dot(aligned[i - 1], aligned[i]) < 0.0:
             aligned[i] *= -1.0
     return _normalize_quat_wxyz(resample_linear(aligned, source_fps, target_fps)).astype(np.float32)
+
+
+def fixed_hz_target_seconds(source_seconds: np.ndarray, target_hz: float) -> np.ndarray:
+    """Build Xperience-compatible target times over a timestamp span."""
+    source = np.asarray(source_seconds, dtype=np.float64)
+    if (
+        source.ndim != 1
+        or len(source) < 2
+        or not np.isfinite(source).all()
+        or not np.isclose(source[0], 0.0, atol=1e-9)
+        or np.any(np.diff(source) <= 0)
+    ):
+        raise ValueError("source_seconds must be finite, strictly increasing, and start at zero")
+    if not np.isfinite(target_hz) or target_hz <= 0:
+        raise ValueError("target_hz must be positive and finite")
+    duration = float(source[-1])
+    step = 1.0 / target_hz
+    target = np.arange(0.0, duration + step * 0.5, step, dtype=np.float64)
+    target[-1] = min(target[-1], duration)
+    return target
+
+
+def resample_linear_at_times(
+    values: np.ndarray,
+    source_seconds: np.ndarray,
+    target_seconds: np.ndarray,
+) -> np.ndarray:
+    """Linearly interpolate arrays along axis 0 using explicit timestamps."""
+    source = np.asarray(source_seconds, dtype=np.float64)
+    target = np.asarray(target_seconds, dtype=np.float64)
+    array = np.asarray(values, dtype=np.float64)
+    if len(array) != len(source):
+        raise ValueError(f"values/source length mismatch: {len(array)} != {len(source)}")
+    if (
+        target.ndim != 1
+        or not len(target)
+        or not np.isfinite(target).all()
+        or np.any(np.diff(target) <= 0)
+        or target[0] < source[0]
+        or target[-1] > source[-1]
+    ):
+        raise ValueError("target_seconds must be finite, increasing, and inside source_seconds")
+    flat = array.reshape(len(array), -1)
+    result = np.empty((len(target), flat.shape[1]), dtype=np.float64)
+    for column in range(flat.shape[1]):
+        result[:, column] = np.interp(target, source, flat[:, column])
+    return result.reshape((len(target), *array.shape[1:])).astype(np.float32)
+
+
+def resample_quat_wxyz_at_times(
+    quaternions_wxyz: np.ndarray,
+    source_seconds: np.ndarray,
+    target_seconds: np.ndarray,
+) -> np.ndarray:
+    """SLERP WXYZ quaternions shaped ``[T,...,4]`` at explicit timestamps."""
+    source = np.asarray(source_seconds, dtype=np.float64)
+    target = np.asarray(target_seconds, dtype=np.float64)
+    quaternions = np.asarray(quaternions_wxyz, dtype=np.float64)
+    if quaternions.ndim < 2 or quaternions.shape[-1] != 4:
+        raise ValueError(f"quaternions_wxyz must be [T,...,4], got {quaternions.shape}")
+    if len(quaternions) != len(source):
+        raise ValueError(
+            f"quaternion/source length mismatch: {len(quaternions)} != {len(source)}"
+        )
+    norms = np.linalg.norm(quaternions, axis=-1, keepdims=True)
+    if np.any(norms < 1e-8):
+        raise ValueError("zero quaternion in a preflight-approved segment")
+    flat = (quaternions / norms).reshape(len(quaternions), -1, 4)
+    result = np.empty((len(target), flat.shape[1], 4), dtype=np.float32)
+    for item in range(flat.shape[1]):
+        rotations = Rotation.from_quat(flat[:, item], scalar_first=True)
+        result[:, item] = Slerp(source, rotations)(target).as_quat(scalar_first=True)
+    return result.reshape((len(target), *quaternions.shape[1:]))
 
 
 def projected_gravity_from_quat_wxyz(quat_wxyz: np.ndarray) -> np.ndarray:

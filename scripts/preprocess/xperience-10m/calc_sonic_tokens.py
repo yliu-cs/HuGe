@@ -25,7 +25,7 @@ from typing import Any
 
 import h5py
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.spatial.transform import Rotation
 
 # GR00T is a read-only local dependency; never leave import bytecode in it.
 sys.dont_write_bytecode = True
@@ -38,6 +38,11 @@ from gear_sonic.scripts.sonic_v3_to_latent import (
 )
 from gear_sonic.scripts.trackingdata_to_sonic_npz import _compute_wrist_joint_positions
 from huge.data.preprocess import atomic_save_npy
+from huge.data.transforms import (
+    fixed_hz_target_seconds,
+    resample_linear_at_times,
+    resample_quat_wxyz_at_times,
+)
 
 
 DEFAULT_DATA_ROOT = Path("resource/datasets/xperience-10m")
@@ -311,55 +316,6 @@ def preflight(
     )
 
 
-def _target_seconds(source_seconds: np.ndarray, target_hz: float) -> np.ndarray:
-    duration = float(source_seconds[-1])
-    step = 1.0 / target_hz
-    target = np.arange(0.0, duration + step * 0.5, step, dtype=np.float64)
-    target[-1] = min(target[-1], duration)
-    return target
-
-
-def _linear_resample(
-    values: np.ndarray,
-    source_seconds: np.ndarray,
-    target_seconds: np.ndarray,
-) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    flat = values.reshape(len(values), -1)
-    result = np.empty((len(target_seconds), flat.shape[1]), dtype=np.float64)
-    for column in range(flat.shape[1]):
-        result[:, column] = np.interp(target_seconds, source_seconds, flat[:, column])
-    return result.reshape((len(target_seconds), *values.shape[1:])).astype(np.float32)
-
-
-def _normalize_quaternions(quaternions: np.ndarray) -> np.ndarray:
-    quaternions = np.asarray(quaternions, dtype=np.float64)
-    norms = np.linalg.norm(quaternions, axis=-1, keepdims=True)
-    if np.any(norms < 1e-8):
-        raise ValueError("zero quaternion in a preflight-approved segment")
-    return quaternions / norms
-
-
-def _slerp_resample(
-    quaternions_wxyz: np.ndarray,
-    source_seconds: np.ndarray,
-    target_seconds: np.ndarray,
-) -> np.ndarray:
-    quaternions = _normalize_quaternions(quaternions_wxyz)
-    if quaternions.ndim == 2:
-        quaternions = quaternions[:, None, :]
-        squeeze = True
-    else:
-        squeeze = False
-    result = np.empty((len(target_seconds), quaternions.shape[1], 4), dtype=np.float32)
-    for joint in range(quaternions.shape[1]):
-        rotations = Rotation.from_quat(quaternions[:, joint], scalar_first=True)
-        result[:, joint] = Slerp(source_seconds, rotations)(target_seconds).as_quat(
-            scalar_first=True
-        )
-    return result[:, 0] if squeeze else result
-
-
 def _hand_distance(hand: np.ndarray) -> np.ndarray:
     tips = hand[:, LEFT_MANO_TIPS]
     return np.min(np.linalg.norm(tips[:, :1] - tips[:, 1:], axis=-1), axis=1)
@@ -375,28 +331,28 @@ def _segment_payload(
     selection = slice(segment.start, segment.end)
     timestamps = arrays["timestamps_ns"][selection]
     source_seconds = (timestamps - timestamps[0]).astype(np.float64) * 1e-9
-    target_seconds = _target_seconds(source_seconds, target_hz)
+    target_seconds = fixed_hz_target_seconds(source_seconds, target_hz)
 
     root = arrays["root"][selection]
     keypoints = arrays["keypoints"][selection][:, SOURCE_BODY_JOINTS]
     centered = keypoints - root[:, None, 4:7]
     inverse_root = Rotation.from_quat(root[:, :4], scalar_first=True).inv().as_matrix()
     smpl_joints = np.einsum("tij,tkj->tki", inverse_root, centered)
-    smpl_joints = _linear_resample(smpl_joints, source_seconds, target_seconds)
+    smpl_joints = resample_linear_at_times(smpl_joints, source_seconds, target_seconds)
 
-    body_quats = _slerp_resample(
+    body_quats = resample_quat_wxyz_at_times(
         arrays["body_quats"][selection], source_seconds, target_seconds
     )
     smpl_pose = Rotation.from_quat(
         body_quats.reshape(-1, 4), scalar_first=True
     ).as_rotvec().reshape(len(target_seconds), 21, 3).astype(np.float32)
     joint_pos = _compute_wrist_joint_positions(smpl_pose)
-    body_quat_w = _slerp_resample(root[:, :4], source_seconds, target_seconds)
+    body_quat_w = resample_quat_wxyz_at_times(root[:, :4], source_seconds, target_seconds)
 
-    left_distance = _linear_resample(
+    left_distance = resample_linear_at_times(
         _hand_distance(arrays["left_hand"][selection]), source_seconds, target_seconds
     ).reshape(-1)
-    right_distance = _linear_resample(
+    right_distance = resample_linear_at_times(
         _hand_distance(arrays["right_hand"][selection]), source_seconds, target_seconds
     ).reshape(-1)
     left_state = (left_distance <= hand_distance_threshold).astype(np.float32)
@@ -526,7 +482,11 @@ def _ensure_cuda_library_path() -> None:
     nvidia_root = Path(sys.prefix) / "lib" / python_version / "site-packages/nvidia"
     preferred = [
         str(path.resolve())
-        for path in (nvidia_root / "cudnn/lib", nvidia_root / "cublas/lib")
+        for path in (
+            nvidia_root / "nvjitlink/lib",
+            nvidia_root / "cudnn/lib",
+            nvidia_root / "cublas/lib",
+        )
         if path.is_dir()
     ]
     current = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]

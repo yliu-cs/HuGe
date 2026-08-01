@@ -25,7 +25,7 @@ from typing import Any, Iterator, TextIO
 
 import numpy as np
 
-from align_sim_replay import align_frames_to_tokens, build_aligned_arrays, capture_g1_debug_frames
+from align_sim_replay import ALIGN_FIELDS, align_frames_to_tokens, build_aligned_arrays, capture_g1_debug_frames
 from export_pseudo_proprio import apply_hand_state, build_pseudo_proprio, self_check
 from huge.data.schemas import ACTION_DIM, MOTION_TOKEN_DIM, validate_action_array
 
@@ -52,6 +52,9 @@ CONTROL_HZ = 50.0
 DEFAULT_ZMQ_PORT_BASE = 5556
 MAX_DDS_DOMAIN = 232
 DEPLOY_INIT_PATTERN = re.compile(r"Init Done")
+TELEOP_MODE_PATTERN = re.compile(
+    r"(?:\[Mode Filter\] Switched to mode .*\(ID=1\)|VR 3-point control enabled)"
+)
 SIM_STARTUP_MARGIN = 3.0
 PROCESS_STOP_TIMEOUT = 10.0
 CAPTURE_RECV_TIMEOUT_MS = 250
@@ -65,6 +68,32 @@ SUCCESS_LOGS = ("sim.log", "deploy.log", "player.log", "motion_tokens.npy")
 class Job:
     token: Path
     output: Path
+    episode_id: str
+
+
+@dataclass(frozen=True)
+class PlannerTrajectory:
+    """Dataset-neutral per-control-tick planner and VR inputs."""
+
+    mode: np.ndarray
+    movement: np.ndarray
+    facing: np.ndarray
+    speed: np.ndarray
+    height: np.ndarray
+    vr_position: np.ndarray
+    vr_orientation: np.ndarray
+    hand_state: np.ndarray
+
+    @property
+    def rows(self) -> int:
+        return int(self.mode.shape[0])
+
+
+@dataclass(frozen=True)
+class PlannerJob:
+    trajectory_source: Path | None
+    token_output: Path
+    proprio_output: Path
     episode_id: str
 
 
@@ -123,6 +152,103 @@ def atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
     with temporary.open("wb") as stream:
         np.savez(stream, **arrays)
     os.replace(temporary, path)
+
+
+def planner_report_path(job: PlannerJob) -> Path:
+    return report_path(job.proprio_output)
+
+
+def validate_planner_trajectory(trajectory: PlannerTrajectory) -> dict[str, Any]:
+    arrays = {
+        "mode": (trajectory.mode, (trajectory.rows,)),
+        "movement": (trajectory.movement, (trajectory.rows, 3)),
+        "facing": (trajectory.facing, (trajectory.rows, 3)),
+        "speed": (trajectory.speed, (trajectory.rows,)),
+        "height": (trajectory.height, (trajectory.rows,)),
+        "vr_position": (trajectory.vr_position, (trajectory.rows, 9)),
+        "vr_orientation": (trajectory.vr_orientation, (trajectory.rows, 12)),
+        "hand_state": (trajectory.hand_state, (trajectory.rows, 2)),
+    }
+    if trajectory.rows <= 0:
+        raise ValueError("planner trajectory must contain at least one row")
+    for name, (value, shape) in arrays.items():
+        if value.shape != shape:
+            raise ValueError(f"planner {name} shape {value.shape} != {shape}")
+        if not np.isfinite(value).all():
+            raise ValueError(f"planner {name} contains NaN or Inf")
+    rounded_mode = np.rint(trajectory.mode)
+    if not np.array_equal(trajectory.mode, rounded_mode) or np.any((rounded_mode < 0) | (rounded_mode > 26)):
+        raise ValueError("planner mode must contain integer locomotion modes in [0,26]")
+    movement_norm = np.linalg.norm(trajectory.movement, axis=1)
+    moving = movement_norm > 1e-6
+    if np.any(np.abs(movement_norm[moving] - 1.0) > 1e-3):
+        raise ValueError("non-zero planner movement rows must be unit vectors")
+    facing_norm = np.linalg.norm(trajectory.facing, axis=1)
+    if np.any(np.abs(facing_norm - 1.0) > 1e-3):
+        raise ValueError("planner facing rows must be unit vectors")
+    if np.any((trajectory.speed < 0.0) & (trajectory.speed != -1.0)):
+        raise ValueError("planner speed must be -1 or non-negative")
+    if np.any((trajectory.height < 0.0) & (trajectory.height != -1.0)):
+        raise ValueError("planner height must be -1 or non-negative")
+    orientations = trajectory.vr_orientation.reshape(trajectory.rows, 3, 4)
+    quaternion_error = float(np.max(np.abs(np.linalg.norm(orientations, axis=2) - 1.0)))
+    if quaternion_error > 1e-3:
+        raise ValueError(f"planner VR quaternion norm error {quaternion_error} exceeds 1e-3")
+    if not np.isin(trajectory.hand_state, (0.0, 1.0)).all():
+        raise ValueError("planner hand_state must contain only 0 or 1")
+    return {
+        "rows": trajectory.rows,
+        "movement_rows": int(moving.sum()),
+        "turning_rows": int(
+            (
+                np.abs(
+                    np.diff(
+                        np.unwrap(
+                            np.arctan2(trajectory.facing[:, 1], trajectory.facing[:, 0])
+                        ),
+                        prepend=0.0,
+                    )
+                )
+                > 1e-6
+            ).sum()
+        ),
+        "height_min": float(trajectory.height.min()),
+        "height_max": float(trajectory.height.max()),
+        "vr_quaternion_norm_max_err": quaternion_error,
+        "left_closed_fraction": float(trajectory.hand_state[:, 0].mean()),
+        "right_closed_fraction": float(trajectory.hand_state[:, 1].mean()),
+    }
+
+
+def load_planner_trajectory(path: Path) -> PlannerTrajectory:
+    if not path.is_file():
+        raise FileNotFoundError(f"planner trajectory does not exist: {path}")
+    required = (
+        "mode",
+        "movement",
+        "facing",
+        "speed",
+        "height",
+        "vr_position",
+        "vr_orientation",
+        "hand_state",
+    )
+    with np.load(path) as archive:
+        missing = [name for name in required if name not in archive]
+        if missing:
+            raise ValueError(f"planner trajectory is missing arrays: {missing}")
+        trajectory = PlannerTrajectory(
+            mode=np.asarray(archive["mode"], dtype=np.float32),
+            movement=np.asarray(archive["movement"], dtype=np.float32),
+            facing=np.asarray(archive["facing"], dtype=np.float32),
+            speed=np.asarray(archive["speed"], dtype=np.float32),
+            height=np.asarray(archive["height"], dtype=np.float32),
+            vr_position=np.asarray(archive["vr_position"], dtype=np.float32),
+            vr_orientation=np.asarray(archive["vr_orientation"], dtype=np.float32),
+            hand_state=np.asarray(archive["hand_state"], dtype=np.float32),
+        )
+    validate_planner_trajectory(trajectory)
+    return trajectory
 
 
 def validate_token(path: Path) -> tuple[int, int]:
@@ -480,6 +606,59 @@ def resume_report(job: Job, rows: int, width: int) -> dict[str, Any] | None:
     return report
 
 
+def resume_planner_report(
+    job: PlannerJob,
+    trajectory: PlannerTrajectory,
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    output_report = planner_report_path(job)
+    paths = (job.token_output, job.proprio_output, output_report)
+    if not any(path.exists() for path in paths):
+        return None
+    if not all(path.is_file() for path in paths):
+        raise RuntimeError(f"incomplete planner token/proprio/report set for {job.episode_id}")
+    report = json.loads(output_report.read_text(encoding="utf-8"))
+    action = np.load(job.token_output, mmap_mode="r")
+    proprio = np.load(job.proprio_output, mmap_mode="r")
+    expected = {
+        "status": "complete",
+        "mode": "planner_trajectory",
+        "episode_id": job.episode_id,
+        "trajectory_source": str(job.trajectory_source) if job.trajectory_source else None,
+        "token_output_path": str(job.token_output),
+        "output_path": str(job.proprio_output),
+        "token_rows": trajectory.rows,
+        "proprio_rows": trajectory.rows,
+        "input_dim": ACTION_DIM,
+        "provenance": provenance or {},
+    }
+    mismatches = {
+        key: (report.get(key), value)
+        for key, value in expected.items()
+        if report.get(key) != value
+    }
+    if action.shape != (trajectory.rows, ACTION_DIM) or action.dtype != np.float32:
+        mismatches["token_array"] = (
+            (action.shape, str(action.dtype)),
+            ((trajectory.rows, ACTION_DIM), "float32"),
+        )
+    if proprio.shape != (trajectory.rows, 34) or proprio.dtype != np.float32:
+        mismatches["proprio_array"] = (
+            (proprio.shape, str(proprio.dtype)),
+            ((trajectory.rows, 34), "float32"),
+        )
+    if not np.isfinite(action).all() or not np.isfinite(proprio).all():
+        mismatches["finite"] = (False, True)
+    if action.shape == (trajectory.rows, ACTION_DIM) and not np.array_equal(
+        action[:, MOTION_TOKEN_DIM:ACTION_DIM], trajectory.hand_state
+    ):
+        mismatches["hand_state"] = ("output differs", "trajectory")
+    if mismatches:
+        raise RuntimeError(f"planner resume validation failed for {job.episode_id}: {mismatches}")
+    return report
+
+
 def prepare_motion_tokens(token: Path, width: int, work_dir: Path) -> Path:
     if width == MOTION_TOKEN_DIM:
         return token
@@ -550,6 +729,426 @@ class TensorRTInitGate:
                     finally:
                         fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
         return self._launch(spec, log_path, env, timeout, stop_event)
+
+
+def _quaternion_echo_error(actual: np.ndarray, expected: np.ndarray) -> float:
+    actual_quaternions = np.asarray(actual, dtype=np.float64).reshape(3, 4)
+    expected_quaternions = np.asarray(expected, dtype=np.float64).reshape(3, 4)
+    direct = np.max(np.abs(actual_quaternions - expected_quaternions), axis=1)
+    flipped = np.max(np.abs(actual_quaternions + expected_quaternions), axis=1)
+    return float(np.max(np.minimum(direct, flipped)))
+
+
+def _warmup_orientation(orientation: np.ndarray) -> np.ndarray:
+    result = np.asarray(orientation, dtype=np.float64).reshape(3, 4).copy()
+    angle = 0.05
+    delta = np.asarray([np.cos(angle / 2.0), 0.0, 0.0, np.sin(angle / 2.0)])
+    left = result[2]
+    lw, lx, ly, lz = delta
+    rw, rx, ry, rz = left
+    result[2] = (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+    result[2] /= np.linalg.norm(result[2])
+    return result.astype(np.float32).reshape(12)
+
+
+def publish_planner_trajectory(
+    trajectory: PlannerTrajectory,
+    spec: WorkerSpec,
+    release_event: threading.Event,
+    cancel_event: threading.Event,
+    stop_event: threading.Event,
+    ready_result: queue.Queue[tuple[float | None, BaseException | None]],
+    publish_result: queue.Queue[tuple[dict[str, Any] | None, BaseException | None]],
+) -> None:
+    """Publish warm-up and then one planner command per 50 Hz control tick."""
+    context = None
+    socket = None
+    first_sent: float | None = None
+    published = 0
+    try:
+        import zmq
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+            build_command_message,
+            build_planner_message,
+        )
+
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        socket.bind(f"tcp://*:{spec.input_port}")
+        wait_interval(0.25, stop_event)
+        warm_started = time.monotonic()
+        ready_result.put((warm_started, None))
+
+        warm_position = trajectory.vr_position[0].copy()
+        warm_position[8] += 0.01
+        warm_orientation = _warmup_orientation(trajectory.vr_orientation[0])
+        warm_message = build_planner_message(
+            mode=0,
+            movement=(0.0, 0.0, 0.0),
+            facing=trajectory.facing[0],
+            speed=-1.0,
+            height=float(trajectory.height[0]),
+            vr_3pt_position=warm_position,
+            vr_3pt_orientation=warm_orientation,
+        )
+        start_message = build_command_message(start=True, stop=False, planner=True)
+        next_warm = warm_started
+        while not release_event.is_set():
+            if cancel_event.is_set():
+                raise RunCancelled("planner publisher cancelled")
+            check_cancelled(stop_event)
+            now = time.monotonic()
+            if now >= next_warm:
+                socket.send(start_message)
+                socket.send(warm_message)
+                next_warm = now + 0.05
+            release_event.wait(min(0.01, max(0.0, next_warm - now)))
+
+        socket.send(start_message)
+        for index in range(trajectory.rows):
+            if cancel_event.is_set():
+                raise RunCancelled("planner publisher cancelled")
+            check_cancelled(stop_event)
+            if index and index % 25 == 0:
+                socket.send(start_message)
+            message = build_planner_message(
+                mode=int(trajectory.mode[index]),
+                movement=trajectory.movement[index],
+                facing=trajectory.facing[index],
+                speed=float(trajectory.speed[index]),
+                height=float(trajectory.height[index]),
+                vr_3pt_position=trajectory.vr_position[index],
+                vr_3pt_orientation=trajectory.vr_orientation[index],
+            )
+            sent_at = time.monotonic()
+            socket.send(message)
+            if first_sent is None:
+                first_sent = sent_at
+            published = index + 1
+            deadline = first_sent + published / CONTROL_HZ
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and cancel_event.wait(remaining):
+                raise RunCancelled("planner publisher cancelled")
+            check_cancelled(stop_event)
+        publish_result.put(
+            (
+                {
+                    "warm_started_monotonic": warm_started,
+                    "first_frame_sent_monotonic": first_sent,
+                    "last_frame_sent_monotonic": time.monotonic(),
+                    "published_rows": published,
+                },
+                None,
+            )
+        )
+        final_message = message
+        while not cancel_event.wait(0.2):
+            check_cancelled(stop_event)
+            socket.send(start_message)
+            socket.send(final_message)
+    except BaseException as error:
+        if ready_result.empty():
+            ready_result.put((None, error))
+        publish_result.put((None, error))
+    finally:
+        if socket is not None:
+            try:
+                from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message
+
+                socket.send(build_command_message(start=False, stop=True, planner=True))
+            except Exception:
+                pass
+            socket.close()
+        if context is not None:
+            context.term()
+
+
+def align_planner_frames(
+    frames: list[dict[str, Any]],
+    trajectory: PlannerTrajectory,
+    *,
+    first_sent_monotonic: float,
+    echo_tol: float,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    expected_first = trajectory.vr_orientation[0]
+    anchor = None
+    for index, frame in enumerate(frames):
+        received = frame.get("_recv_monotonic")
+        orientation = frame.get("vr_3point_orientation")
+        if received is None or received < first_sent_monotonic or orientation is None:
+            continue
+        actual = np.asarray(orientation)
+        if actual.shape == (12,) and _quaternion_echo_error(actual, expected_first) <= echo_tol:
+            anchor = index
+            break
+    if anchor is None:
+        raise ValueError("no g1_debug frame echoed the first planner VR orientation")
+    selected = frames[anchor : anchor + trajectory.rows]
+    if len(selected) != trajectory.rows:
+        raise ValueError(
+            f"planner capture ended early: selected {len(selected)}/{trajectory.rows} rows"
+        )
+
+    indices = np.asarray([int(np.asarray(frame.get("index")).reshape(-1)[0]) for frame in selected])
+    if indices.shape != (trajectory.rows,) or np.any(np.diff(indices) != 1):
+        raise ValueError("planner g1_debug.index is missing, duplicated, or non-contiguous")
+
+    echo_errors: list[float] = []
+    arrays: dict[str, np.ndarray] = {}
+    for row, frame in enumerate(selected):
+        orientation = frame.get("vr_3point_orientation")
+        if orientation is None or np.asarray(orientation).shape != (12,):
+            raise ValueError(f"missing planner VR orientation echo at row {row}")
+        echo_errors.append(
+            _quaternion_echo_error(
+                np.asarray(orientation), trajectory.vr_orientation[row]
+            )
+        )
+    # The publisher and g1_debug producer are independent 50 Hz clocks, so an
+    # occasional frame can echo an adjacent command even when debug indices are
+    # complete and contiguous. Keep that phase drift as QA metadata; the hard
+    # pairing gate is the continuous same-frame token/proprio sequence above.
+    max_echo_error = max(echo_errors)
+    echo_rows_over_tolerance = sum(error > echo_tol for error in echo_errors)
+
+    for field in ALIGN_FIELDS:
+        missing = [row for row, frame in enumerate(selected) if field not in frame]
+        if missing:
+            raise ValueError(f"required g1_debug field {field!r} is missing at rows {missing[:5]}")
+        values = [np.asarray(frame[field], dtype=np.float64) for frame in selected]
+        shape = values[0].shape
+        if any(value.shape != shape for value in values):
+            raise ValueError(f"g1_debug field {field!r} changed shape during planner rollout")
+        arrays[field] = np.stack(values)
+    if arrays["token_state"].shape != (trajectory.rows, MOTION_TOKEN_DIM):
+        raise ValueError(
+            f"planner token_state shape {arrays['token_state'].shape} != "
+            f"({trajectory.rows},{MOTION_TOKEN_DIM})"
+        )
+    return arrays, {
+        "anchor_idx": anchor,
+        "anchor_debug_index": int(indices[0]),
+        "last_debug_index": int(indices[-1]),
+        "captured_frames": len(frames),
+        "selected_frames": trajectory.rows,
+        "missing_head": 0,
+        "missing_tail": 0,
+        "vr_orientation_echo_max_abs": max_echo_error,
+        "vr_orientation_echo_rows_over_tolerance": echo_rows_over_tolerance,
+        "command_to_anchor_seconds": float(
+            selected[0]["_recv_monotonic"] - first_sent_monotonic
+        ),
+    }
+
+
+def run_planner_job(
+    job: PlannerJob,
+    trajectory: PlannerTrajectory,
+    args: argparse.Namespace,
+    spec: WorkerSpec,
+    init_gate: TensorRTInitGate,
+    stop_event: threading.Event,
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one dataset-neutral planner trajectory and export paired 66D/34D arrays."""
+    trajectory_check = validate_planner_trajectory(trajectory)
+    check_cancelled(stop_event)
+    check_ports_free(spec)
+    work_dir = (args.work_root / Path(job.episode_id)).resolve()
+    if not work_dir.is_relative_to(args.work_root):
+        raise ValueError(f"work path escapes --work-root: {work_dir}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    capture_duration = (
+        trajectory.rows / CONTROL_HZ
+        + args.startup_settle_margin
+        + args.planner_mode_timeout
+        + args.capture_tail_margin
+        + 5.0
+    )
+    env = worker_environment(spec)
+    processes: list[tuple[subprocess.Popen[bytes], str]] = []
+    capture_stop = threading.Event()
+    capture_result: queue.Queue[tuple[list[dict[str, Any]] | None, BaseException | None]] = queue.Queue(maxsize=1)
+    release_event = threading.Event()
+    publisher_cancel = threading.Event()
+    ready_result: queue.Queue[tuple[float | None, BaseException | None]] = queue.Queue(maxsize=1)
+    publish_result: queue.Queue[tuple[dict[str, Any] | None, BaseException | None]] = queue.Queue(maxsize=1)
+    capture_thread: threading.Thread | None = None
+    publisher_thread: threading.Thread | None = None
+
+    def capture_frames() -> None:
+        try:
+            captured = capture_g1_debug_frames(
+                capture_duration,
+                port=spec.output_port,
+                recv_timeout_ms=CAPTURE_RECV_TIMEOUT_MS,
+                stop_event=capture_stop,
+            )
+            capture_result.put((captured, None))
+        except BaseException as error:
+            capture_result.put((None, error))
+
+    try:
+        sim_log = work_dir / "sim.log"
+        sim = start_logged(
+            [str(SIM_PYTHON), str(SIM_SCRIPT), "--domain-id", str(spec.dds_domain)],
+            sim_log,
+            cwd=WBC_ROOT,
+            env=env,
+        )
+        processes.append((sim, "sim"))
+        wait_interval(SIM_STARTUP_MARGIN, stop_event)
+        if sim.poll() is not None:
+            raise RuntimeError(f"sim exited with {sim.returncode}; see {sim_log}")
+
+        deploy_log = work_dir / "deploy.log"
+        deploy = init_gate.start(spec, deploy_log, env, args.deploy_timeout, stop_event)
+        processes.append((deploy, "deploy"))
+        capture_thread = threading.Thread(
+            target=capture_frames,
+            name=f"calc-proprio-planner-capture-{spec.index}",
+            daemon=True,
+        )
+        capture_thread.start()
+        wait_interval(args.capture_startup_margin, stop_event)
+        if not capture_thread.is_alive():
+            frames, error = capture_result.get_nowait()
+            if error is not None:
+                raise error
+            raise RuntimeError(f"capture stopped before planner launch after {len(frames or [])} frame(s)")
+
+        publisher_thread = threading.Thread(
+            target=publish_planner_trajectory,
+            args=(
+                trajectory,
+                spec,
+                release_event,
+                publisher_cancel,
+                stop_event,
+                ready_result,
+                publish_result,
+            ),
+            name=f"calc-proprio-planner-publisher-{spec.index}",
+            daemon=True,
+        )
+        publisher_thread.start()
+        warm_started, ready_error = ready_result.get(timeout=5.0)
+        if ready_error is not None:
+            raise ready_error
+        if warm_started is None:
+            raise RuntimeError("planner publisher did not report warm-up start")
+        wait_for_log_pattern(
+            deploy,
+            deploy_log,
+            TELEOP_MODE_PATTERN,
+            args.planner_mode_timeout,
+            stop_event,
+        )
+        wait_interval(
+            max(0.0, args.startup_settle_margin - (time.monotonic() - warm_started)),
+            stop_event,
+        )
+        release_event.set()
+
+        publisher_deadline = time.monotonic() + trajectory.rows / CONTROL_HZ + 10.0
+        while publish_result.empty():
+            check_cancelled(stop_event)
+            if not publisher_thread.is_alive():
+                raise RuntimeError("planner publisher stopped without a completion result")
+            if time.monotonic() >= publisher_deadline:
+                raise TimeoutError("planner publisher exceeded trajectory duration by 10 seconds")
+            stop_event.wait(0.25)
+        publish_metadata, publish_error = publish_result.get_nowait()
+        if publish_error is not None:
+            raise publish_error
+        if publish_metadata is None:
+            raise RuntimeError("planner publisher returned no metadata")
+        wait_interval(args.capture_tail_margin, stop_event)
+        capture_stop.set()
+        capture_thread.join()
+        frames, capture_error = capture_result.get_nowait()
+        if capture_error is not None:
+            raise capture_error
+        if frames is None:
+            raise RuntimeError("capture returned no frame list")
+
+        if args.keep_work:
+            atomic_pickle(work_dir / "frames.pkl", frames)
+        arrays, alignment_report = align_planner_frames(
+            frames,
+            trajectory,
+            first_sent_monotonic=float(publish_metadata["first_frame_sent_monotonic"]),
+            echo_tol=args.planner_echo_tol,
+        )
+        if args.keep_work:
+            atomic_npz(work_dir / "aligned.npz", arrays)
+        del frames
+
+        proprio, missing_head, missing_tail = build_pseudo_proprio(arrays)
+        if missing_head or missing_tail:
+            raise ValueError("planner alignment unexpectedly required edge fill")
+        action = np.concatenate(
+            (arrays["token_state"], trajectory.hand_state), axis=1
+        ).astype(np.float32)
+        validate_action_array(action)
+        proprio, hand_report, warnings = apply_hand_state(proprio, action)
+        check_report, check_warnings = self_check(
+            proprio,
+            token_rows=trajectory.rows,
+            stats=str(args.stats) if args.stats is not None else None,
+        )
+        warnings.extend(check_warnings)
+        report = {
+            "schema_version": 3,
+            "status": "complete",
+            "mode": "planner_trajectory",
+            "episode_id": job.episode_id,
+            "trajectory_source": str(job.trajectory_source) if job.trajectory_source else None,
+            "token_output_path": str(job.token_output),
+            "output_path": str(job.proprio_output),
+            "token_rows": trajectory.rows,
+            "proprio_rows": int(proprio.shape[0]),
+            "input_dim": ACTION_DIM,
+            "missing_head_filled": 0,
+            "missing_tail_filled": 0,
+            "edge_frames_filled": 0,
+            **hand_report,
+            **check_report,
+            **alignment_report,
+            "trajectory_check": trajectory_check,
+            "publisher": publish_metadata,
+            "runtime_assets": runtime_assets(),
+            "runtime_assignment": runtime_assignment(spec),
+            "parameters": replay_parameters(args),
+            "provenance": provenance or {},
+            "work_retained": args.keep_work,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+    finally:
+        publisher_cancel.set()
+        release_event.set()
+        capture_stop.set()
+        if publisher_thread is not None:
+            publisher_thread.join(timeout=PROCESS_STOP_TIMEOUT)
+        if capture_thread is not None:
+            capture_thread.join()
+        for process, name in reversed(processes):
+            stop_process(process, name)
+
+    check_cancelled(stop_event)
+    atomic_npy(job.token_output, action)
+    atomic_npy(job.proprio_output, proprio.astype(np.float32))
+    atomic_json(planner_report_path(job), report)
+    if not args.keep_work:
+        cleanup_success_work(work_dir)
+    return report
 
 
 def run_job(
@@ -717,6 +1316,8 @@ def replay_parameters(args: argparse.Namespace) -> dict[str, Any]:
         "anchor_max_offset": args.anchor_max_offset,
         "anchor_tol": args.anchor_tol,
         "max_edge_fill": args.max_edge_fill,
+        "planner_mode_timeout": args.planner_mode_timeout,
+        "planner_echo_tol": args.planner_echo_tol,
         "keep_work": args.keep_work,
         "stats": str(args.stats) if args.stats is not None else None,
     }
@@ -776,6 +1377,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output")
     parser.add_argument("--input-root")
     parser.add_argument("--output-root")
+    parser.add_argument("--planner-trajectory", help="dataset-neutral planner trajectory .npz")
+    parser.add_argument("--token-output", help="planner mode [T,66] output .npy")
+    parser.add_argument("--proprio-output", help="planner mode [T,34] output .npy")
     parser.add_argument("--token-glob", default="**/*.npy")
     parser.add_argument("--episode", action="append", help="exact relative path without .npy; repeatable")
     parser.add_argument("--work-root", default=".runs/calc_proprio/work")
@@ -794,22 +1398,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-max-offset", type=int, default=5)
     parser.add_argument("--anchor-tol", type=float, default=1e-5)
     parser.add_argument("--max-edge-fill", type=int, default=1)
+    parser.add_argument("--planner-mode-timeout", type=float, default=15.0)
+    parser.add_argument("--planner-echo-tol", type=float, default=1e-4)
     args = parser.parse_args()
 
-    single = args.token is not None or args.output is not None
+    token_single = args.token is not None or args.output is not None
     directory = args.input_root is not None or args.output_root is not None
-    if single == directory:
-        parser.error("choose exactly one mode: --token/--output or --input-root/--output-root")
-    if single and (args.token is None or args.output is None):
+    planner_single = any(
+        value is not None
+        for value in (args.planner_trajectory, args.token_output, args.proprio_output)
+    )
+    if sum((token_single, directory, planner_single)) != 1:
+        parser.error(
+            "choose exactly one mode: --token/--output, --input-root/--output-root, "
+            "or --planner-trajectory/--token-output/--proprio-output"
+        )
+    if token_single and (args.token is None or args.output is None):
         parser.error("--token and --output must be supplied together")
     if directory and (args.input_root is None or args.output_root is None):
         parser.error("--input-root and --output-root must be supplied together")
-    if single and args.episode:
+    if planner_single and any(
+        value is None
+        for value in (args.planner_trajectory, args.token_output, args.proprio_output)
+    ):
+        parser.error(
+            "--planner-trajectory, --token-output, and --proprio-output must be supplied together"
+        )
+    if not directory and args.episode:
         parser.error("--episode is only valid in directory mode")
-    if single and args.workers is not None:
+    if not directory and args.workers is not None:
         parser.error("--workers is only valid in directory mode")
     if args.output and Path(args.output).suffix != ".npy":
         parser.error("--output must end in .npy")
+    if args.planner_trajectory and Path(args.planner_trajectory).suffix != ".npz":
+        parser.error("--planner-trajectory must end in .npz")
+    if args.token_output and Path(args.token_output).suffix != ".npy":
+        parser.error("--token-output must end in .npy")
+    if args.proprio_output and Path(args.proprio_output).suffix != ".npy":
+        parser.error("--proprio-output must end in .npy")
+    if args.token_output and resolve_path(args.token_output) == resolve_path(args.proprio_output):
+        parser.error("--token-output and --proprio-output must differ")
     if args.workers is not None and args.workers < 1:
         parser.error("--workers must be at least 1")
     if not 1 <= args.zmq_port_base <= 65534:
@@ -822,13 +1450,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("settle margin must be non-negative; anchor offset/tolerance must be positive")
     if args.max_edge_fill < 0:
         parser.error("--max-edge-fill must be non-negative")
+    if args.planner_mode_timeout <= 0 or args.planner_echo_tol <= 0:
+        parser.error("planner mode timeout and echo tolerance must be positive")
 
     args.work_root = resolve_path(args.work_root)
     args.stats = resolve_path(args.stats) if args.stats else None
     if args.stats is not None and not args.stats.is_file():
         parser.error(f"--stats does not exist: {args.stats}")
     return args
-
 
 def validation_entry(job: Job, rows: int, width: int) -> dict[str, Any]:
     warnings = ["input_has_no_hand_action"] if width == MOTION_TOKEN_DIM else []
@@ -1128,13 +1757,84 @@ def run_directory(
     return 0 if manifest["complete"] else 1
 
 
+def run_planner_single(
+    job: PlannerJob,
+    trajectory: PlannerTrajectory,
+    args: argparse.Namespace,
+    spec: WorkerSpec | None,
+    stop_event: threading.Event,
+) -> int:
+    check = validate_planner_trajectory(trajectory)
+    if args.validate_only:
+        print(
+            json.dumps(
+                {
+                    "mode": "planner_trajectory",
+                    "trajectory_source": str(job.trajectory_source),
+                    "token_output_path": str(job.token_output),
+                    "proprio_output_path": str(job.proprio_output),
+                    **check,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if spec is None:
+        raise RuntimeError("live planner run requires a worker")
+    existing = resume_planner_report(job, trajectory)
+    if existing is not None:
+        if not args.resume:
+            raise FileExistsError(
+                f"planner output already exists: {job.token_output} / {job.proprio_output}"
+            )
+        print(f"resume: validated and skipped {job.episode_id}")
+        return 0
+    report = run_planner_job(
+        job,
+        trajectory,
+        args,
+        spec,
+        TensorRTInitGate(TRT_LOCK_PATH),
+        stop_event,
+    )
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    stop_event = threading.Event()
+    if args.planner_trajectory is not None:
+        trajectory_source = resolve_path(args.planner_trajectory)
+        token_output = resolve_path(args.token_output)
+        proprio_output = resolve_path(args.proprio_output)
+        if trajectory_source in {token_output, proprio_output}:
+            raise ValueError("planner outputs must not overwrite the trajectory input")
+        trajectory = load_planner_trajectory(trajectory_source)
+        job = PlannerJob(
+            trajectory_source=trajectory_source,
+            token_output=token_output,
+            proprio_output=proprio_output,
+            episode_id=trajectory_source.stem,
+        )
+        specs: list[WorkerSpec] = []
+        if not args.validate_only:
+            validate_runtime_assets()
+            devices, _ = discover_visible_gpus()
+            specs = build_worker_specs(devices, args, 1)
+        return run_planner_single(
+            job,
+            trajectory,
+            args,
+            specs[0] if specs else None,
+            stop_event,
+        )
+
     jobs, roots = discover_jobs(args)
     if roots is not None:
         args.work_root = directory_work_root(args.work_root, roots)
 
-    specs: list[WorkerSpec] = []
+    specs = []
     gpu_source: str | None = None
     if not args.validate_only:
         validate_runtime_assets()
@@ -1142,11 +1842,9 @@ def main() -> int:
         worker_jobs = 1 if roots is None else len(jobs)
         specs = build_worker_specs(devices, args, worker_jobs)
 
-    stop_event = threading.Event()
     if roots is None:
         return run_single(jobs[0], args, specs[0] if specs else None, stop_event)
     return run_directory(jobs, roots, args, specs, gpu_source, stop_event)
-
 
 def handle_termination(_signum: int, _frame: Any) -> None:
     raise KeyboardInterrupt

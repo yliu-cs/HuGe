@@ -114,6 +114,14 @@ def _save_portable_safetensors(
             f"missing={sorted(expected_keys - actual_keys)}, "
             f"unexpected={sorted(actual_keys - expected_keys)}"
         )
+    for name, tensor in state_dict.items():
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"portable state contains a non-tensor value: {name}")
+        if (
+            (torch.is_floating_point(tensor) or torch.is_complex(tensor))
+            and not bool(torch.isfinite(tensor).all().item())
+        ):
+            raise ValueError(f"portable checkpoint contains non-finite tensor: {name}")
     aliases = _shared_tensor_aliases(model, expected_state)
     for alias, canonical in aliases.items():
         alias_tensor = state_dict[alias]

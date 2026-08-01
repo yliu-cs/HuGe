@@ -326,28 +326,104 @@ class EgoVerseDataset(Stage1CacheDataset):
     expected_dataset = "egoverse"
 
     def __init__(self, cache_root: str | Path, **kwargs: Any) -> None:
-        self._zarr_cache: OrderedDict[str, Any] = OrderedDict()
+        self._zarr_cache: OrderedDict[
+            str, tuple[Any, np.ndarray | None]
+        ] = OrderedDict()
+        self._validated_timestamp_segments: set[str] = set()
         super().__init__(cache_root, dataset_id="egoverse", **kwargs)
+        mapping_contracts = {
+            segment.source_start_timestamp_ns is not None
+            for segment in self.segments
+        }
+        if len(mapping_contracts) != 1:
+            raise ValueError("EgoVerse cache mixes frame-index and timestamp mapping")
+        self._uses_timestamp_mapping = mapping_contracts == {True}
 
     def _load_image(self, segment: Stage1Segment, frame_idx: int) -> Image.Image:
         source_path = self.data_root / "v3" / segment.source
         key = str(source_path)
-        group = self._zarr_cache.get(key)
-        if group is None:
+        cached = self._zarr_cache.get(key)
+        if cached is None:
             if not source_path.is_dir():
                 raise FileNotFoundError(source_path)
             group = zarr.open_group(str(source_path), mode="r")
-            self._zarr_cache[key] = group
-            if len(self._zarr_cache) > 4:
-                self._zarr_cache.popitem(last=False)
+            timestamps = None
         else:
+            group, timestamps = cached
             self._zarr_cache.move_to_end(key)
-        source_frame = segment.source_start_frame + frame_idx
-        if source_frame >= segment.source_end_frame:
-            raise IndexError(f"{segment.stable_id} image frame {source_frame} exceeds segment end")
+        if segment.source_start_timestamp_ns is not None and timestamps is None:
+            timestamps = np.asarray(
+                group["obs_rgb_timestamps_ns"][:], dtype=np.int64
+            ).reshape(-1)
+            if (
+                len(timestamps) != int(group["images.front_1"].shape[0])
+                or not len(timestamps)
+            ):
+                raise ValueError(f"invalid obs_rgb_timestamps_ns in {source_path}")
+        self._zarr_cache[key] = (group, timestamps)
+        if len(self._zarr_cache) > 4:
+            self._zarr_cache.popitem(last=False)
+
+        if segment.source_start_timestamp_ns is None:
+            source_frame = segment.source_start_frame + frame_idx
+        else:
+            assert timestamps is not None
+            segment_timestamps = timestamps[
+                segment.source_start_frame : segment.source_end_frame
+            ]
+            if segment.stable_id not in self._validated_timestamp_segments:
+                if (
+                    len(segment_timestamps)
+                    != segment.source_end_frame - segment.source_start_frame
+                    or np.any(segment_timestamps <= 0)
+                    or np.any(segment_timestamps[1:] <= segment_timestamps[:-1])
+                ):
+                    raise ValueError(
+                        f"invalid segment timestamps for {segment.stable_id}"
+                    )
+                self._validated_timestamp_segments.add(segment.stable_id)
+            target = segment.source_start_timestamp_ns + round(
+                frame_idx * 1_000_000_000 / segment.target_hz
+            )
+            position = segment.source_start_frame + int(
+                np.searchsorted(segment_timestamps, target, side="left")
+            )
+            candidates = [
+                max(
+                    segment.source_start_frame,
+                    min(position, segment.source_end_frame - 1),
+                )
+            ]
+            if position > segment.source_start_frame:
+                candidates.append(
+                    max(
+                        segment.source_start_frame,
+                        min(position - 1, segment.source_end_frame - 1),
+                    )
+                )
+            source_frame = min(
+                candidates,
+                key=lambda value: (abs(int(timestamps[value]) - target), value),
+            )
+        if (
+            source_frame < segment.source_start_frame
+            or source_frame >= segment.source_end_frame
+        ):
+            raise IndexError(
+                f"{segment.stable_id} image frame {source_frame} outside "
+                f"[{segment.source_start_frame},{segment.source_end_frame})"
+            )
         payload = _unwrap_bytes(group["images.front_1"][source_frame])
         with Image.open(io.BytesIO(payload)) as image:
             return image.convert("RGB")
+
+    def _vision_contract(self) -> tuple[str, str]:
+        if self._uses_timestamp_mapping:
+            return (
+                "zarr/images.front_1",
+                "nearest_obs_rgb_timestamp_tie_earlier",
+            )
+        return super()._vision_contract()
 
 
 class Behavior1KDataset(Stage1CacheDataset):
