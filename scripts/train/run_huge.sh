@@ -6,7 +6,7 @@ set -euo pipefail
 # through explicit environment overrides.
 #
 # sim mode (HUGE_STAGE3_DATA=sim) runs one qwenpi_v3 pipeline:
-#   stage1: EgoDex pretraining over every time step
+#   stage1: Ego pretraining over every 10th time step by default
 #   stage2: HE + WBT + HIW posttraining, initialized from stage1
 #   stage3: G1WholebodyPushOfficeChairTeleop sim finetuning, initialized from stage2
 #   writes to ${HUGE_RUN_ROOT:-./.runs/sim_pipeline}/pipeline/<stage>/<ts>/
@@ -40,6 +40,7 @@ set -euo pipefail
 #   HUGE_STAGE12_VLM_LR=...               Stage 1/2 VLM LR (default 2e-5)
 #   HUGE_STAGE12_PROJECTOR_LR=...         Stage 1/2 projector LR (default 5e-5)
 #   HUGE_STAGE12_ACTION_LR=...            Stage 1/2 action-head LR (default 2e-4)
+#   HUGE_STAGE1_SAMPLE_STRIDE=...         Stage 1 time-step stride (default 10)
 #   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenoft qwenpi_v3 qwengr00t")
 #   HUGE_HUMANOID_ARENA_TUNING_MODES=...      space-separated modes (default "full")
 #   HUGE_HUMANOID_ARENA_RESUME_STATE=...      resume state; requires one architecture and full mode
@@ -135,7 +136,7 @@ read -r -a STAGE1_SOURCES <<< "${HUGE_STAGE1_SOURCES:-egodex egoverse behavior1k
 read -r -a STAGE2_SOURCES <<< "${HUGE_STAGE2_SOURCES:-he wbt hiw}"
 STAGE1_EPISODE_FRACTION="${HUGE_STAGE1_EPISODE_FRACTION:-}"
 STAGE1_EPISODE_SELECTION_SEED="${HUGE_STAGE1_EPISODE_SELECTION_SEED:-7}"
-STAGE1_SAMPLE_STRIDE="${HUGE_STAGE1_SAMPLE_STRIDE:-1}"
+STAGE1_SAMPLE_STRIDE="${HUGE_STAGE1_SAMPLE_STRIDE:-10}"
 STAGE1_MAX_STEPS="${HUGE_STAGE1_MAX_STEPS:-}"
 STAGE2_MAX_STEPS="${HUGE_STAGE2_MAX_STEPS:-}"
 

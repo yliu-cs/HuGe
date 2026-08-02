@@ -28,6 +28,7 @@ from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+from tqdm.auto import tqdm
 
 sys.dont_write_bytecode = True
 
@@ -1106,7 +1107,7 @@ def _preflight_egoverse(
         ),
         key=lambda path: path.name,
     )
-    for source in entries:
+    for source in tqdm(entries, desc="EgoVerse preflight", unit="episode"):
         metadata = source / "zarr.json"
         try:
             payload = json.loads(metadata.read_text(encoding="utf-8"))

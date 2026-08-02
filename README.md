@@ -363,11 +363,14 @@ bash scripts/train/train_huge.sh stage2 \
 
 The full-pipeline launcher now defaults Stage 1 to EgoDex + EgoVerse +
 BEHAVIOR-1K + Xperience-10M and Stage 2 to Humanoid Everyday + G1_WBT +
-HIW-500. Stage 1 fractions select a deterministic, nested subset of complete
-source episodes; `sample_stride` is a deterministic within-episode time-step
-stride, not random episode sampling. `--max-episodes` remains a mutually
-exclusive per-source prefix limit for debugging. Sources are mixed in canonical
-order at their natural sample ratio.
+HIW-500. Stage 1 defaults to `sample_stride=10`, and Stage 2 defaults to
+`sample_stride=5`; both strides select training start frames while keeping each
+50-step action target contiguous. Fractions
+select a deterministic, nested subset of complete source episodes independently
+of this within-episode stride. Override `--sample-stride` directly or set
+`HUGE_STAGE1_SAMPLE_STRIDE` for data-volume ablations. `--max-episodes` remains
+a mutually exclusive per-source prefix limit for debugging. Sources are mixed
+in canonical order at their natural sample ratio.
 
 The HIW adapter reads `HIW-500/meta/episodes` directly; when that directory is
 absent, it downloads only the official `BitRobot/HIW-500-LeRobot` episode
@@ -484,8 +487,8 @@ Outputs:
 
 | Stage | LR | Batch/process | Epochs | Stride | Warmup | Weight decay | Periodic checkpoint |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `stage1` | `1e-4` | 96 | 1 | 1 | 0.05 | 0.01 | disabled |
-| `stage2` | `1e-4` | 96 | 1 | 1 | 0.05 | 0.01 | disabled |
+| `stage1` | `1e-4` | 96 | 1 | 10 | 0.05 | 0.01 | disabled |
+| `stage2` | `1e-4` | 96 | 1 | 5 | 0.05 | 0.01 | disabled |
 | `stage3` | `3e-5` | 32 | 50,000-step cap | 1 | 0.1 | 0.005 | disabled; final only |
 
 Shared defaults: `qwenpi_v3`, full Qwen training, bf16, DeepSpeed ZeRO-2,
