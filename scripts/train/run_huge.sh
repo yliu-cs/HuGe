@@ -37,9 +37,9 @@ set -euo pipefail
 #   HUGE_HUMANOID_ARENA_INIT_CKPT=...  optional init checkpoint (default none/from scratch)
 #   HUGE_STAGE12_DATA_ROOT=...           Stage 1/2 dataset root (default resource/datasets)
 #   HUGE_STAGE2_PROPRIO_STATS=...        Stage 2 stats under that root by default
-#   HUGE_STAGE12_VLM_LR=...               Stage 1/2 VLM LR (default 2e-5)
-#   HUGE_STAGE12_PROJECTOR_LR=...         Stage 1/2 projector LR (default 5e-5)
-#   HUGE_STAGE12_ACTION_LR=...            Stage 1/2 action-head LR (default 2e-4)
+#   HUGE_STAGE12_VLM_LR=...               Stage 1/2 VLM LR (default 1e-5)
+#   HUGE_STAGE12_PROJECTOR_LR=...         Stage 1/2 projector LR (default 2.5e-5)
+#   HUGE_STAGE12_ACTION_LR=...            Stage 1/2 action-head LR (default 1e-4)
 #   HUGE_STAGE1_SAMPLE_STRIDE=...         Stage 1 time-step stride (default 10)
 #   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenoft qwenpi_v3 qwengr00t")
 #   HUGE_HUMANOID_ARENA_TUNING_MODES=...      space-separated modes (default "full")
@@ -129,9 +129,9 @@ HUMANOID_ARENA_LORA_ALPHA="${HUGE_HUMANOID_ARENA_LORA_ALPHA:-16}"
 HUMANOID_ARENA_LORA_DROPOUT="${HUGE_HUMANOID_ARENA_LORA_DROPOUT:-0.0}"
 STAGE12_DATA_ROOT="${HUGE_STAGE12_DATA_ROOT:-resource/datasets}"
 STAGE2_PROPRIO_STATS="${HUGE_STAGE2_PROPRIO_STATS:-$STAGE12_DATA_ROOT/G1_WBT-cache/meta/g1_proprio_stats_sonic.json}"
-STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-2e-5}"
-STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-5e-5}"
-STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-2e-4}"
+STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-1e-5}"
+STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-2.5e-5}"
+STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-1e-4}"
 read -r -a STAGE1_SOURCES <<< "${HUGE_STAGE1_SOURCES:-egodex egoverse behavior1k xperience}"
 read -r -a STAGE2_SOURCES <<< "${HUGE_STAGE2_SOURCES:-he wbt hiw}"
 STAGE1_EPISODE_FRACTION="${HUGE_STAGE1_EPISODE_FRACTION:-}"
@@ -142,7 +142,7 @@ STAGE2_MAX_STEPS="${HUGE_STAGE2_MAX_STEPS:-}"
 
 declare -A STAGE1_ROOT_BY_KIND=(
   [egodex]="$STAGE12_DATA_ROOT/EgoDex"
-  [egoverse]="$STAGE12_DATA_ROOT/egoverse-cache"
+  [egoverse]="$STAGE12_DATA_ROOT/egoverse-retargeted-cache"
   [behavior1k]="$STAGE12_DATA_ROOT/behavior-1k-2025-challenge-cache"
   [xperience]="$STAGE12_DATA_ROOT/xperience-10m-cache"
 )

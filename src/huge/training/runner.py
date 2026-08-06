@@ -74,7 +74,7 @@ class StageDefaults:
     checkpointing_steps: int
     max_steps: int | None = None
     weight_decay: float = 0.01
-    num_workers: int = 8
+    num_workers: int = 4
     freeze_qwen: bool = False
     qwen_lora: bool = False
     train_qwen_lora: bool = False
@@ -105,8 +105,8 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     # Large, weakly supervised visual-language pretraining. Hand bits are
     # masked, so the hand loss weight is irrelevant but kept small.
     "stage1": StageDefaults(
-        learning_rate=1e-4,
-        batch_size=96,
+        learning_rate=3e-5,
+        batch_size=32,
         epochs=1,
         sample_stride=10,
         checkpointing_steps=0,
@@ -116,8 +116,8 @@ STAGE_DEFAULTS: dict[str, StageDefaults] = {
     # Main whole-body posttraining on HE + WBT + HIW with shared 34-D proprio
     # normalization and complete 66-D motion/hand supervision.
     "stage2": StageDefaults(
-        learning_rate=1e-4,
-        batch_size=96,
+        learning_rate=3e-5,
+        batch_size=32,
         epochs=1,
         sample_stride=5,
         checkpointing_steps=0,

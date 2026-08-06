@@ -434,7 +434,17 @@ def wait_for_log_pattern(
     raise TimeoutError(f"timed out after {timeout}s waiting for {pattern.pattern!r}; see {log_path}")
 
 
-def deploy_command(spec: WorkerSpec) -> list[str]:
+def inference_backend(args: argparse.Namespace | None = None) -> str:
+    value = getattr(args, "inference_backend", "tensorrt") if args is not None else "tensorrt"
+    normalized = str(value).lower().replace("-", "").replace("_", "")
+    if normalized in {"tensorrt", "trt", "cuda"}:
+        return "tensorrt"
+    if normalized in {"onnxruntime", "ort", "cpu"}:
+        return "onnxruntime"
+    raise ValueError(f"unsupported inference backend: {value!r}")
+
+
+def deploy_command(spec: WorkerSpec, args: argparse.Namespace | None = None) -> list[str]:
     return [
         str(DEPLOY_BINARY),
         "lo",
@@ -459,6 +469,8 @@ def deploy_command(spec: WorkerSpec) -> list[str]:
         str(spec.input_port),
         "--zmq-out-port",
         str(spec.output_port),
+        "--inference-backend",
+        inference_backend(args),
     ]
 
 
@@ -479,9 +491,12 @@ def player_command(motion_tokens: Path, spec: WorkerSpec) -> list[str]:
     ]
 
 
-def worker_environment(spec: WorkerSpec) -> dict[str, str]:
+def worker_environment(spec: WorkerSpec, args: argparse.Namespace | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = spec.gpu_selector
+    if inference_backend(args) == "tensorrt":
+        env["CUDA_VISIBLE_DEVICES"] = spec.gpu_selector
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
     return env
 
 
@@ -537,7 +552,10 @@ def build_worker_specs(
     job_count: int,
 ) -> list[WorkerSpec]:
     if not devices:
-        raise ValueError("at least one visible GPU is required")
+        if inference_backend(args) == "onnxruntime":
+            devices = ["cpu"]
+        else:
+            raise ValueError("at least one visible GPU is required")
     workers_per_gpu = getattr(args, "workers_per_gpu", None)
     requested = (
         args.workers
@@ -756,6 +774,25 @@ class TensorRTInitGate:
                     finally:
                         fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
         return self._launch(spec, log_path, env, timeout, stop_event)
+
+
+def start_deploy(
+    spec: WorkerSpec,
+    args: argparse.Namespace,
+    log_path: Path,
+    env: dict[str, str],
+    init_gate: TensorRTInitGate,
+    stop_event: threading.Event,
+) -> subprocess.Popen[bytes]:
+    if inference_backend(args) == "tensorrt":
+        return init_gate.start(spec, log_path, env, args.deploy_timeout, stop_event)
+    process = start_logged(deploy_command(spec, args), log_path, cwd=DEPLOY_ROOT, env=env)
+    try:
+        wait_for_log_pattern(process, log_path, DEPLOY_INIT_PATTERN, args.deploy_timeout, stop_event)
+    except BaseException:
+        stop_process(process, "deploy")
+        raise
+    return process
 
 
 def _quaternion_echo_error(actual: np.ndarray, expected: np.ndarray) -> float:
@@ -999,7 +1036,7 @@ def run_planner_job(
         + args.capture_tail_margin
         + 5.0
     )
-    env = worker_environment(spec)
+    env = worker_environment(spec, args)
     processes: list[tuple[subprocess.Popen[bytes], str]] = []
     capture_stop = threading.Event()
     capture_result: queue.Queue[tuple[list[dict[str, Any]] | None, BaseException | None]] = queue.Queue(maxsize=1)
@@ -1036,7 +1073,7 @@ def run_planner_job(
             raise RuntimeError(f"sim exited with {sim.returncode}; see {sim_log}")
 
         deploy_log = work_dir / "deploy.log"
-        deploy = init_gate.start(spec, deploy_log, env, args.deploy_timeout, stop_event)
+        deploy = start_deploy(spec, args, deploy_log, env, init_gate, stop_event)
         processes.append((deploy, "deploy"))
         capture_thread = threading.Thread(
             target=capture_frames,
@@ -1196,7 +1233,7 @@ def run_job(
 
     motion_tokens = prepare_motion_tokens(job.token, width, work_dir)
     capture_duration = rows / CONTROL_HZ + args.startup_settle_margin + args.capture_tail_margin
-    env = worker_environment(spec)
+    env = worker_environment(spec, args)
     processes: list[tuple[subprocess.Popen[bytes], str]] = []
     capture_stop = threading.Event()
     capture_result: queue.Queue[tuple[list[dict[str, Any]] | None, BaseException | None]] = queue.Queue(maxsize=1)
@@ -1227,7 +1264,7 @@ def run_job(
         if sim.poll() is not None:
             raise RuntimeError(f"sim exited with {sim.returncode}; see {sim_log}")
 
-        deploy = init_gate.start(spec, work_dir / "deploy.log", env, args.deploy_timeout, stop_event)
+        deploy = start_deploy(spec, args, work_dir / "deploy.log", env, init_gate, stop_event)
         processes.append((deploy, "deploy"))
 
         capture_thread = threading.Thread(
@@ -1423,6 +1460,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--zmq-port-base", type=int, default=DEFAULT_ZMQ_PORT_BASE)
     parser.add_argument("--dds-domain-base", type=int, default=0)
+    parser.add_argument(
+        "--inference-backend",
+        default="tensorrt",
+        choices=("tensorrt", "onnxruntime", "ort", "cpu"),
+        help="live deploy backend; cpu/ort aliases select ONNX Runtime CPU",
+    )
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -1860,7 +1903,7 @@ def main() -> int:
         specs: list[WorkerSpec] = []
         if not args.validate_only:
             validate_runtime_assets()
-            devices, _ = discover_visible_gpus()
+            devices, _ = (["cpu"], "cpu") if inference_backend(args) == "onnxruntime" else discover_visible_gpus()
             specs = build_worker_specs(devices, args, 1)
         return run_planner_single(
             job,
@@ -1878,7 +1921,10 @@ def main() -> int:
     gpu_source: str | None = None
     if not args.validate_only:
         validate_runtime_assets()
-        devices, gpu_source = discover_visible_gpus()
+        if inference_backend(args) == "onnxruntime":
+            devices, gpu_source = ["cpu"], "cpu"
+        else:
+            devices, gpu_source = discover_visible_gpus()
         worker_jobs = 1 if roots is None else len(jobs)
         specs = build_worker_specs(devices, args, worker_jobs)
         print(json.dumps({"worker_plan": worker_summary(specs)}, indent=2), flush=True)

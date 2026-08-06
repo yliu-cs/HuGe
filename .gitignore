@@ -15,6 +15,7 @@ sync*
 .sii/
 docs/
 skills/
+/scripts/preprocess/calc_egodex_replay_proprio.py
 
 # Python / uv
 .venv/

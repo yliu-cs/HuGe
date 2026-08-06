@@ -1,0 +1,83 @@
+# Local reference repositories
+starVLA/
+Isaac-GR00T/
+GR00T-WholeBodyControl/
+HumanoidArena/
+Psi0/
+openpi/
+sync*
+
+# Local scratch / tool state
+.agents/
+.baks/
+.claude/
+.codex/
+.sii/
+docs/
+skills/
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Data and generated artifacts
+resource/
+runs/
+.runs/
+outputs/
+checkpoints/
+logs/
+wandb/
+mlruns/
+tests/
+
+# Model weights and large binary artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+*.bin
+*.gguf
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.tar
+*.tar.gz
+*.zip
+*.zst
+
+# Media produced during experiments
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.gif
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -87,6 +87,42 @@ Unify HumanoidArena preprocessing and stage3 training matrix
 - Improve distributed progress logging and virtualenv cuDNN setup
 ```
 
+## Engineering proportionality — high priority
+
+This is a research and robotics codebase, not a security challenge or a
+defensive-programming showcase. Use engineering judgment and keep safeguards
+proportional to concrete risk. Before adding a nontrivial defensive mechanism,
+be able to name the supported scenario or observed failure that requires it.
+
+- Solve the requested or demonstrated problem with the smallest clear change.
+  Do not add machinery merely because a hypothetical failure can be imagined.
+- Defend real boundaries: external or untrusted input, an established project
+  invariant, a supported data format, or a destructive/irreversible operation.
+  Within an already validated boundary, rely on the contract instead of
+  stacking preflight checks, retries, recovery branches, and fallback paths.
+- Do not add content hashes, checksum manifests, content-addressed naming, or
+  SHA-256 verification unless an existing format/protocol or genuine security
+  boundary requires it, or the user explicitly requests it. Do not use hashing
+  as a generic substitute for ordinary schema, shape, equality, or sentinel
+  checks.
+- Validate an invariant at the narrowest layer that owns it. Do not repeat the
+  same validation at every caller and callee merely for reassurance.
+- Do not implement a corner-case branch unless the case is reachable from a
+  supported entry point, represented by existing data or formats, required by
+  a documented contract, or evidenced by a failure. Extremely low probability
+  by itself is not sufficient justification.
+- When a heuristic or rubric is genuinely needed, keep it small, readable, and
+  grounded in domain meaning. Avoid exhaustive scoring matrices, arbitrary
+  threshold proliferation, or mechanically converting qualitative judgment
+  into rules.
+- Prefer a clear, actionable failure at the owning boundary over a silent,
+  permissive fallback that hides broken assumptions.
+
+These constraints do not weaken the explicit Git policy, atomic publication,
+raw-data preservation, supported schema and environment contracts, or the
+protections around destructive and costly operations in this file. They limit
+speculative defenses beyond those concrete requirements.
+
 ## Repository artifact policy — high priority
 
 Do not add planning artifacts or tests to the repository unless the user

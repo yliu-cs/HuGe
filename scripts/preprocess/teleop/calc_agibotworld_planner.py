@@ -294,6 +294,129 @@ def _preflight_agibot_sharded(
         inventory_fingerprint=teleop._inventory_fingerprint(version_root, scanned),
     )
 
+
+PREFLIGHT_CACHE_FORMAT_VERSION = 1
+
+
+def _preflight_cache_params(args: argparse.Namespace, max_episodes: int | None) -> dict[str, Any]:
+    return {
+        "data_root": str(args.data_root),
+        "version_root": str(teleop._agibot_root(args.data_root)),
+        "shard_count": int(args.shard_count),
+        "shard_index": int(args.shard_index),
+        "min_source_frames": int(args.min_source_frames),
+        "max_episodes": max_episodes,
+    }
+
+
+def _segment_payload(segment: teleop.Segment) -> dict[str, int | None]:
+    return {
+        "start": int(segment.start),
+        "end": int(segment.end),
+        "calibration_start": segment.calibration_start,
+        "calibration_end": segment.calibration_end,
+    }
+
+
+def _segment_from_payload(payload: dict[str, Any]) -> teleop.Segment:
+    return teleop.Segment(
+        start=int(payload["start"]),
+        end=int(payload["end"]),
+        calibration_start=payload.get("calibration_start"),
+        calibration_end=payload.get("calibration_end"),
+    )
+
+
+def _episode_payload(episode: teleop.Episode) -> dict[str, Any]:
+    return {
+        "dataset": episode.dataset,
+        "source": str(episode.source),
+        "relative_source": episode.relative_source,
+        "stable_base": episode.stable_base,
+        "source_frames": int(episode.source_frames),
+        "source_hz": float(episode.source_hz),
+        "main_task": episode.main_task,
+        "segments": [_segment_payload(segment) for segment in episode.segments],
+        "valid_frames": int(episode.valid_frames),
+        "stats": teleop._jsonable(episode.stats),
+    }
+
+
+def _episode_from_payload(payload: dict[str, Any]) -> teleop.Episode:
+    return teleop.Episode(
+        dataset=str(payload["dataset"]),
+        source=Path(payload["source"]),
+        relative_source=str(payload["relative_source"]),
+        stable_base=str(payload["stable_base"]),
+        source_frames=int(payload["source_frames"]),
+        source_hz=float(payload["source_hz"]),
+        main_task=str(payload["main_task"]),
+        segments=tuple(_segment_from_payload(item) for item in payload["segments"]),
+        valid_frames=int(payload["valid_frames"]),
+        stats=dict(payload.get("stats", {})),
+    )
+
+
+def _load_preflight_cache(
+    cache_path: Path,
+    args: argparse.Namespace,
+    max_episodes: int | None,
+) -> teleop.Preflight | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        params = _preflight_cache_params(args, max_episodes)
+        if payload.get("format_version") != PREFLIGHT_CACHE_FORMAT_VERSION:
+            print(f"[agibot preflight cache] ignoring version mismatch: {cache_path}", flush=True)
+            return None
+        if payload.get("params") != params:
+            print(f"[agibot preflight cache] ignoring parameter mismatch: {cache_path}", flush=True)
+            return None
+        scanned = tuple(Path(item) for item in payload["scanned_sources"])
+        fingerprint = teleop._inventory_fingerprint(teleop._agibot_root(args.data_root), list(scanned))
+        if payload.get("inventory_fingerprint") != fingerprint:
+            print(f"[agibot preflight cache] ignoring stale source fingerprint: {cache_path}", flush=True)
+            return None
+        preflight = teleop.Preflight(
+            episodes=tuple(_episode_from_payload(item) for item in payload["episodes"]),
+            exclusions=tuple(dict(item) for item in payload.get("exclusions", ())),
+            scanned_sources=scanned,
+            inventory_fingerprint=fingerprint,
+        )
+        print(
+            f"[agibot preflight cache] loaded {len(preflight.episodes)} episode(s) "
+            f"from {cache_path}",
+            flush=True,
+        )
+        return preflight
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"[agibot preflight cache] ignoring unreadable cache {cache_path}: {error}", flush=True)
+        return None
+
+
+def _write_preflight_cache(
+    cache_path: Path,
+    preflight: teleop.Preflight,
+    args: argparse.Namespace,
+    max_episodes: int | None,
+) -> None:
+    payload = {
+        "format_version": PREFLIGHT_CACHE_FORMAT_VERSION,
+        "kind": "agibotworld_sharded_preflight",
+        "created_at": replay.now_utc(),
+        "params": _preflight_cache_params(args, max_episodes),
+        "inventory_fingerprint": preflight.inventory_fingerprint,
+        "scanned_sources": [str(path) for path in preflight.scanned_sources],
+        "episodes": [_episode_payload(episode) for episode in preflight.episodes],
+        "exclusions": list(preflight.exclusions),
+    }
+    teleop._atomic_write_json(cache_path, payload)
+    print(
+        f"[agibot preflight cache] wrote {len(preflight.episodes)} episode(s) to {cache_path}",
+        flush=True,
+    )
+
 def _yaw_from_robot_orientation_xyzw(quaternions: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
     values = np.asarray(quaternions, dtype=np.float64)
     norms = np.linalg.norm(values, axis=1)
@@ -965,8 +1088,14 @@ def _build_worker_specs(
     args: argparse.Namespace,
     job_count: int,
 ) -> list[replay.WorkerSpec]:
+    backend = replay.inference_backend(args)
+    if not devices:
+        if backend == "onnxruntime":
+            devices = ["cpu"]
+        else:
+            raise ValueError("at least one visible GPU is required")
     requested = args.workers if args.workers is not None else len(devices)
-    if requested > len(devices) and not args.allow_gpu_oversubscription:
+    if backend == "tensorrt" and requested > len(devices) and not args.allow_gpu_oversubscription:
         raise ValueError(
             f"--workers={requested} exceeds {len(devices)} visible GPU(s); "
             "pass --allow-gpu-oversubscription to run multiple replay workers per GPU"
@@ -1216,14 +1345,51 @@ def _run_live(
         cache_root,
         pilot=bool(args.allow_cross_root_cache),
     )
-    if cache_root.exists():
-        raise FileExistsError(f"cache already exists; refusing to overwrite: {cache_root}")
     mapping = _mapping_config(args)
     mapping_hash = _json_hash(mapping)
     asset_hashes = _asset_hashes()
     asset_hash = _json_hash(asset_hashes)
     jobs = _jobs(preflight)
     jobs.sort(key=lambda item: (-(item.segment.end - item.segment.start), item.stable_id))
+    if cache_root.exists():
+        if not args.resume:
+            raise FileExistsError(f"cache already exists; refusing to overwrite: {cache_root}")
+        success_path = cache_root / "_SUCCESS"
+        manifest_path = cache_root / "meta/conversion_manifest.json"
+        index_path = cache_root / "meta/episode_index.jsonl"
+        if not success_path.is_file() or not manifest_path.is_file() or not index_path.is_file():
+            raise FileExistsError(
+                f"cache already exists but is not a complete resumable part: {cache_root}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        checks = {
+            "raw_inventory_fingerprint": preflight.inventory_fingerprint,
+            "mapping_config_sha256": mapping_hash,
+            "runtime_asset_set_sha256": asset_hash,
+        }
+        mismatches = [
+            key for key, expected in checks.items() if manifest.get(key) != expected
+        ]
+        counts = manifest.get("counts") if isinstance(manifest.get("counts"), dict) else {}
+        if counts.get("segments") != len(jobs):
+            mismatches.append("counts.segments")
+        if mismatches:
+            raise ValueError(
+                f"existing cache metadata does not match current inputs: {', '.join(mismatches)}"
+            )
+        rows = [
+            json.loads(line)
+            for line in index_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        expected_ids = sorted(job.stable_id for job in jobs)
+        row_ids = sorted(str(row.get("stable_id")) for row in rows)
+        if row_ids != expected_ids:
+            raise ValueError("existing cache episode_index does not match current preflight jobs")
+        _validate_live_cache(cache_root, rows)
+        print(f"[agibot resume] complete cache already exists; skipped {len(rows)} episode(s): {cache_root}", flush=True)
+        return manifest
+    cache_root.parent.mkdir(parents=True, exist_ok=True)
     estimated_bytes = sum(
         (job.segment.end - job.segment.start) * (66 + PROPRIO_DIM) * 4
         for job in jobs
@@ -1237,7 +1403,10 @@ def _run_live(
         raise OSError(f"insufficient cache space: need {required_bytes}, have {available_bytes}")
 
     replay.validate_runtime_assets()
-    devices, gpu_source = replay.discover_visible_gpus()
+    if replay.inference_backend(args) == "onnxruntime":
+        devices, gpu_source = ["cpu"], "cpu"
+    else:
+        devices, gpu_source = replay.discover_visible_gpus()
     specs = _build_worker_specs(devices, args, len(jobs))
     args.work_root = (args.work_root / mapping_hash[:12]).resolve()
     staging = cache_root.with_name(f".{cache_root.name}.staging")
@@ -1398,6 +1567,7 @@ def _run_live(
             "runtime_asset_hashes": asset_hashes,
             "runtime_asset_set_sha256": asset_hash,
             "gpu_discovery_source": gpu_source,
+            "inference_backend": replay.inference_backend(args),
             "workers": replay.worker_inventory(specs),
             "gpu_oversubscription": bool(args.allow_gpu_oversubscription),
             "sharding": {
@@ -1636,9 +1806,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-root", type=Path, default=CACHE_ROOT)
     parser.add_argument("--max-episodes", type=int, default=2)
     parser.add_argument("--preflight-workers", type=_workers, default="auto")
+    parser.add_argument("--preflight-cache", type=Path)
+    parser.add_argument("--refresh-preflight-cache", action="store_true")
     parser.add_argument("--min-source-frames", type=int, default=20)
     parser.add_argument("--confirm-source-schema", action="store_true")
-    parser.add_argument("--workers", type=int, help="default: one worker per visible GPU")
+    parser.add_argument("--workers", type=int, help="default: one worker per visible GPU/CPU backend slot")
+    parser.add_argument("--inference-backend", default="tensorrt", choices=("tensorrt", "onnxruntime", "ort", "cpu"))
     parser.add_argument("--work-root", type=Path, default=WORK_ROOT)
     parser.add_argument("--zmq-port-base", type=int, default=replay.DEFAULT_ZMQ_PORT_BASE)
     parser.add_argument("--dds-domain-base", type=int, default=0)
@@ -1796,17 +1969,28 @@ def main() -> int:
     args.data_root = _resolve(args.data_root)
     args.cache_root = _resolve(args.cache_root)
     args.work_root = _resolve(args.work_root)
+    args.preflight_cache = _resolve(args.preflight_cache) if args.preflight_cache else None
     args.stats = _resolve(args.stats) if args.stats else None
     if args.stats is not None and not args.stats.is_file():
         raise FileNotFoundError(f"--stats does not exist: {args.stats}")
-    limit = None if (args.publish_full or args.max_episodes == 0) else args.max_episodes
-    preflight = _preflight_agibot_sharded(
-        args.data_root,
-        max_episodes=limit,
-        min_source_frames=args.min_source_frames,
-        shard_count=args.shard_count,
-        shard_index=args.shard_index,
+    max_episodes_explicit = any(
+        token == "--max-episodes" or token.startswith("--max-episodes=")
+        for token in sys.argv[1:]
     )
+    limit = None if ((args.publish_full and not max_episodes_explicit) or args.max_episodes == 0) else args.max_episodes
+    preflight = None
+    if args.preflight_cache and not args.refresh_preflight_cache:
+        preflight = _load_preflight_cache(args.preflight_cache, args, limit)
+    if preflight is None:
+        preflight = _preflight_agibot_sharded(
+            args.data_root,
+            max_episodes=limit,
+            min_source_frames=args.min_source_frames,
+            shard_count=args.shard_count,
+            shard_index=args.shard_index,
+        )
+        if args.preflight_cache:
+            _write_preflight_cache(args.preflight_cache, preflight, args, limit)
     if not (args.pilot or args.publish_full):
         print(json.dumps(_preflight_summary(preflight, args), indent=2, sort_keys=True))
         return 0
