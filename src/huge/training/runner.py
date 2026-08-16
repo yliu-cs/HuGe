@@ -27,6 +27,12 @@ from tqdm import tqdm
 
 from huge.data.collator import HugeCollator
 from huge.data.datamodule import build_stage_dataset, limit_dataset, normalize_dataset_specs
+from huge.data.proprio_stats import validate_proprio_stats_contract
+from huge.data.validation_manifest import (
+    build_validation_sources,
+    ensure_validation_manifest,
+    load_validation_manifest,
+)
 from huge.data.sampler import BlockShuffleSampler
 from huge.data.schemas import ActionSchema
 from huge.data.video_reader import set_frame_cache_size
@@ -182,6 +188,8 @@ def apply_stage_defaults(args: argparse.Namespace, provided: set[str]) -> argpar
     for key, value in asdict(defaults).items():
         if key not in provided:
             setattr(args, key, value)
+    if "batch_size" not in provided and args.model_architecture == "qwenoft" and stage in {"stage2", "stage3"}:
+        args.batch_size = 24
     return args
 
 
@@ -230,6 +238,8 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
         if args.egodex_root is not None:
             raise ValueError("--stage1-source and --egodex-root are mutually exclusive")
         normalize_dataset_specs(args.stage1_sources, stage="stage1")
+    if args.humanoid_arena_roots and args.humanoid_arena_task != "all":
+        raise ValueError("HumanoidArena training only supports --humanoid-arena-task all")
     if args.stage2_sources:
         if args.stage != "stage2":
             raise ValueError("--stage2-source is only valid for Stage 2")
@@ -794,6 +804,7 @@ def _payload_fingerprint(payload: Any) -> str:
 _RESUME_CONFIG_EXCLUDED_FIELDS = frozenset(
     {
         "init_ckpt",
+        "force_data_audit",
         "output_dir",
         "resume_from_checkpoint",
         "run_id",
@@ -851,6 +862,178 @@ def _file_contract(path: str | Path, *, required: bool = True) -> dict[str, Any]
         return None
     return {"path": str(source), "size": source.stat().st_size, "sha256": sha256_file(source)}
 
+
+def _cumulative_stats_contract(args: argparse.Namespace) -> tuple[str, dict[str, Path], str | None] | None:
+    data = Path(args.dataset_root) if args.dataset_root else Path("resource/dataset")
+    stage1 = {
+        "EGODEX": data / "EgoDex-cache" / "g1_proprio",
+        "EGOVERSE": data / "egoverse-retargeted-cache" / "g1_proprio",
+        "BEHAVIOR1K": data / "behavior-1k-2025-challenge-cache" / "g1_proprio",
+        "XPERIENCE": data / "xperience-10m-cache" / "g1_proprio",
+    }
+    if args.stage1_sources:
+        for spec in normalize_dataset_specs(args.stage1_sources, stage="stage1"):
+            stage1[{
+                "egodex": "EGODEX",
+                "egoverse": "EGOVERSE",
+                "behavior1k": "BEHAVIOR1K",
+                "xperience": "XPERIENCE",
+            }[spec.kind]] = (
+                spec.root.with_name(f"{spec.root.name}-cache") / "g1_proprio"
+                if spec.kind == "egodex"
+                else spec.root / "g1_proprio"
+            )
+    if args.stage == "stage1":
+        return "stage1", stage1, None
+
+    stage12 = {
+        **stage1,
+        "HE": data / "humanoid-everyday-cache" / "g1_proprio",
+        "WBT": data / "G1_WBT" / "g1_proprio",
+        "HIW": data / "HIW-500" / "g1_proprio",
+    }
+    if args.stage2_sources:
+        for spec in normalize_dataset_specs(args.stage2_sources, stage="stage2"):
+            stage12[{"he": "HE", "wbt": "WBT", "hiw": "HIW"}[spec.kind]] = (
+                spec.root.with_name(f"{spec.root.name}-cache") / "g1_proprio"
+                if spec.kind == "he"
+                else spec.root / "g1_proprio"
+            )
+    if args.stage == "stage2":
+        return "stage12", stage12, None
+    if args.stage == "stage3" and args.humanoid_arena_roots:
+        if len(args.humanoid_arena_roots) != 1:
+            raise ValueError("cumulative HumanoidArena stats require exactly one --humanoid-arena-roots entry")
+        return (
+            "stage123_humanoid_arena",
+            {**stage12, "HUMANOID_ARENA": Path(args.humanoid_arena_roots[0]) / "g1_proprio"},
+            "all",
+        )
+    return None
+
+
+def _validation_sources(args: argparse.Namespace, expected_sources: dict[str, Path]) -> dict[str, Any]:
+    data = Path(args.dataset_root) if args.dataset_root else Path("resource/dataset")
+    stage1_roots = (
+        {
+            spec.kind: spec.root
+            for spec in normalize_dataset_specs(args.stage1_sources, stage="stage1")
+        }
+        if args.stage1_sources
+        else None
+    )
+    stage2_roots = (
+        {
+            spec.kind: spec.root
+            for spec in normalize_dataset_specs(args.stage2_sources, stage="stage2")
+        }
+        if args.stage2_sources
+        else None
+    )
+    arena_root = Path(args.humanoid_arena_roots[0]) if args.humanoid_arena_roots else None
+    available = build_validation_sources(
+        data,
+        stage1_roots=stage1_roots,
+        stage2_roots=stage2_roots,
+        humanoid_arena_root=arena_root,
+    )
+    selected = {tag: available[tag] for tag in expected_sources}
+    for tag, expected_root in expected_sources.items():
+        if selected[tag].proprio_root.resolve() != expected_root.resolve():
+            raise ValueError(f"{tag} validation/stats proprio root mismatch")
+    return selected
+
+
+def _current_validation_tags(args: argparse.Namespace) -> list[str]:
+    if args.stage == "stage1":
+        kinds = (
+            [spec.kind for spec in normalize_dataset_specs(args.stage1_sources, stage="stage1")]
+            if args.stage1_sources
+            else ["egodex"]
+        )
+        tags = {
+            "egodex": "EGODEX",
+            "egoverse": "EGOVERSE",
+            "behavior1k": "BEHAVIOR1K",
+            "xperience": "XPERIENCE",
+        }
+        return [tags[kind] for kind in kinds]
+    if args.stage == "stage2":
+        kinds = (
+            [spec.kind for spec in normalize_dataset_specs(args.stage2_sources, stage="stage2")]
+            if args.stage2_sources
+            else ["he", "wbt"]
+        )
+        tags = {"he": "HE", "wbt": "WBT", "hiw": "HIW"}
+        return [tags[kind] for kind in kinds]
+    if args.stage == "stage3" and args.humanoid_arena_roots:
+        return ["HUMANOID_ARENA"]
+    return []
+
+
+def _validation_summaries(manifest: dict[str, Any], tags: list[str]) -> list[dict[str, Any]]:
+    fields = (
+        "dataset_id",
+        "n_files",
+        "n_frames",
+        "missing",
+        "extra",
+        "header_mismatch",
+        "length_mismatch",
+        "inventory_sha256",
+    )
+    return [{key: manifest["sources"][tag][key] for key in fields} for tag in tags]
+
+def _default_cumulative_stats_path(args: argparse.Namespace, stage_scope: str) -> str:
+    data = Path(args.dataset_root) if args.dataset_root else Path("resource/dataset")
+    filename = {
+        "stage1": "stage1_proprio_stats_union_sonic.json",
+        "stage12": "stage12_proprio_stats_union_sonic.json",
+        "stage123_humanoid_arena": "stage123_humanoid_arena_proprio_stats_union_sonic.json",
+    }[stage_scope]
+    return str(data / "meta" / filename)
+
+
+def _snapshot_proprio_stats(source: str | Path, run_dir: Path) -> str:
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"proprio stats not found: {source_path}")
+    destination = run_dir / "proprio_stats_sonic.json"
+    if destination.exists():
+        raise FileExistsError(f"new run already has a stats snapshot: {destination}")
+    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
+    try:
+        shutil.copy2(source_path, temporary)
+        if sha256_file(temporary) != sha256_file(source_path):
+            raise OSError(f"proprio stats snapshot changed while copying: {source_path}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(destination.resolve())
+
+
+def _validate_proprio_inventory(dataset: Any) -> list[dict[str, Any]] | None:
+    adapters = getattr(dataset, "datasets", [dataset])
+    summaries: list[dict[str, Any]] = []
+    for adapter in adapters:
+        validate = getattr(adapter, "validate_proprio_inventory", None)
+        if not callable(validate):
+            continue
+        summary = validate()
+        if not isinstance(summary, dict):
+            raise ValueError(f"{type(adapter).__name__}.validate_proprio_inventory() returned no summary")
+        failures = {
+            key: summary.get(key)
+            for key in ("missing", "extra", "header_mismatch", "length_mismatch")
+            if summary.get(key) != 0
+        }
+        if failures:
+            raise ValueError(
+                f"{summary.get('dataset_id', type(adapter).__name__)} proprio inventory failed: "
+                f"{failures}; examples={summary.get('examples', [])}"
+            )
+        summaries.append(summary)
+    return summaries or None
 
 def _source_contract(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[3]
@@ -917,6 +1100,7 @@ def _data_contract(
     dataset: Any,
     train_length: int,
     stats_path: str | None,
+    proprio_inventory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     roots: list[dict[str, Any]] = []
     source_values = args.stage1_sources if args.stage == "stage1" else args.stage2_sources
@@ -967,6 +1151,7 @@ def _data_contract(
         "episode_spans": spans_contract,
         "roots": roots,
         "stats": _file_contract(stats_path, required=True) if stats_path else None,
+        "proprio_inventory": proprio_inventory,
         "sample_stride": int(args.sample_stride),
         "max_episodes": args.max_episodes,
         "episode_fraction": args.episode_fraction,
@@ -2141,18 +2326,28 @@ def _train_stage_impl(
 
     source_contract = _main_process_call(accelerator, lambda: _source_contract(args))
     resume_info: dict[str, Any] | None = None
+    stats_contract = _cumulative_stats_contract(args)
+    requested_stats_path = args.proprio_stats_path
     if args.resume_from_checkpoint is not None:
         resume_info = _main_process_call(
             accelerator,
             lambda: inspect_resume_state(args.resume_from_checkpoint),
         )
+        if stats_contract is not None:
+            resume_run_dir = Path(str(resume_info["trainer_state"]["run_dir"])).resolve()
+            snapshot = resume_run_dir / "proprio_stats_sonic.json"
+            if not snapshot.is_file():
+                raise FileNotFoundError(f"resume run is missing stats snapshot: {snapshot}")
+            if requested_stats_path is not None and sha256_file(requested_stats_path) != sha256_file(snapshot):
+                raise ValueError("explicit proprio stats do not match the resume run-local snapshot")
+            args.proprio_stats_path = str(snapshot)
         out_dir = validate_resume_static(
             resume_info["trainer_state"],
             args,
             source_contract=source_contract,
         )
     else:
-        out_dir = (Path(args.output_dir).expanduser().resolve() / args.stage / _run_dir_name(args, accelerator))
+        out_dir = Path(args.output_dir).expanduser().resolve() / args.stage / _run_dir_name(args, accelerator)
     writer_lock = RunWriterLock(out_dir, enabled=_is_main_process(accelerator))
     writer_lock_holder.append(writer_lock)
 
@@ -2165,18 +2360,57 @@ def _train_stage_impl(
         ),
     )
     stats = args.proprio_stats_path
-    if stats is None and args.stage == "stage2":
-        source_kinds = {source[0].lower() for source in (args.stage2_sources or [])}
-        if source_kinds != {"hiw"}:
-            if args.dataset_root:
-                stage2_root = Path(args.dataset_root)
-            elif args.stage2_sources:
-                stage2_root = Path(args.stage2_sources[0][1]).parent
-            else:
-                stage2_root = Path("resource/dataset")
-            stats = str(stage2_root / "G1_WBT-cache/meta/g1_proprio_stats_sonic.json")
-    if stats is None and args.stage in {"stage3", "finetune_prop"}:
+    external_stats_path = requested_stats_path
+    validation_manifest: dict[str, Any] | None = None
+    validation_manifest_path: str | None = None
+    validated_inventories: dict[str, dict[str, Any]] | None = None
+    if stats_contract is not None:
+        stage_scope, expected_sources, task_scope = stats_contract
+        if stats is None:
+            stats = _default_cumulative_stats_path(args, stage_scope)
+        validate_proprio_stats_contract(
+            stats,
+            stage_scope=stage_scope,
+            sources=expected_sources,
+            task_scope=task_scope,
+        )
+        if resume_info is None:
+            external_stats_path = stats
+    elif stats is None and args.stage in {"stage3", "finetune_prop"}:
         stats = "resource/dataset/proprietary/real/cola_merged_cleaned_0530/meta/proprio_stats_union_sonic.json"
+        external_stats_path = stats
+
+    if stats_contract is not None:
+        validation_sources = _validation_sources(args, expected_sources)
+        validation_result = _main_process_call(
+            accelerator,
+            lambda: ensure_validation_manifest(
+                Path(args.dataset_root) if args.dataset_root else Path("resource/dataset"),
+                sources=validation_sources,
+                stage_scope=stage_scope,
+                stats_path=str(stats),
+                force=args.force_data_audit,
+            ),
+        )
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+        validation_manifest = load_validation_manifest(validation_result["publication"])
+        validation_manifest_path = str(Path(validation_result["publication"]) / "manifest.json")
+        validated_inventories = validation_manifest["sources"]
+        _log_main(
+            accelerator,
+            f"[{args.stage}] action/proprio validation: manifest={validation_manifest_path} "
+            f"audited={validation_result['audited_tags'] or 'none'} "
+            f"cached={validation_result['cached_tags'] or 'none'}",
+        )
+    _main_process_call(accelerator, lambda: writer_lock.acquire() or True)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    if stats_contract is not None and resume_info is None:
+        stats = _main_process_call(accelerator, lambda: _snapshot_proprio_stats(str(stats), out_dir))
+        args.proprio_stats_path = stats
+    elif stats_contract is not None:
+        stats = args.proprio_stats_path
     _log_main(
         accelerator,
         (
@@ -2199,15 +2433,28 @@ def _train_stage_impl(
         prop_ego_roots=args.prop_ego_roots,
         humanoid_arena_roots=args.humanoid_arena_roots,
         humanoid_arena_task=args.humanoid_arena_task,
+        validated_inventories=validated_inventories,
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
+    if validation_manifest is not None:
+        proprio_inventory = _validation_summaries(validation_manifest, _current_validation_tags(args))
+    else:
+        proprio_inventory = _main_process_call(accelerator, lambda: _validate_proprio_inventory(dataset))
+    if proprio_inventory:
+        for summary in proprio_inventory:
+            _log_main(
+                accelerator,
+                f"[{args.stage}] proprio inventory: source={summary['dataset_id']} "
+                f"files={summary['n_files']} frames={summary['n_frames']} mismatches=0",
+            )
     train_ds = limit_dataset(dataset, max_samples=args.max_train_samples)
     data_contract = _data_contract(
         args,
         dataset=dataset,
         train_length=len(train_ds),
         stats_path=stats,
+        proprio_inventory=proprio_inventory,
     )
     if resume_info is not None:
         _require_equal(
@@ -2427,15 +2674,12 @@ def _train_stage_impl(
         if resume_info is not None
         else out_dir.name
     )
-    _main_process_call(accelerator, lambda: writer_lock.acquire() or True)
-    if accelerator is not None:
-        accelerator.wait_for_everyone()
-
     if resume_info is None:
         data_manifest_payload = {
             **data_contract,
             "stage": args.stage,
             "stats": stats,
+            "external_stats": _file_contract(external_stats_path, required=True) if external_stats_path else None,
             "validation": "disabled",
         }
         training_config_payload = {
@@ -2453,6 +2697,7 @@ def _train_stage_impl(
             lambda: {
                 "data_manifest.json": write_json_atomic(out_dir / "data_manifest.json", data_manifest_payload),
                 "training_config.json": write_json_atomic(out_dir / "training_config.json", training_config_payload),
+                **({"proprio_stats_sonic.json": sha256_file(out_dir / "proprio_stats_sonic.json")} if stats_contract else {}),
             },
         )
     else:
@@ -2824,6 +3069,7 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--init-ckpt", default=None)
     p.add_argument("--resume-from-checkpoint", default=None)
     p.add_argument("--proprio-stats-path", default=None)
+    p.add_argument("--force-data-audit", action="store_true")
     p.add_argument("--dataset-root", default=None)
     p.add_argument("--egodex-root", default=None)
     p.add_argument("--stage1-source", dest="stage1_sources", action="append", nargs=2, metavar=("TYPE", "ROOT"))

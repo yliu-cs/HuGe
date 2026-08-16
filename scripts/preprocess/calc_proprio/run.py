@@ -624,13 +624,21 @@ def worker_summary(specs: list[WorkerSpec]) -> dict[str, Any]:
     }
 
 
-def resume_report(job: Job, rows: int, width: int) -> dict[str, Any] | None:
+def resume_report(
+    job: Job,
+    rows: int,
+    width: int,
+    *,
+    recover_missing_report: bool = False,
+) -> dict[str, Any] | None:
     output_report = report_path(job.output)
     if not job.output.exists() and not output_report.exists():
         return None
-    if not job.output.is_file() or not output_report.is_file():
+    if not job.output.is_file() or (output_report.exists() and not output_report.is_file()):
         raise RuntimeError(f"incomplete output/report pair for {job.episode_id}")
-    report = json.loads(output_report.read_text(encoding="utf-8"))
+    report = json.loads(output_report.read_text(encoding="utf-8")) if output_report.is_file() else None
+    if report is None and not recover_missing_report:
+        raise RuntimeError(f"incomplete output/report pair for {job.episode_id}")
     output = np.load(job.output, mmap_mode="r")
     expected = {
         "status": "complete",
@@ -641,13 +649,27 @@ def resume_report(job: Job, rows: int, width: int) -> dict[str, Any] | None:
         "proprio_rows": rows,
         "hand_state_source": hand_source(width),
     }
-    mismatches = {key: (report.get(key), value) for key, value in expected.items() if report.get(key) != value}
+    mismatches = (
+        {key: (report.get(key), value) for key, value in expected.items() if report.get(key) != value}
+        if report is not None
+        else {}
+    )
     if output.shape != (rows, 34) or output.dtype != np.float32:
         mismatches["output_array"] = ((output.shape, str(output.dtype)), ((rows, 34), "float32"))
     if not np.isfinite(output).all():
         mismatches["output_finite"] = (False, True)
     if mismatches:
         raise RuntimeError(f"resume validation failed for {job.episode_id}: {mismatches}")
+    if report is None:
+        report = {
+            "schema_version": 2,
+            **expected,
+            "episode_id": job.episode_id,
+            "recovered_at": now_utc(),
+            "recovered_from_output_only": True,
+            "warnings": ["recovered_missing_report"],
+        }
+        atomic_json(output_report, report)
     return report
 
 
@@ -1570,7 +1592,7 @@ def process_live_job(
     width: int | None = None
     try:
         rows, width = validate_token(job.token)
-        existing = resume_report(job, rows, width)
+        existing = resume_report(job, rows, width, recover_missing_report=args.resume)
         entry = validation_entry(job, rows, width)
         entry["runtime_assignment"] = runtime_assignment(spec)
         if existing is not None:
@@ -1693,7 +1715,7 @@ def run_single(
         return 0
     if spec is None:
         raise RuntimeError("live single-file run requires a worker")
-    existing = resume_report(job, rows, width)
+    existing = resume_report(job, rows, width, recover_missing_report=args.resume)
     if existing is not None:
         if not args.resume:
             raise FileExistsError(f"output already exists: {job.output}")

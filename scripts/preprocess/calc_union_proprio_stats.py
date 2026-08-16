@@ -1,33 +1,41 @@
-"""Compute Stage 2 + Stage 3 grouped 34-D proprio statistics."""
+"""Compute exact cumulative 34-D proprio statistics."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from huge.data.proprio_stats import write_proprio_stats
+from huge.data.proprio_stats import EXACT_STAGE_TAGS, write_proprio_stats
+
+
+def _source(value: str) -> tuple[str, Path]:
+    tag, separator, root = value.partition("=")
+    if not separator or not tag or not root:
+        raise argparse.ArgumentTypeError("--source must be TAG=ROOT")
+    return tag, Path(root)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--he-cache-root", default="resource/datasets/humanoid-everyday-cache")
-    parser.add_argument("--wbt-source-root", default="resource/datasets/G1_WBT")
-    parser.add_argument("--hiw-source-root", default="resource/datasets/HIW-500")
-    parser.add_argument("--prop-root", default=None)
-    parser.add_argument("--humanoid-arena-root", default="resource/datasets/HumanoidArena")
-    parser.add_argument("--out", default="resource/datasets/HumanoidArena/meta/proprio_stats_union_sonic.json")
+    parser.add_argument("--stage-scope", choices=sorted(EXACT_STAGE_TAGS), required=True)
+    parser.add_argument("--source", action="append", type=_source, required=True, metavar="TAG=ROOT")
+    parser.add_argument("--scratch-dir", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--show-progress", action="store_true")
     args = parser.parse_args()
-    sources = {
-        "HE": Path(args.he_cache_root) / "g1_proprio",
-        "WBT": Path(args.wbt_source_root) / "g1_proprio",
-        "HIW": Path(args.hiw_source_root) / "g1_proprio",
-    }
-    if args.prop_root:
-        sources["PROP"] = Path(args.prop_root) / "g1_proprio"
-    if args.humanoid_arena_root:
-        sources["HUMANOID_ARENA"] = Path(args.humanoid_arena_root) / "g1_proprio"
+    sources: dict[str, Path] = {}
+    for tag, root in args.source:
+        if tag in sources:
+            parser.error(f"duplicate --source tag: {tag}")
+        sources[tag] = root
     out = Path(args.out)
-    write_proprio_stats(sources, out)
+    write_proprio_stats(
+        sources,
+        out,
+        show_progress=args.show_progress,
+        scratch_dir=args.scratch_dir,
+        stage_scope=args.stage_scope,
+    )
     print(f"wrote {out}")
 
 

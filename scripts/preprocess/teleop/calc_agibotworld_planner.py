@@ -10,6 +10,7 @@ the live SONIC planner replay and writes Behavior-cache-style 66-D action tokens
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -54,7 +55,13 @@ DEFAULT_SOURCE_STANDING_WAIST_LIFT = 0.37
 DEFAULT_G1_STANDING_HEIGHT = 0.78
 DEFAULT_MINIMUM_HEIGHT = 0.40
 DEFAULT_MAXIMUM_HEIGHT = 0.80
+DEFAULT_AGIBOT_XYZ_X_SCALE = 0.667
+DEFAULT_AGIBOT_XYZ_Y_SCALE = 2.0 / 3.0
+DEFAULT_AGIBOT_XYZ_X_MIN = 0.12
+DEFAULT_AGIBOT_XYZ_Z_MIN = 0.15
+DEFAULT_AGIBOT_XYZ_Z_MAX = 1.25
 DEFAULT_GRIPPER_CLOSED_MM_THRESHOLD = 55.0
+DEFAULT_GRIPPER_CLOSED_WHEN = "ge"
 
 
 @dataclass(frozen=True)
@@ -138,26 +145,44 @@ def _read_agibot_arrays(data_root: Path, episode: teleop.Episode) -> dict[str, A
 
 
 
-def _preflight_agibot_sharded(
+def _preflight_agibot_sharded_serial(
     root: Path,
     *,
     max_episodes: int | None,
     min_source_frames: int,
     shard_count: int,
     shard_index: int,
+    trajectory_args: argparse.Namespace | None = None,
+    _tf: Any | None = None,
+    _tfds: Any | None = None,
+    _builder: Any | None = None,
+    _all_shards: list[Path] | None = None,
 ) -> teleop.Preflight:
-    if shard_count == 1 and shard_index == 0:
+    if shard_count == 1 and shard_index == 0 and trajectory_args is None:
         return teleop._preflight_agibot(
             root,
             max_episodes=max_episodes,
             min_source_frames=min_source_frames,
         )
-    tf, tfds = teleop._import_tfds()
+    tf, tfds = (
+        (_tf, _tfds)
+        if _tf is not None and _tfds is not None
+        else teleop._import_tfds()
+    )
     version_root = teleop._agibot_root(root)
     if not version_root.is_dir():
         raise FileNotFoundError(f"AgiBotWorld version root is missing: {version_root}")
-    builder = tfds.builder_from_directory(str(version_root))
-    all_shards = sorted(version_root.glob("*.tfrecord-*"))
+    builder = (
+        _builder
+        if _builder is not None
+        else tfds.builder_from_directory(str(version_root))
+    )
+    all_shards = (
+        _all_shards
+        if _all_shards is not None
+        else sorted(version_root.glob("*.tfrecord-*"))
+    )
+    absolute_indices = {shard: index for index, shard in enumerate(all_shards)}
     if not all_shards:
         raise FileNotFoundError(f"no AgiBotWorld TFRecord shards under {version_root}")
     shards = [
@@ -179,7 +204,7 @@ def _preflight_agibot_sharded(
     options.threading.private_threadpool_size = 1
     options.threading.max_intra_op_parallelism = 1
     for selected_shard_index, shard in enumerate(shards):
-        absolute_shard_index = all_shards.index(shard)
+        absolute_shard_index = absolute_indices[shard]
         scanned.append(shard)
         records = tf.data.TFRecordDataset(
             str(shard), num_parallel_reads=1
@@ -252,23 +277,29 @@ def _preflight_agibot_sharded(
                         "closed threshold require approved physical calibration"
                     ),
                 }
-                episodes.append(
-                    teleop.Episode(
-                        dataset="agibotworld",
-                        source=shard,
-                        relative_source=relative,
-                        stable_base=(
-                            f"agibotworld__{teleop._safe_id(shard.name)}__"
-                            f"record{record_index:03d}"
-                        ),
-                        source_frames=frames,
-                        source_hz=SOURCE_HZ,
-                        main_task=str(arrays["language"] or arrays["task"]),
-                        segments=segments,
-                        valid_frames=sum(segment.end - segment.start for segment in segments),
-                        stats=stats,
-                    )
+                episode = teleop.Episode(
+                    dataset="agibotworld",
+                    source=shard,
+                    relative_source=relative,
+                    stable_base=(
+                        f"agibotworld__{teleop._safe_id(shard.name)}__"
+                        f"record{record_index:03d}"
+                    ),
+                    source_frames=frames,
+                    source_hz=SOURCE_HZ,
+                    main_task=str(arrays["language"] or arrays["task"]),
+                    segments=segments,
+                    valid_frames=sum(segment.end - segment.start for segment in segments),
+                    stats=stats,
                 )
+                if trajectory_args is not None:
+                    for segment_index in range(len(episode.segments)):
+                        _trajectory_for_job(
+                            AgibotJob(episode, segment_index),
+                            trajectory_args,
+                            arrays=arrays,
+                        )
+                episodes.append(episode)
             except (OSError, ValueError, KeyError, IndexError) as exc:
                 exclusions.append({"source": relative, "reason": str(exc)})
             if max_episodes is not None and len(episodes) >= max_episodes:
@@ -295,7 +326,102 @@ def _preflight_agibot_sharded(
     )
 
 
-PREFLIGHT_CACHE_FORMAT_VERSION = 1
+def _preflight_agibot_sharded(
+    root: Path,
+    *,
+    max_episodes: int | None,
+    min_source_frames: int,
+    shard_count: int,
+    shard_index: int,
+    preflight_workers: str | int,
+    trajectory_args: argparse.Namespace | None = None,
+) -> teleop.Preflight:
+    cpu_count = os.cpu_count() or 1
+    requested = min(64, cpu_count) if preflight_workers == "auto" else int(preflight_workers)
+    if requested == 1 or max_episodes is not None or shard_count == 1:
+        return _preflight_agibot_sharded_serial(
+            root,
+            max_episodes=max_episodes,
+            min_source_frames=min_source_frames,
+            shard_count=shard_count,
+            shard_index=shard_index,
+            trajectory_args=trajectory_args,
+        )
+
+    worker_count = max(1, min(requested, cpu_count))
+    subshard_count = shard_count * worker_count
+    subshard_indices = [
+        shard_index + shard_count * worker for worker in range(worker_count)
+    ]
+    print(
+        f"[agibot shard preflight] part={shard_index}/{shard_count} "
+        f"workers={worker_count} subshard_count={subshard_count}",
+        flush=True,
+    )
+
+    tf, tfds = teleop._import_tfds()
+    version_root = teleop._agibot_root(root)
+    if not version_root.is_dir():
+        raise FileNotFoundError(f"AgiBotWorld version root is missing: {version_root}")
+    builder = tfds.builder_from_directory(str(version_root))
+    all_shards = sorted(version_root.glob("*.tfrecord-*"))
+
+    def scan(subshard_index: int) -> teleop.Preflight:
+        return _preflight_agibot_sharded_serial(
+            root,
+            max_episodes=None,
+            min_source_frames=min_source_frames,
+            shard_count=subshard_count,
+            shard_index=subshard_index,
+            trajectory_args=trajectory_args,
+            _tf=tf,
+            _tfds=tfds,
+            _builder=builder,
+            _all_shards=all_shards,
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        partials = list(executor.map(scan, subshard_indices))
+
+    episodes = [episode for partial in partials for episode in partial.episodes]
+    for episode in episodes:
+        episode.stats["shard_count"] = shard_count
+        episode.stats["shard_index"] = shard_index
+    episodes.sort(
+        key=lambda episode: (
+            int(episode.stats["absolute_shard_index"]),
+            int(episode.stats["record_index"]),
+        )
+    )
+    exclusions = [item for partial in partials for item in partial.exclusions]
+    exclusions.sort(key=lambda item: item["source"])
+    version_root = teleop._agibot_root(root)
+    scanned = [version_root / "dataset_info.json", version_root / "features.json"]
+    scanned.extend(
+        sorted(
+            {
+                path
+                for partial in partials
+                for path in partial.scanned_sources
+                if ".tfrecord-" in path.name
+            }
+        )
+    )
+    print(
+        f"[agibot shard preflight] part={shard_index}/{shard_count} "
+        f"complete shards={len(scanned) - 2} eligible={len(episodes)} "
+        f"excluded={len(exclusions)}",
+        flush=True,
+    )
+    return teleop.Preflight(
+        episodes=tuple(episodes),
+        exclusions=tuple(exclusions),
+        scanned_sources=tuple(scanned),
+        inventory_fingerprint=teleop._inventory_fingerprint(version_root, scanned),
+    )
+
+
+PREFLIGHT_CACHE_FORMAT_VERSION = 2
 
 
 def _preflight_cache_params(args: argparse.Namespace, max_episodes: int | None) -> dict[str, Any]:
@@ -306,6 +432,9 @@ def _preflight_cache_params(args: argparse.Namespace, max_episodes: int | None) 
         "shard_index": int(args.shard_index),
         "min_source_frames": int(args.min_source_frames),
         "max_episodes": max_episodes,
+        "trajectory_mapping_sha256": (
+            _json_hash(_mapping_config(args)) if args.publish_full else None
+        ),
     }
 
 
@@ -374,7 +503,12 @@ def _load_preflight_cache(
             print(f"[agibot preflight cache] ignoring parameter mismatch: {cache_path}", flush=True)
             return None
         scanned = tuple(Path(item) for item in payload["scanned_sources"])
-        fingerprint = teleop._inventory_fingerprint(teleop._agibot_root(args.data_root), list(scanned))
+        if args.trust_preflight_cache:
+            fingerprint = str(payload["inventory_fingerprint"])
+        else:
+            fingerprint = teleop._inventory_fingerprint(
+                teleop._agibot_root(args.data_root), list(scanned)
+            )
         if payload.get("inventory_fingerprint") != fingerprint:
             print(f"[agibot preflight cache] ignoring stale source fingerprint: {cache_path}", flush=True)
             return None
@@ -489,6 +623,37 @@ def _apply_flange_offsets(
     return out_pos, teleop._normalize_quaternions(out_ori)
 
 
+def _adjust_agibot_xyz(
+    positions: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    source = np.asarray(positions, dtype=np.float32)
+    adjusted = source.copy()
+    x_scaled = adjusted[..., 0] * float(args.agibot_xyz_x_scale)
+    adjusted[..., 0] = np.maximum(x_scaled, float(args.agibot_xyz_x_min))
+    adjusted[..., 1] *= float(args.agibot_xyz_y_scale)
+    adjusted[..., 2] = np.clip(
+        adjusted[..., 2],
+        float(args.agibot_xyz_z_min),
+        float(args.agibot_xyz_z_max),
+    )
+    return adjusted.astype(np.float32, copy=False), {
+        "method": "scale_xy_floor_x_clip_z",
+        "x_scale": float(args.agibot_xyz_x_scale),
+        "y_scale": float(args.agibot_xyz_y_scale),
+        "x_min": float(args.agibot_xyz_x_min),
+        "z_min": float(args.agibot_xyz_z_min),
+        "z_max": float(args.agibot_xyz_z_max),
+        "input_min": source.min(axis=(0, 1)).tolist(),
+        "input_max": source.max(axis=(0, 1)).tolist(),
+        "output_min": adjusted.min(axis=(0, 1)).tolist(),
+        "output_max": adjusted.max(axis=(0, 1)).tolist(),
+        "x_floor_values": int((x_scaled < float(args.agibot_xyz_x_min)).sum()),
+        "z_clip_low_values": int((source[..., 2] < float(args.agibot_xyz_z_min)).sum()),
+        "z_clip_high_values": int((source[..., 2] > float(args.agibot_xyz_z_max)).sum()),
+    }
+
+
 def _three_point_targets(
     arrays: dict[str, Any],
     segment: teleop.Segment,
@@ -497,7 +662,8 @@ def _three_point_targets(
     selection = slice(segment.start, segment.end)
     source_pos = np.asarray(arrays["end_position"][selection], dtype=np.float32)
     source_ori = teleop._to_wxyz(arrays["end_orientation"][selection], "xyzw")
-    tracking_pos, tracking_ori = _apply_flange_offsets(source_pos, source_ori, args)
+    tracking_pos_raw, tracking_ori = _apply_flange_offsets(source_pos, source_ori, args)
+    tracking_pos, xyz_adjust_report = _adjust_agibot_xyz(tracking_pos_raw, args)
 
     calibration_frames = min(int(args.calibration_frames), len(tracking_pos))
     if calibration_frames < 2:
@@ -556,8 +722,11 @@ def _three_point_targets(
         "calibration_end_frame_exclusive": segment.start + calibration_frames,
         "source_flange_position_min": source_pos.min(axis=(0, 1)).tolist(),
         "source_flange_position_max": source_pos.max(axis=(0, 1)).tolist(),
+        "tracking_position_pre_adjust_min": tracking_pos_raw.min(axis=(0, 1)).tolist(),
+        "tracking_position_pre_adjust_max": tracking_pos_raw.max(axis=(0, 1)).tolist(),
         "tracking_position_min": tracking_pos.min(axis=(0, 1)).tolist(),
         "tracking_position_max": tracking_pos.max(axis=(0, 1)).tolist(),
+        "agibot_xyz_adjustment": xyz_adjust_report,
         "retargeted_wrist_to_head_min": np.min(wrist_head, axis=0).tolist(),
         "retargeted_wrist_to_head_max": np.max(wrist_head, axis=0).tolist(),
         "base_yaw": base_yaw_report,
@@ -657,12 +826,23 @@ def _hand_state(
     gripper = np.asarray(
         arrays["gripper"][segment.start : segment.end], dtype=np.float32
     )
-    hands = (gripper <= float(args.gripper_closed_mm_threshold)).astype(np.float32)
+    threshold = float(args.gripper_closed_mm_threshold)
+    if args.gripper_closed_when == "le":
+        hands = gripper <= threshold
+        comparator = "<="
+    elif args.gripper_closed_when == "ge":
+        hands = gripper >= threshold
+        comparator = ">="
+    else:
+        raise ValueError(f"invalid gripper closed comparator: {args.gripper_closed_when}")
+    hands = hands.astype(np.float32)
     return hands, {
         "method": "observation_effector_position_gripper_mm_threshold",
-        "threshold_mm": float(args.gripper_closed_mm_threshold),
-        "source_open_mm_min": gripper.min(axis=0).tolist(),
-        "source_open_mm_max": gripper.max(axis=0).tolist(),
+        "threshold_mm": threshold,
+        "closed_when": args.gripper_closed_when,
+        "closed_comparator": comparator,
+        "source_position_gripper_min": gripper.min(axis=0).tolist(),
+        "source_position_gripper_max": gripper.max(axis=0).tolist(),
         "left_closed_fraction": float(hands[:, 0].mean()),
         "right_closed_fraction": float(hands[:, 1].mean()),
     }
@@ -774,6 +954,13 @@ def _mapping_config(args: argparse.Namespace) -> dict[str, Any]:
             "canonical_head_z": args.canonical_head_z,
             "calibration_frames": args.calibration_frames,
             "arm_axis_scale": list(args.arm_axis_scale),
+            "agibot_xyz_adjustment": {
+                "x_scale": args.agibot_xyz_x_scale,
+                "y_scale": args.agibot_xyz_y_scale,
+                "x_min": args.agibot_xyz_x_min,
+                "z_min": args.agibot_xyz_z_min,
+                "z_max": args.agibot_xyz_z_max,
+            },
             "left_flange_position_offset": list(args.left_flange_position_offset),
             "right_flange_position_offset": list(args.right_flange_position_offset),
             "left_flange_rotation_wxyz": list(args.left_flange_rotation_wxyz),
@@ -791,6 +978,7 @@ def _mapping_config(args: argparse.Namespace) -> dict[str, Any]:
         "hand": {
             "source": "observation/state/effector/position_gripper",
             "closed_mm_threshold": args.gripper_closed_mm_threshold,
+            "closed_when": args.gripper_closed_when,
             "closed": 1,
             "open": 0,
         },
@@ -993,6 +1181,191 @@ def _row_and_provenance(
         "source_fingerprint": source_fingerprint,
     }
     return row, provenance
+
+
+def _resume_identity(
+    job: AgibotJob,
+    mapping_hash: str,
+    asset_hash: str,
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    episode = job.episode
+    segment = job.segment
+    count = segment.end - segment.start
+    source_fingerprint = _source_fingerprint(episode.source, episode.relative_source)
+    episode_file_path = str(episode.stats.get("episode_file_path") or "")
+    shard_name, record_index = _parse_relative_source(episode.relative_source)
+    provenance = {
+        "source_path": episode.relative_source,
+        "source_fingerprint": source_fingerprint,
+        "source_episode_file_path": episode_file_path,
+        "source_start_frame": segment.start,
+        "source_end_frame_exclusive": segment.end,
+        "mapping_config_sha256": mapping_hash,
+        "runtime_asset_set_sha256": asset_hash,
+    }
+    row_checks = {
+        "stable_id": job.stable_id,
+        "dataset": "agibotworld",
+        "source": episode.relative_source,
+        "source_episode": episode.stable_base,
+        "source_start_frame": segment.start,
+        "source_end_frame_exclusive": segment.end,
+        "source_frame_count": count,
+        "token_frame_count": count,
+        "proprio_frame_count": count,
+        "source_hz": episode.source_hz,
+        "control_hz": CONTROL_HZ,
+        "resampling": "none",
+        "frame_mapping": "one_source_frame_to_one_control_tick",
+        "duration_scale": SOURCE_HZ / CONTROL_HZ,
+        "main_task": episode.main_task,
+        "encoder_mode": "teleop_planner",
+        "lower_body_policy": "sonic_planner",
+        "source_path": episode.relative_source,
+        "source_tfrecord": shard_name,
+        "source_record_index": record_index,
+        "source_episode_file_path": episode_file_path,
+        "mapping_config_sha256": mapping_hash,
+        "runtime_asset_set_sha256": asset_hash,
+        "source_fingerprint": source_fingerprint,
+    }
+    return count, provenance, row_checks
+
+
+def _mismatched_fields(payload: dict[str, Any], expected: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    return {
+        key: (payload.get(key), value)
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+
+
+def _trusted_resume_result(
+    staging: Path,
+    job: AgibotJob,
+    result: dict[str, Any],
+    mapping_hash: str,
+    asset_hash: str,
+) -> dict[str, Any] | None:
+    if result.get("status") not in LIVE_SUCCESS_STATUSES:
+        return None
+    row = result.get("row")
+    if not isinstance(row, dict):
+        return None
+    count, provenance, row_checks = _resume_identity(job, mapping_hash, asset_hash)
+    row_mismatches = _mismatched_fields(row, row_checks)
+    if row_mismatches:
+        raise RuntimeError(f"resume journal row mismatch for {job.stable_id}: {row_mismatches}")
+
+    token_path = staging / "sonic_tokens" / f"{job.stable_id}.npy"
+    proprio_path = staging / "g1_proprio" / f"{job.stable_id}.npy"
+    report_path = proprio_path.with_suffix(".report.json")
+    paths = (token_path, proprio_path, report_path)
+    if not any(path.exists() for path in paths):
+        return None
+    if not all(path.is_file() for path in paths):
+        raise RuntimeError(f"incomplete fast-resume output set for {job.stable_id}")
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report_expected = {
+        "status": "complete",
+        "mode": "planner_trajectory",
+        "episode_id": job.stable_id,
+        "trajectory_source": None,
+        "token_output_path": str(token_path),
+        "output_path": str(proprio_path),
+        "token_rows": count,
+        "proprio_rows": count,
+        "input_dim": replay.ACTION_DIM,
+        "provenance": provenance,
+    }
+    report_mismatches = _mismatched_fields(report, report_expected)
+    if report_mismatches:
+        raise RuntimeError(
+            f"resume report mismatch for {job.stable_id}: {report_mismatches}"
+        )
+
+    token = np.load(token_path, mmap_mode="r")
+    proprio = np.load(proprio_path, mmap_mode="r")
+    shape_mismatches: dict[str, tuple[Any, Any]] = {}
+    if token.shape != (count, replay.ACTION_DIM) or token.dtype != np.float32:
+        shape_mismatches["token_array"] = (
+            (token.shape, str(token.dtype)),
+            ((count, replay.ACTION_DIM), "float32"),
+        )
+    if proprio.shape != (count, PROPRIO_DIM) or proprio.dtype != np.float32:
+        shape_mismatches["proprio_array"] = (
+            (proprio.shape, str(proprio.dtype)),
+            ((count, PROPRIO_DIM), "float32"),
+        )
+    if shape_mismatches:
+        raise RuntimeError(
+            f"resume array header mismatch for {job.stable_id}: {shape_mismatches}"
+        )
+    return {
+        "status": "skipped",
+        "stable_id": job.stable_id,
+        "row": row,
+        "report": report,
+        "attempts": 0,
+        "resume_source": "execution_results.jsonl",
+    }
+
+
+def _load_trusted_resume_index(
+    staging: Path,
+    jobs: list[AgibotJob],
+    args: argparse.Namespace,
+    mapping_hash: str,
+    asset_hash: str,
+) -> dict[str, dict[str, Any]]:
+    if not args.resume or args.strict_resume_validation:
+        return {}
+    journal_path = staging / "meta/execution_results.jsonl"
+    if not journal_path.is_file():
+        return {}
+    candidates: dict[str, dict[str, Any]] = {}
+    with journal_path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"invalid resume journal JSON at {journal_path}:{line_number}: {exc}"
+                ) from exc
+            stable_id = str(result.get("stable_id") or "")
+            if stable_id and result.get("status") in LIVE_SUCCESS_STATUSES:
+                candidates[stable_id] = result
+    trusted: dict[str, dict[str, Any]] = {}
+    rejected: list[str] = []
+    for job in jobs:
+        result = candidates.get(job.stable_id)
+        if result is None:
+            continue
+        try:
+            trusted_result = _trusted_resume_result(
+                staging, job, result, mapping_hash, asset_hash
+            )
+        except RuntimeError as exc:
+            rejected.append(str(exc))
+            continue
+        if trusted_result is not None:
+            trusted[job.stable_id] = trusted_result
+    print(
+        f"[agibot resume] trusted {len(trusted)}/{len(jobs)} successful journal "
+        f"entry(s); strict_deep_validation={bool(args.strict_resume_validation)}",
+        flush=True,
+    )
+    for message in rejected[:5]:
+        print(f"[agibot resume] ignored stale journal entry: {message}", flush=True)
+    if len(rejected) > 5:
+        print(
+            f"[agibot resume] ignored {len(rejected) - 5} additional stale journal entries",
+            flush=True,
+        )
+    return trusted
 
 
 def _write_stats(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1335,6 +1708,121 @@ def _write_lerobot_v2_1(root: Path, rows: list[dict[str, Any]], args: argparse.N
     }
 
 
+LIVE_SUCCESS_STATUSES = {"complete", "complete-with-warnings", "skipped"}
+
+RETRYABLE_LIVE_ERROR_MARKERS = (
+    "planner capture ended early",
+    "no g1_debug frame echoed",
+    "planner g1_debug.index is missing, duplicated, or non-contiguous",
+    "missing planner VR orientation echo",
+    "capture stopped before planner launch",
+    "process exited with 0",
+    "Lost LowState data connection",
+    "Safety check failed",
+    "timed out after",
+    "TimeoutError:",
+)
+
+
+def _is_retryable_live_error(error_text: str) -> bool:
+    return any(marker in error_text for marker in RETRYABLE_LIVE_ERROR_MARKERS)
+
+
+def _status_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status", "unknown"))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _execution_failure_payload(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in {"row", "report"}
+    }
+
+
+def _write_live_execution_snapshot(
+    staging: Path,
+    jobs: list[AgibotJob],
+    results: list[dict[str, Any]],
+    *,
+    interrupted: bool,
+    workers: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    expected_ids = [job.stable_id for job in jobs]
+    latest_by_id = {
+        str(result["stable_id"]): result
+        for result in results
+        if "stable_id" in result
+    }
+    terminal = [
+        latest_by_id[stable_id]
+        for stable_id in expected_ids
+        if stable_id in latest_by_id
+    ]
+    missing_ids = [
+        stable_id for stable_id in expected_ids if stable_id not in latest_by_id
+    ]
+    failures = [
+        _execution_failure_payload(result)
+        for result in terminal
+        if result.get("status") == "failed"
+    ]
+    successes = [
+        result for result in terminal if result.get("status") in LIVE_SUCCESS_STATUSES
+    ]
+    success_rows = [
+        result["row"]
+        for result in successes
+        if isinstance(result.get("row"), dict)
+    ]
+    status_counts = _status_counts(terminal)
+    attempts = [
+        int(result.get("attempts", 1))
+        for result in terminal
+        if result.get("attempts") is not None
+    ]
+    payload = {
+        "status": (
+            "interrupted"
+            if interrupted
+            else "complete"
+            if len(successes) == len(expected_ids)
+            else "incomplete"
+        ),
+        "recorded_at": replay.now_utc(),
+        "attempted_segments": len(terminal),
+        "expected_segments": len(expected_ids),
+        "success_segments": len(successes),
+        "failed_segments": len(failures),
+        "missing_segments": len(missing_ids),
+        "status_counts": status_counts,
+        "success_ids": [str(result["stable_id"]) for result in successes],
+        "failed_ids": [str(item["stable_id"]) for item in failures],
+        "missing_ids": missing_ids,
+        "max_attempts_seen": max(attempts) if attempts else 0,
+        "retry": {
+            "max_retries_per_episode": int(args.max_retries_per_episode),
+            "retry_backoff_seconds": float(args.retry_backoff_seconds),
+            "retryable_error_markers": RETRYABLE_LIVE_ERROR_MARKERS,
+        },
+        "workers": workers,
+    }
+    meta = staging / "meta"
+    teleop._atomic_write_json(meta / "execution_report.json", payload)
+    teleop._atomic_write_jsonl(meta / "successful_episode_index.jsonl", success_rows)
+    teleop._atomic_write_jsonl(meta / "failed_episodes.jsonl", failures)
+    teleop._atomic_write_jsonl(
+        meta / "missing_episodes.jsonl",
+        [{"stable_id": stable_id} for stable_id in missing_ids],
+    )
+    return payload
+
+
 def _run_live(
     preflight: teleop.Preflight,
     args: argparse.Namespace,
@@ -1408,6 +1896,7 @@ def _run_live(
     else:
         devices, gpu_source = replay.discover_visible_gpus()
     specs = _build_worker_specs(devices, args, len(jobs))
+    worker_inventory = replay.worker_inventory(specs)
     args.work_root = (args.work_root / mapping_hash[:12]).resolve()
     staging = cache_root.with_name(f".{cache_root.name}.staging")
     started = time.monotonic()
@@ -1420,6 +1909,9 @@ def _run_live(
             (staging / "g1_proprio").mkdir()
             (staging / "meta").mkdir()
         journal_path = staging / "meta/execution_results.jsonl"
+        trusted_resume_index = _load_trusted_resume_index(
+            staging, jobs, args, mapping_hash, asset_hash
+        )
         task_queue: queue.Queue[AgibotJob] = queue.Queue()
         result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         for job in jobs:
@@ -1432,59 +1924,111 @@ def _run_live(
                     job = task_queue.get_nowait()
                 except queue.Empty:
                     return
-                try:
-                    trajectory, trajectory_check = _trajectory_for_job(job, args)
-                    row, provenance = _row_and_provenance(
-                        job,
-                        trajectory,
-                        trajectory_check,
-                        mapping_hash,
-                        asset_hash,
-                    )
-                    planner_job = replay.PlannerJob(
-                        trajectory_source=None,
-                        token_output=staging / "sonic_tokens" / f"{job.stable_id}.npy",
-                        proprio_output=staging / "g1_proprio" / f"{job.stable_id}.npy",
-                        episode_id=job.stable_id,
-                    )
-                    existing = replay.resume_planner_report(
-                        planner_job, trajectory, provenance=provenance
-                    )
-                    if existing is not None:
-                        if not args.resume:
-                            raise FileExistsError(f"output already exists for {job.stable_id}")
-                        status = "skipped"
-                        report = existing
-                    else:
-                        report = replay.run_planner_job(
-                            planner_job,
-                            trajectory,
-                            args,
-                            spec,
-                            gate,
-                            stop_event,
-                            provenance=provenance,
-                        )
-                        status = "complete-with-warnings" if report["warnings"] else "complete"
+                max_attempts = int(args.max_retries_per_episode) + 1
+                attempt = 0
+                trusted_resume = trusted_resume_index.get(job.stable_id)
+                if trusted_resume is not None:
                     result_queue.put(
                         {
-                            "status": status,
-                            "stable_id": job.stable_id,
-                            "row": row,
-                            "report": report,
-                        }
-                    )
-                except BaseException as error:
-                    result_queue.put(
-                        {
-                            "status": "failed",
-                            "stable_id": job.stable_id,
-                            "error": f"{type(error).__name__}: {error}",
+                            **trusted_resume,
                             "runtime_assignment": replay.runtime_assignment(spec),
                         }
                     )
-                    if args.fail_fast:
-                        stop_event.set()
+                    continue
+                while attempt < max_attempts and not stop_event.is_set():
+                    attempt += 1
+                    try:
+                        trajectory, trajectory_check = _trajectory_for_job(job, args)
+                        row, provenance = _row_and_provenance(
+                            job,
+                            trajectory,
+                            trajectory_check,
+                            mapping_hash,
+                            asset_hash,
+                        )
+                        planner_job = replay.PlannerJob(
+                            trajectory_source=None,
+                            token_output=staging / "sonic_tokens" / f"{job.stable_id}.npy",
+                            proprio_output=staging / "g1_proprio" / f"{job.stable_id}.npy",
+                            episode_id=job.stable_id,
+                        )
+                        if args.resume:
+                            resume_paths = (
+                                planner_job.token_output,
+                                planner_job.proprio_output,
+                                replay.planner_report_path(planner_job),
+                            )
+                            present_resume_paths = [
+                                path for path in resume_paths if path.exists()
+                            ]
+                            if present_resume_paths and len(present_resume_paths) != len(resume_paths):
+                                for path in present_resume_paths:
+                                    if path.is_file() or path.is_symlink():
+                                        path.unlink()
+                                    else:
+                                        raise RuntimeError(
+                                            f"cannot clean non-file incomplete resume artifact: {path}"
+                                        )
+                        existing = replay.resume_planner_report(
+                            planner_job, trajectory, provenance=provenance
+                        )
+                        if existing is not None:
+                            if not args.resume:
+                                raise FileExistsError(f"output already exists for {job.stable_id}")
+                            status = "skipped"
+                            report = existing
+                        else:
+                            report = replay.run_planner_job(
+                                planner_job,
+                                trajectory,
+                                args,
+                                spec,
+                                gate,
+                                stop_event,
+                                provenance=provenance,
+                            )
+                            status = "complete-with-warnings" if report["warnings"] else "complete"
+                        result_queue.put(
+                            {
+                                "status": status,
+                                "stable_id": job.stable_id,
+                                "row": row,
+                                "report": report,
+                                "attempts": attempt,
+                                "runtime_assignment": replay.runtime_assignment(spec),
+                            }
+                        )
+                        break
+                    except BaseException as error:
+                        error_text = f"{type(error).__name__}: {error}"
+                        retryable = (
+                            not isinstance(error, (KeyboardInterrupt, SystemExit))
+                            and _is_retryable_live_error(error_text)
+                        )
+                        if retryable and attempt < max_attempts and not stop_event.is_set():
+                            delay = float(args.retry_backoff_seconds) * attempt
+                            print(
+                                f"[retry {attempt}/{max_attempts - 1}] "
+                                f"{job.stable_id}: {error_text}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            if delay > 0.0 and stop_event.wait(delay):
+                                break
+                            continue
+                        result_queue.put(
+                            {
+                                "status": "failed",
+                                "stable_id": job.stable_id,
+                                "error": error_text,
+                                "attempts": attempt,
+                                "retryable": retryable,
+                                "runtime_assignment": replay.runtime_assignment(spec),
+                            }
+                        )
+                        if args.fail_fast:
+                            stop_event.set()
+                        break
 
         threads = [
             threading.Thread(
@@ -1525,17 +2069,41 @@ def _run_live(
         finally:
             for thread in threads:
                 thread.join()
+            drained_results: list[dict[str, Any]] = []
             while True:
                 try:
-                    results.append(result_queue.get_nowait())
+                    drained_results.append(result_queue.get_nowait())
                 except queue.Empty:
                     break
+            if drained_results:
+                with journal_path.open("a", encoding="utf-8") as journal:
+                    for result in drained_results:
+                        results.append(result)
+                        journal.write(
+                            json.dumps(
+                                {
+                                    "recorded_at": replay.now_utc(),
+                                    **teleop._jsonable(result),
+                                }
+                            )
+                            + "\n"
+                        )
+        execution_snapshot = _write_live_execution_snapshot(
+            staging,
+            jobs,
+            results,
+            interrupted=interrupted,
+            workers=worker_inventory,
+            args=args,
+        )
         failures = [result for result in results if result["status"] == "failed"]
         if interrupted:
             raise KeyboardInterrupt
         if failures or len(results) != len(jobs):
             raise RuntimeError(
-                f"planner conversion incomplete: results={len(results)}/{len(jobs)}, failures={len(failures)}"
+                "planner conversion incomplete: "
+                f"results={len(results)}/{len(jobs)}, failures={len(failures)}; "
+                f"see {staging / 'meta/execution_report.json'}"
             )
 
         rows_by_id = {result["stable_id"]: result["row"] for result in results}
@@ -1548,9 +2116,7 @@ def _run_live(
         teleop._atomic_write_json(staging / "meta/language_map.json", language_map)
         teleop._atomic_write_jsonl(staging / "meta/episode_index.jsonl", rows)
         stats_meta = _write_stats(staging, rows)
-        status_counts: dict[str, int] = {}
-        for result in results:
-            status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
+        status_counts = dict(execution_snapshot["status_counts"])
         lerobot_summary = None
         if not args.skip_lerobot_v2_1:
             lerobot_summary = _write_lerobot_v2_1(staging, rows, args)
@@ -1568,8 +2134,13 @@ def _run_live(
             "runtime_asset_set_sha256": asset_hash,
             "gpu_discovery_source": gpu_source,
             "inference_backend": replay.inference_backend(args),
-            "workers": replay.worker_inventory(specs),
+            "workers": worker_inventory,
             "gpu_oversubscription": bool(args.allow_gpu_oversubscription),
+            "retry": {
+                "max_retries_per_episode": int(args.max_retries_per_episode),
+                "retry_backoff_seconds": float(args.retry_backoff_seconds),
+                "retryable_error_markers": RETRYABLE_LIVE_ERROR_MARKERS,
+            },
             "sharding": {
                 "shard_count": args.shard_count,
                 "shard_index": args.shard_index,
@@ -1596,11 +2167,10 @@ def _run_live(
             "cli_resolved_config": teleop._jsonable(vars(args)),
         }
         teleop._atomic_write_json(staging / "meta/conversion_manifest.json", manifest)
-        teleop._atomic_write_json(
-            staging / "meta/execution_report.json",
-            {"status_counts": status_counts, "workers": replay.worker_inventory(specs)},
-        )
         _validate_live_cache(staging, rows)
+        execution_snapshot["published_cache_root"] = str(cache_root)
+        execution_snapshot["validated"] = True
+        teleop._atomic_write_json(staging / "meta/execution_report.json", execution_snapshot)
         (staging / "_SUCCESS").write_text("ok\n", encoding="utf-8")
         os.replace(staging, cache_root)
         return manifest
@@ -1808,6 +2378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preflight-workers", type=_workers, default="auto")
     parser.add_argument("--preflight-cache", type=Path)
     parser.add_argument("--refresh-preflight-cache", action="store_true")
+    parser.add_argument("--trust-preflight-cache", action="store_true")
     parser.add_argument("--min-source-frames", type=int, default=20)
     parser.add_argument("--confirm-source-schema", action="store_true")
     parser.add_argument("--workers", type=int, help="default: one worker per visible GPU/CPU backend slot")
@@ -1816,7 +2387,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zmq-port-base", type=int, default=replay.DEFAULT_ZMQ_PORT_BASE)
     parser.add_argument("--dds-domain-base", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--strict-resume-validation",
+        action="store_true",
+        help=(
+            "Disable fast journal-based resume and re-run the full per-episode "
+            "trajectory/output validation before skipping existing outputs."
+        ),
+    )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--max-retries-per-episode", type=int, default=0)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
     parser.add_argument("--allow-gpu-oversubscription", action="store_true")
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--stats", type=Path)
@@ -1851,6 +2432,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-head-z", type=float, default=teleop.DEFAULT_CANONICAL_HEAD_Z)
     parser.add_argument("--calibration-frames", type=int, default=30)
     parser.add_argument("--arm-axis-scale", nargs=3, type=float, default=(1.0, 1.0, 1.0))
+    parser.add_argument("--agibot-xyz-x-scale", type=float, default=DEFAULT_AGIBOT_XYZ_X_SCALE)
+    parser.add_argument("--agibot-xyz-y-scale", type=float, default=DEFAULT_AGIBOT_XYZ_Y_SCALE)
+    parser.add_argument("--agibot-xyz-x-min", type=float, default=DEFAULT_AGIBOT_XYZ_X_MIN)
+    parser.add_argument("--agibot-xyz-z-min", type=float, default=DEFAULT_AGIBOT_XYZ_Z_MIN)
+    parser.add_argument("--agibot-xyz-z-max", type=float, default=DEFAULT_AGIBOT_XYZ_Z_MAX)
     parser.add_argument("--left-flange-position-offset", nargs=3, type=float, default=(0.0, 0.0, 0.0))
     parser.add_argument("--right-flange-position-offset", nargs=3, type=float, default=(0.0, 0.0, 0.0))
     parser.add_argument("--left-flange-rotation-wxyz", nargs=4, type=float, default=(1.0, 0.0, 0.0, 0.0))
@@ -1862,6 +2448,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-yaw-offset", type=float, default=0.0)
     parser.add_argument("--head-pitch-offset", type=float, default=0.0)
     parser.add_argument("--gripper-closed-mm-threshold", type=float, default=DEFAULT_GRIPPER_CLOSED_MM_THRESHOLD)
+    parser.add_argument(
+        "--gripper-closed-when",
+        choices=("ge", "le"),
+        default=DEFAULT_GRIPPER_CLOSED_WHEN,
+        help="'ge': gripper values >= threshold are closed; 'le': values <= threshold are closed.",
+    )
     return parser.parse_args()
 
 
@@ -1879,6 +2471,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--resume is only valid with --publish-full")
     if args.workers is not None and args.workers <= 0:
         raise ValueError("--workers must be positive")
+    if args.max_retries_per_episode < 0:
+        raise ValueError("--max-retries-per-episode must be non-negative")
+    if args.retry_backoff_seconds < 0.0:
+        raise ValueError("--retry-backoff-seconds must be non-negative")
     if args.shard_count <= 0:
         raise ValueError("--shard-count must be positive")
     if not 0 <= args.shard_index < args.shard_count:
@@ -1909,6 +2505,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("squat threshold must be inside the height range")
     if args.source_standing_waist_lift <= args.source_minimum_waist_lift:
         raise ValueError("source standing waist lift must exceed source minimum waist lift")
+    if args.agibot_xyz_x_scale <= 0.0 or args.agibot_xyz_y_scale <= 0.0:
+        raise ValueError("AgiBot xyz x/y scales must be positive")
+    if args.agibot_xyz_x_min < 0.0:
+        raise ValueError("--agibot-xyz-x-min must be non-negative")
+    if not 0.0 <= args.agibot_xyz_z_min < args.agibot_xyz_z_max:
+        raise ValueError("AgiBot xyz z clip must satisfy 0 <= min < max")
     if args.gripper_closed_mm_threshold <= 0.0:
         raise ValueError("--gripper-closed-mm-threshold must be positive")
     args.left_flange_position_offset = _vec3_arg(list(args.left_flange_position_offset))
@@ -1954,8 +2556,8 @@ def _self_check() -> None:
     assert trajectory.rows == rows
     assert trajectory.vr_position.shape == (rows, 9)
     assert trajectory.vr_orientation.shape == (rows, 12)
-    assert np.array_equal(trajectory.hand_state[:, 0], np.ones(rows, dtype=np.float32))
-    assert np.array_equal(trajectory.hand_state[:, 1], np.zeros(rows, dtype=np.float32))
+    assert np.array_equal(trajectory.hand_state[:, 0], np.zeros(rows, dtype=np.float32))
+    assert np.array_equal(trajectory.hand_state[:, 1], np.ones(rows, dtype=np.float32))
     assert check["vr_quaternion_norm_max_err"] < 1e-6
     print("self-check passed: AgiBot planner trajectory contract")
 
@@ -1988,6 +2590,8 @@ def main() -> int:
             min_source_frames=args.min_source_frames,
             shard_count=args.shard_count,
             shard_index=args.shard_index,
+            preflight_workers=args.preflight_workers,
+            trajectory_args=args if args.publish_full else None,
         )
         if args.preflight_cache:
             _write_preflight_cache(args.preflight_cache, preflight, args, limit)

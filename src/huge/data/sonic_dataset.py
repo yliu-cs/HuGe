@@ -117,6 +117,7 @@ class SonicTokenDataset:
         language_map: dict[str, str] | None = None,
         max_episodes: int | None = None,
         video_len_hint_mode: str = "legacy_30fps",
+        validated_inventory: dict[str, Any] | None = None,
     ) -> None:
         self.cache_root = Path(cache_root)
         self.dataset_id = dataset_id
@@ -130,10 +131,18 @@ class SonicTokenDataset:
         self.language_map = language_map or {}
         self.max_episodes = max_episodes
         self.video_len_hint_mode = video_len_hint_mode
+        self.validated_inventory = validated_inventory
+        if validated_inventory is not None:
+            if validated_inventory.get("dataset_id") != dataset_id:
+                raise ValueError(f"validation manifest dataset mismatch for {dataset_id}")
+            if validated_inventory.get("cache_root") != str(self.cache_root.resolve()):
+                raise ValueError(f"validation manifest root mismatch for {dataset_id}")
         self.episodes = self._discover_episodes()
         self._finalize_index()
 
     def _discover_episodes(self) -> list[EpisodeRecord]:
+        if self.validated_inventory is not None:
+            return self._discover_validated_episodes()
         token_root = self.cache_root / "sonic_tokens"
         token_paths = _find_npy(token_root if token_root.exists() else self.cache_root)
         records: list[EpisodeRecord] = []
@@ -173,6 +182,40 @@ class SonicTokenDataset:
         if not records:
             raise FileNotFoundError(f"no .npy token files found under {self.cache_root}")
         return records
+    def _discover_validated_episodes(self) -> list[EpisodeRecord]:
+        rows = self.validated_inventory.get("records")
+        if not isinstance(rows, list) or len(rows) != self.validated_inventory.get("n_files"):
+            raise ValueError(f"validation manifest records are invalid for {self.dataset_id}")
+        records: list[EpisodeRecord] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 3:
+                raise ValueError(f"validation manifest record is invalid for {self.dataset_id}: {row!r}")
+            action_relative, proprio_relative, length = row
+            token_path = self.cache_root / "sonic_tokens" / str(action_relative)
+            proprio_path = self.cache_root / "g1_proprio" / str(proprio_relative)
+            video_path, video_len_hint = _candidate_video_paths(
+                self.cache_root,
+                token_path,
+                int(length),
+                video_len_hint_mode=self.video_len_hint_mode,
+            )
+            records.append(
+                EpisodeRecord(
+                    dataset_id=self.dataset_id,
+                    episode_id=_episode_id(token_path),
+                    token_path=token_path,
+                    proprio_path=proprio_path,
+                    video_path=video_path,
+                    video_len_hint=video_len_hint,
+                    length=int(length),
+                )
+            )
+            if self.max_episodes is not None and len(records) >= self.max_episodes:
+                break
+        if not records:
+            raise FileNotFoundError(f"no validated token files under {self.cache_root}")
+        return records
+
 
     def _finalize_index(self) -> None:
         self._ep_lengths = np.asarray(
@@ -263,11 +306,23 @@ class SonicTokenDataset:
         inventory = hashlib.sha256()
         tasks: Counter[str] = Counter()
         for episode in self.episodes:
-            relative = episode.token_path.relative_to(self.cache_root).as_posix()
-            inventory.update(
-                f"{relative}\t{episode.token_path.stat().st_size}\t{episode.length}\n".encode()
-            )
+            if self.validated_inventory is None:
+                relative = episode.token_path.relative_to(self.cache_root).as_posix()
+                inventory.update(
+                    f"{relative}\t{episode.token_path.stat().st_size}\t{episode.length}\n".encode()
+                )
+            else:
+                action_relative = episode.token_path.relative_to(self.cache_root / "sonic_tokens").as_posix()
+                proprio_relative = episode.proprio_path.relative_to(self.cache_root / "g1_proprio").as_posix()
+                inventory.update(
+                    f"{action_relative}\t{proprio_relative}\t{episode.length}\n".encode()
+                )
             tasks[self.language_map.get(episode.episode_id, self.language)] += 1
+        inventory_digest = (
+            str(self.validated_inventory["inventory_sha256"])
+            if self.validated_inventory is not None and self.max_episodes is None
+            else inventory.hexdigest()
+        )
         return {
             "adapter_schema_version": 1,
             "dataset_id": self.dataset_id,
@@ -283,7 +338,7 @@ class SonicTokenDataset:
             "state_mode": "required" if self.state_required else "masked_absent",
             "video_mode": self.video_len_hint_mode,
             "task_histogram": dict(sorted(tasks.items())),
-            "token_inventory_digest": inventory.hexdigest(),
+            "token_inventory_digest": inventory_digest,
         }
 
 

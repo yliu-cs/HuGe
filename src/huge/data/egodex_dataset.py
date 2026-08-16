@@ -10,7 +10,7 @@ resource/dataset/EgoDex/egodex_repacked_simple/
     token_state.npy      # [T, 64] SONIC latents at 50 Hz
 ```
 
-EgoDex has no G1 proprio and no reliable hand binary labels, so this loader
+EgoDex uses sibling replayed 34-D G1 proprio. It has no reliable hand binary labels, so this loader
 pads 64-D tokens into the 66-D container and masks the hand dimensions.
 """
 
@@ -35,6 +35,8 @@ from huge.data.episode_selection import (
     task_histogram,
 )
 from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM, pad_egodex_action
+from huge.data.proprio_stats import read_npy_header
+from huge.data.state_normalizer import StateNormalizer
 from huge.data.transforms import token_to_video_frame_index
 from huge.data.video_reader import decode_video_frame
 
@@ -67,6 +69,8 @@ class EgoDexDataset:
         self,
         data_root: str | Path = "resource/dataset/EgoDex/egodex_repacked_simple",
         *,
+        proprio_root: str | Path,
+        proprio_normalizer: StateNormalizer,
         action_horizon: int = ACTION_HORIZON,
         sample_stride: int = 1,
         max_episodes: int | None = None,
@@ -77,6 +81,10 @@ class EgoDexDataset:
         episode_selection_seed: int = 7,
     ) -> None:
         self.data_root = Path(data_root)
+        self.proprio_root = Path(proprio_root)
+        self.proprio_normalizer = proprio_normalizer
+        if not self.proprio_root.is_dir():
+            raise FileNotFoundError(f"missing EgoDex proprio root: {self.proprio_root}")
         self.dataset_id = "egodex"
         self.cache_root = Path(cache_root) if cache_root is not None else self.data_root
         self.action_horizon = int(action_horizon)
@@ -104,7 +112,7 @@ class EgoDexDataset:
             "selection_schema_version": 1,
             "algorithm": SELECTION_ALGORITHM,
             "adapter_name": type(self).__name__,
-            "adapter_schema_version": 1,
+            "adapter_schema_version": 2,
             "data_root": str(self.data_root),
             "cache_root": str(self.cache_root),
             "selection_mode": "prefix_debug" if max_episodes is not None else "fraction",
@@ -266,13 +274,118 @@ class EgoDexDataset:
     def __len__(self) -> int:
         return self._total
 
+    def _inventory_rows(self) -> list[tuple[str, int]]:
+        index_path = self._index_path()
+        idx = json.loads(index_path.read_text(encoding="utf-8"))
+        if "paths" in idx:
+            return [(str(path), int(length)) for path, length in zip(idx["paths"], idx["token_rows"], strict=True)]
+        if "episodes" in idx:
+            rows: list[tuple[str, int]] = []
+            episodes_root = self.data_root / "episodes"
+            for row in idx["episodes"]:
+                token_path = Path(row["token_path"])
+                ep_dir = token_path.parent if token_path.is_absolute() else (self.data_root / token_path).parent
+                try:
+                    rel = ep_dir.relative_to(self.data_root).as_posix()
+                except ValueError:
+                    rel = f"episodes/{ep_dir.relative_to(episodes_root).as_posix()}"
+                rows.append((rel, int(row["length"])))
+            return rows
+        raise ValueError(f"unsupported EgoDex index format: {index_path}")
+
+    def _proprio_path(self, ep_rel: str) -> Path:
+        relative = Path(ep_rel).relative_to("episodes")
+        return self.proprio_root / relative / "token_state.npy"
+
+    def _load_state(self, ep_rel: str, frame_idx: int, expected_length: int) -> np.ndarray:
+        path = self._proprio_path(ep_rel)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        raw = np.load(path, mmap_mode="r", allow_pickle=False)
+        if raw.shape != (expected_length, PROPRIO_DIM) or raw.dtype != np.dtype(np.float32):
+            raise ValueError(
+                f"{path} must be [{expected_length}, {PROPRIO_DIM}]/float32, "
+                f"got {raw.shape}/{raw.dtype}"
+            )
+        state = np.asarray(raw[frame_idx], dtype=np.float32)
+        if not np.isfinite(state).all():
+            raise ValueError(f"nonfinite proprio at {path}:{frame_idx}")
+        normalized = self.proprio_normalizer.normalize(state)
+        if not np.isfinite(normalized).all() or np.any(np.abs(normalized) > 1.000001):
+            raise ValueError(f"invalid normalized proprio at {path}:{frame_idx}")
+        return normalized
+
+    def validate_proprio_inventory(self) -> dict[str, Any]:
+        rows = self._inventory_rows()
+        expected_lengths: dict[str, int] = {}
+        for ep_rel, length in rows:
+            relative = (Path(ep_rel).relative_to("episodes") / "token_state.npy").as_posix()
+            if relative in expected_lengths or length <= 0:
+                raise ValueError(f"invalid EgoDex inventory row: {ep_rel!r}/{length}")
+            expected_lengths[relative] = length
+        token_root = self.data_root / "episodes"
+        expected = set(expected_lengths)
+        actual_tokens = {
+            path.relative_to(token_root).as_posix()
+            for path in token_root.rglob("token_state.npy")
+        }
+        actual_proprio = {
+            path.relative_to(self.proprio_root).as_posix()
+            for path in self.proprio_root.rglob("token_state.npy")
+        }
+        token_missing = expected - actual_tokens
+        proprio_missing = expected - actual_proprio
+        token_extra = actual_tokens - expected
+        proprio_extra = actual_proprio - expected
+        header_mismatch = 0
+        length_mismatch = 0
+        examples = sorted(token_missing | proprio_missing | token_extra | proprio_extra)[:8]
+        def probe(relative: str) -> tuple[int, int, str | None]:
+            token_shape, token_dtype = read_npy_header(token_root / relative)
+            proprio_shape, proprio_dtype = read_npy_header(self.proprio_root / relative)
+            token_header_ok = len(token_shape) == 2 and token_shape[1] == 64 and token_dtype == np.dtype(np.float32)
+            proprio_header_ok = len(proprio_shape) == 2 and proprio_shape[1] == PROPRIO_DIM and proprio_dtype == np.dtype(np.float32)
+            if not token_header_ok or not proprio_header_ok:
+                return 1, 0, relative
+            expected_length = expected_lengths[relative]
+            if token_shape[0] != expected_length or proprio_shape[0] != expected_length:
+                return 0, 1, relative
+            return 0, 0, None
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            for bad_header, bad_length, relative in executor.map(
+                probe, sorted(expected & actual_tokens & actual_proprio)
+            ):
+                header_mismatch += bad_header
+                length_mismatch += bad_length
+                if relative is not None and len(examples) < 8:
+                    examples.append(relative)
+        return {
+            "dataset_id": self.dataset_id,
+            "n_files": len(expected),
+            "n_frames": sum(expected_lengths.values()),
+            "missing": len(token_missing) + len(proprio_missing),
+            "extra": len(token_extra) + len(proprio_extra),
+            "header_mismatch": header_mismatch,
+            "length_mismatch": length_mismatch,
+            "examples": examples,
+        }
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ep_idx, frame_idx = self._resolve(idx)
         ep_rel = self._ep_paths[ep_idx].decode()
         ep_dir = self.data_root / ep_rel
         token_path = ep_dir / "token_state.npy"
-        tokens = np.load(token_path, mmap_mode="r")
+        tokens = np.load(token_path, mmap_mode="r", allow_pickle=False)
+        expected_length = int(self._ep_token_rows[ep_idx])
+        if tokens.shape != (expected_length, 64) or tokens.dtype != np.dtype(np.float32):
+            raise ValueError(
+                f"{token_path} must be [{expected_length}, 64]/float32, got {tokens.shape}/{tokens.dtype}"
+            )
         chunk = tokens[frame_idx : frame_idx + self.action_horizon]
+        if not np.isfinite(chunk).all():
+            raise ValueError(f"nonfinite action tokens at {token_path}:{frame_idx}")
+        state = self._load_state(ep_rel, frame_idx, expected_length)
         valid = len(chunk)
         action, mask = pad_egodex_action(chunk)
         if valid < self.action_horizon:
@@ -299,8 +412,8 @@ class EgoDexDataset:
             "video_path": str(video) if video.exists() else None,
             "video_frame_idx": video_frame_idx,
             "language": self._descriptions[int(self._ep_desc_id[ep_idx])],
-            "state": np.zeros((PROPRIO_DIM,), dtype=np.float32),
-            "state_mask": np.zeros((1,), dtype=np.float32),
+            "state": state,
+            "state_mask": np.ones((1,), dtype=np.float32),
             "normalized_actions": action,
             "sonic_mask": mask,
             "image": image,
@@ -322,6 +435,8 @@ class EgoDexDataset:
                 "size": index_path.stat().st_size,
                 "sha256": digest.hexdigest(),
             },
+            "proprio_root": str(self.proprio_root.resolve()),
+            "state_mode": "required_normalized_34d",
             "vision_source": "episode.mp4",
             "vision_time_mapping": "token_50hz_to_video_30hz",
         }

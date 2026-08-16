@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from torch.utils.data import Dataset, Subset
@@ -54,7 +54,7 @@ def normalize_dataset_specs(
 
 
 def _build_egodex(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
-    return EgoDexDataset(spec.root, **kwargs)
+    return EgoDexDataset(spec.root, proprio_root=spec.root.with_name(f"{spec.root.name}-cache") / "g1_proprio", **kwargs)
 
 
 def _build_egoverse(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
@@ -94,6 +94,7 @@ def _build_hiw(spec: DatasetSpec, kwargs: dict[str, Any]) -> Dataset:
         sample_stride=kwargs["sample_stride"],
         proprio_normalizer=kwargs["proprio_normalizer"],
         max_episodes=kwargs["max_episodes"],
+        validated_inventory=kwargs.get("validated_inventory"),
     )
 
 
@@ -234,12 +235,15 @@ def build_stage_dataset(
     prop_ego_roots: list[str] | None = None,
     humanoid_arena_roots: list[str] | None = None,
     humanoid_arena_task: str = "all",
+    validated_inventories: Mapping[str, dict[str, Any]] | None = None,
 ) -> Dataset:
     root = Path(repo_root)
     data = Path(dataset_root) if dataset_root is not None else root / "resource" / "dataset"
     stage = stage.lower()
     normalizer = StateNormalizer.from_json(proprio_stats_path) if proprio_stats_path else None
     if stage in {"stage1", "egodex", "pretrain_egodex"}:
+        if normalizer is None:
+            raise ValueError("Stage 1 requires --proprio-stats-path")
         if stage1_sources:
             specs = normalize_dataset_specs(stage1_sources, stage="stage1")
         else:
@@ -249,6 +253,7 @@ def build_stage_dataset(
             "max_episodes": max_episodes,
             "episode_fraction": episode_fraction,
             "episode_selection_seed": episode_selection_seed,
+            "proprio_normalizer": normalizer,
         }
         datasets = [STAGE1_DATASET_BUILDERS[spec.kind](spec, kwargs) for spec in specs]
         return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
@@ -266,7 +271,17 @@ def build_stage_dataset(
             "proprio_normalizer": normalizer,
             "max_episodes": max_episodes,
         }
-        datasets = [STAGE2_DATASET_BUILDERS[spec.kind](spec, kwargs) for spec in specs]
+        validation_tags = {"he": "HE", "wbt": "WBT", "hiw": "HIW"}
+        datasets = [
+            STAGE2_DATASET_BUILDERS[spec.kind](
+                spec,
+                {
+                    **kwargs,
+                    "validated_inventory": (validated_inventories or {}).get(validation_tags[spec.kind]),
+                },
+            )
+            for spec in specs
+        ]
         return datasets[0] if len(datasets) == 1 else MixtureDataset(datasets)
     if stage in {"stage3", "prop", "proprietary", "finetune_prop", "prop_ego", "proprietary_ego"}:
         datasets: list[Dataset] = []
@@ -292,6 +307,7 @@ def build_stage_dataset(
                 sample_stride=sample_stride,
                 proprio_normalizer=normalizer,
                 max_episodes=max_episodes,
+                validated_inventory=(validated_inventories or {}).get("HUMANOID_ARENA"),
             )
             for path in (humanoid_arena_roots or [])
         )

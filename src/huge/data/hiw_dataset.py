@@ -220,6 +220,7 @@ class HIWDataset(SonicTokenDataset):
         sample_stride: int = 1,
         proprio_normalizer: StateNormalizer | None = None,
         max_episodes: int | None = None,
+        validated_inventory: dict[str, Any] | None = None,
     ) -> None:
         self.data_root = Path(data_root)
         self.hiw_cache_root = (
@@ -228,12 +229,13 @@ class HIWDataset(SonicTokenDataset):
         self._episode_metadata_root, self._episode_metadata_origin = (
             resolve_hiw_episode_metadata_root(self.data_root)
         )
-        self._manifest = self._validate_overlay()
+        self._manifest = self._validate_overlay(skip_inventory_validation=validated_inventory is not None)
         self._hiw_episodes = load_hiw_episode_metadata(
             self.data_root,
             self._episode_metadata_root,
         )
-        self._validate_tokens()
+        if validated_inventory is None:
+            self._validate_tokens()
         language_map = {episode_id: episode.language for episode_id, episode in self._hiw_episodes.items()}
         super().__init__(
             self.data_root,
@@ -245,9 +247,10 @@ class HIWDataset(SonicTokenDataset):
             language_map=language_map,
             max_episodes=max_episodes,
             video_len_hint_mode="token_1to1",
+            validated_inventory=validated_inventory,
         )
 
-    def _validate_overlay(self) -> dict[str, Any]:
+    def _validate_overlay(self, *, skip_inventory_validation: bool = False) -> dict[str, Any]:
         required = [
             self.data_root / "meta" / "info.json",
             self.data_root / "meta" / "tasks.parquet",
@@ -265,19 +268,22 @@ class HIWDataset(SonicTokenDataset):
         manifest_sha256 = _sha256(manifest_path)
         if success_path.read_text(encoding="utf-8").strip() != manifest_sha256:
             raise ValueError("HIW cache _SUCCESS does not match conversion manifest")
-        episode_files: list[dict[str, str | int]] = []
-        episode_digest = hashlib.sha256()
-        for path in sorted(item for item in self._episode_metadata_root.rglob("*") if item.is_file()):
-            contract = _file_contract(path, self._episode_metadata_root)
-            episode_files.append(contract)
-            episode_digest.update(
-                f"{contract['path']}\t{contract['size']}\t{contract['sha256']}\n".encode()
-            )
-        if episode_files != manifest.get("episode_metadata_files"):
-            raise ValueError("HIW source episode metadata file inventory changed")
-        if episode_digest.hexdigest() != manifest.get("episode_metadata_digest"):
-            raise ValueError("HIW source episode metadata digest changed")
-        self._episode_metadata_files = episode_files
+        if skip_inventory_validation:
+            self._episode_metadata_files = list(manifest.get("episode_metadata_files", []))
+        else:
+            episode_files: list[dict[str, str | int]] = []
+            episode_digest = hashlib.sha256()
+            for path in sorted(item for item in self._episode_metadata_root.rglob("*") if item.is_file()):
+                contract = _file_contract(path, self._episode_metadata_root)
+                episode_files.append(contract)
+                episode_digest.update(
+                    f"{contract['path']}\t{contract['size']}\t{contract['sha256']}\n".encode()
+                )
+            if episode_files != manifest.get("episode_metadata_files"):
+                raise ValueError("HIW source episode metadata file inventory changed")
+            if episode_digest.hexdigest() != manifest.get("episode_metadata_digest"):
+                raise ValueError("HIW source episode metadata digest changed")
+            self._episode_metadata_files = episode_files
 
         if manifest.get("schema_version") != 4 or manifest.get("dataset_id") != "hiw500":
             raise ValueError(f"unsupported HIW cache manifest: {manifest_path}")

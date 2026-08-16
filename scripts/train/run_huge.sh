@@ -33,7 +33,7 @@ set -euo pipefail
 #   HUGE_SIM_STAGE3_CHECKPOINTING_STEPS=...   sim stage3 ckpt interval (default 500)
 #   HUGE_REAL_STAGE3_EPOCHS=...    real stage3 epochs (default 50)
 #   HUGE_REAL_STAGE3_CHECKPOINTING_STEPS=...  real stage3 ckpt interval (default 20000)
-#   HUGE_HUMANOID_ARENA_TASK=...   exact HumanoidArena task name, or all (default all)
+#   HUGE_HUMANOID_ARENA_TASK=all   HumanoidArena only supports all-task training
 #   HUGE_HUMANOID_ARENA_INIT_CKPT=...  optional init checkpoint (default none/from scratch)
 #   HUGE_STAGE12_DATA_ROOT=...           Stage 1/2 dataset root (default resource/datasets)
 #   HUGE_STAGE2_PROPRIO_STATS=...        Stage 2 stats under that root by default
@@ -61,6 +61,7 @@ set -euo pipefail
 #   HUGE_HUMANOID_ARENA_STAGE3_CHECKPOINTING_STEPS=...  legacy alias for checkpoint interval
 #   HUGE_MODEL_ARCHITECTURE=...    qwenpi_v3, qwengr00t, or qwenoft (sim/real modes only)
 #   HUGE_LOCK_FILE=...             override the default run flag file
+#   HUGE_FORCE_DATA_AUDIT=1        rerun the fixed 8-source audit once before training
 #
 # Usage:
 #   scripts/train/run_huge.sh --full-pipeline   run all three full pipelines sequentially
@@ -84,6 +85,7 @@ esac
 RUN_ROOT="${HUGE_RUN_ROOT:-$DEFAULT_RUN_ROOT}"
 MODEL_ARCHITECTURE="${HUGE_MODEL_ARCHITECTURE:-qwenpi_v3}"
 DRY_RUN="${HUGE_DRY_RUN:-0}"
+FORCE_DATA_AUDIT="${HUGE_FORCE_DATA_AUDIT:-0}"
 RUN_COUNT=0
 LOCK_HOST="$(hostname 2>/dev/null || printf 'unknown')"
 LOCK_TOKEN="$LOCK_HOST:$$:$(date +%s)"
@@ -103,10 +105,14 @@ REAL_STAGE3_CHECKPOINTING_STEPS="${HUGE_REAL_STAGE3_CHECKPOINTING_STEPS:-20000}"
 # Existing stage1/stage2 runs used to initialize real stage3 (read-only).
 STAGE2_SOURCE_ROOT="${HUGE_STAGE2_SOURCE_ROOT:-./.runs/sim_pipeline/pipeline}"
 
-# --- humanoid_arena stage3 (full-only by default; legacy modes are opt-in) ---
+# --- humanoid_arena stage3 (full tuning by default) ---
+STAGE12_DATA_ROOT="${HUGE_STAGE12_DATA_ROOT:-resource/datasets}"
+STAGE_STATS_ROOT="${HUGE_STAGE_STATS_ROOT:-$STAGE12_DATA_ROOT/meta}"
+STAGE1_PROPRIO_STATS="${HUGE_STAGE1_PROPRIO_STATS:-$STAGE_STATS_ROOT/stage1_proprio_stats_union_sonic.json}"
+STAGE2_PROPRIO_STATS="${HUGE_STAGE2_PROPRIO_STATS:-$STAGE_STATS_ROOT/stage12_proprio_stats_union_sonic.json}"
 HUMANOID_ARENA_TASK="${HUGE_HUMANOID_ARENA_TASK:-all}"
 HUMANOID_ARENA_ROOT="${HUGE_STAGE3_HUMANOID_ARENA_ROOT:-resource/datasets/HumanoidArena}"
-HUMANOID_ARENA_STATS="${HUGE_STAGE3_HUMANOID_ARENA_PROPRIO_STATS:-$HUMANOID_ARENA_ROOT/meta/proprio_stats_union_sonic.json}"
+HUMANOID_ARENA_STATS="${HUGE_STAGE3_HUMANOID_ARENA_PROPRIO_STATS:-$STAGE_STATS_ROOT/stage123_humanoid_arena_proprio_stats_union_sonic.json}"
 HUMANOID_ARENA_INIT_CKPT="${HUGE_HUMANOID_ARENA_INIT_CKPT:-none}"
 HUMANOID_ARENA_RESUME_STATE="${HUGE_HUMANOID_ARENA_RESUME_STATE:-}"
 HUMANOID_ARENA_STAGE3_EPOCHS="${HUGE_HUMANOID_ARENA_STAGE3_EPOCHS:-50}"
@@ -127,50 +133,31 @@ read -r -a HUMANOID_ARENA_TUNING_MODES <<< "${HUGE_HUMANOID_ARENA_TUNING_MODES:-
 HUMANOID_ARENA_LORA_R="${HUGE_HUMANOID_ARENA_LORA_R:-8}"
 HUMANOID_ARENA_LORA_ALPHA="${HUGE_HUMANOID_ARENA_LORA_ALPHA:-16}"
 HUMANOID_ARENA_LORA_DROPOUT="${HUGE_HUMANOID_ARENA_LORA_DROPOUT:-0.0}"
-STAGE12_DATA_ROOT="${HUGE_STAGE12_DATA_ROOT:-resource/datasets}"
-STAGE2_PROPRIO_STATS="${HUGE_STAGE2_PROPRIO_STATS:-$STAGE12_DATA_ROOT/G1_WBT-cache/meta/g1_proprio_stats_sonic.json}"
 STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-1e-5}"
 STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-2.5e-5}"
 STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-1e-4}"
-read -r -a STAGE1_SOURCES <<< "${HUGE_STAGE1_SOURCES:-egodex egoverse behavior1k xperience}"
-read -r -a STAGE2_SOURCES <<< "${HUGE_STAGE2_SOURCES:-he wbt hiw}"
 STAGE1_EPISODE_FRACTION="${HUGE_STAGE1_EPISODE_FRACTION:-}"
 STAGE1_EPISODE_SELECTION_SEED="${HUGE_STAGE1_EPISODE_SELECTION_SEED:-7}"
 STAGE1_SAMPLE_STRIDE="${HUGE_STAGE1_SAMPLE_STRIDE:-10}"
 STAGE1_MAX_STEPS="${HUGE_STAGE1_MAX_STEPS:-}"
 STAGE2_MAX_STEPS="${HUGE_STAGE2_MAX_STEPS:-}"
 
-declare -A STAGE1_ROOT_BY_KIND=(
-  [egodex]="$STAGE12_DATA_ROOT/EgoDex"
-  [egoverse]="$STAGE12_DATA_ROOT/egoverse-retargeted-cache"
-  [behavior1k]="$STAGE12_DATA_ROOT/behavior-1k-2025-challenge-cache"
-  [xperience]="$STAGE12_DATA_ROOT/xperience-10m-cache"
+STAGE1_SOURCE_ARGS=(
+  --stage1-source egodex "$STAGE12_DATA_ROOT/EgoDex"
+  --stage1-source egoverse "$STAGE12_DATA_ROOT/egoverse-retargeted-cache"
+  --stage1-source behavior1k "$STAGE12_DATA_ROOT/behavior-1k-2025-challenge-cache"
+  --stage1-source xperience "$STAGE12_DATA_ROOT/xperience-10m-cache"
 )
-declare -A STAGE2_ROOT_BY_KIND=(
-  [he]="$STAGE12_DATA_ROOT/humanoid-everyday"
-  [wbt]="$STAGE12_DATA_ROOT/G1_WBT"
-  [hiw]="$STAGE12_DATA_ROOT/HIW-500"
+STAGE2_SOURCE_ARGS=(
+  --stage2-source he "$STAGE12_DATA_ROOT/humanoid-everyday"
+  --stage2-source wbt "$STAGE12_DATA_ROOT/G1_WBT"
+  --stage2-source hiw "$STAGE12_DATA_ROOT/HIW-500"
 )
-STAGE1_SOURCE_ARGS=()
-for source_kind in "${STAGE1_SOURCES[@]}"; do
-  if [[ ! -v "STAGE1_ROOT_BY_KIND[$source_kind]" ]]; then
-    echo "invalid HUGE_STAGE1_SOURCES kind: $source_kind" >&2
-    exit 2
-  fi
-  STAGE1_SOURCE_ARGS+=(--stage1-source "$source_kind" "${STAGE1_ROOT_BY_KIND[$source_kind]}")
-done
-STAGE2_SOURCE_ARGS=()
-for source_kind in "${STAGE2_SOURCES[@]}"; do
-  if [[ ! -v "STAGE2_ROOT_BY_KIND[$source_kind]" ]]; then
-    echo "invalid HUGE_STAGE2_SOURCES kind: $source_kind" >&2
-    exit 2
-  fi
-  STAGE2_SOURCE_ARGS+=(--stage2-source "$source_kind" "${STAGE2_ROOT_BY_KIND[$source_kind]}")
-done
 STAGE1_DATA_ARGS=(
   "${STAGE1_SOURCE_ARGS[@]}"
   --episode-selection-seed "$STAGE1_EPISODE_SELECTION_SEED"
   --sample-stride "$STAGE1_SAMPLE_STRIDE"
+  --proprio-stats-path "$STAGE1_PROPRIO_STATS"
 )
 [[ -z "$STAGE1_EPISODE_FRACTION" ]] || STAGE1_DATA_ARGS+=(--episode-fraction "$STAGE1_EPISODE_FRACTION")
 [[ -z "$STAGE1_MAX_STEPS" ]] || STAGE1_DATA_ARGS+=(--max-steps "$STAGE1_MAX_STEPS")
@@ -260,6 +247,10 @@ if truthy "$FULL_PIPELINE" && [[ "$STAGE3_DATA" != "humanoid_arena" ]]; then
 fi
 
 validate_humanoid_arena_matrix() {
+  if [[ "$HUMANOID_ARENA_TASK" != "all" ]]; then
+    echo "HumanoidArena training only supports HUGE_HUMANOID_ARENA_TASK=all" >&2
+    return 2
+  fi
   if [[ "${#HUMANOID_ARENA_ARCHITECTURES[@]}" -eq 0 ]]; then
     echo "HumanoidArena architecture list must not be empty" >&2
     return 2
@@ -310,6 +301,10 @@ validate_humanoid_arena_matrix() {
     esac
     if [[ ! -d "$STAGE12_DATA_ROOT" ]]; then
       echo "Stage 1/2 dataset root not found: $STAGE12_DATA_ROOT" >&2
+      return 2
+    fi
+    if [[ ! -f "$STAGE1_PROPRIO_STATS" ]]; then
+      echo "Stage 1 proprio stats not found: $STAGE1_PROPRIO_STATS" >&2
       return 2
     fi
     if [[ ! -f "$STAGE2_PROPRIO_STATS" ]]; then
@@ -385,11 +380,11 @@ run_exp() {
 }
 
 run_stage1() {
-  run_exp stage1 --model-architecture "$MODEL_ARCHITECTURE" "${STAGE1_DATA_ARGS[@]}"
+  run_exp stage1 --model-architecture "$MODEL_ARCHITECTURE" --dataset-root "$STAGE12_DATA_ROOT" "${STAGE1_DATA_ARGS[@]}"
 }
 
 run_stage2() {
-  run_exp stage2 --model-architecture "$MODEL_ARCHITECTURE" "${STAGE2_DATA_ARGS[@]}"
+  run_exp stage2 --model-architecture "$MODEL_ARCHITECTURE" --dataset-root "$STAGE12_DATA_ROOT" "${STAGE2_DATA_ARGS[@]}" --proprio-stats-path "$STAGE2_PROPRIO_STATS"
 }
 
 run_sim_stage3() {
@@ -460,7 +455,7 @@ run_real_stage3() {
     --checkpointing-steps "$REAL_STAGE3_CHECKPOINTING_STEPS"
 }
 
-# Stage 3 on the unified HumanoidArena cache, optionally filtered to one task.
+# Stage 3 on the unified HumanoidArena cache with all tasks combined.
 run_humanoid_arena_stage3() {
   local architecture="$1"
   local tuning_mode="$2"
@@ -520,15 +515,7 @@ run_humanoid_arena_stage3() {
       --checkpointing-steps "$HUMANOID_ARENA_CHECKPOINTING_STEPS"
     )
   fi
-  run_exp stage3 \
-    --model-architecture "$architecture" \
-    "${initialization_args[@]}" \
-    --prop-roots \
-    --humanoid-arena-roots "$HUMANOID_ARENA_ROOT" \
-    --humanoid-arena-task "$HUMANOID_ARENA_TASK" \
-    --proprio-stats-path "$HUMANOID_ARENA_STATS" \
-    "${recipe_args[@]}" \
-    "${tuning_args[@]}"
+  run_exp stage3 --model-architecture "$architecture" --dataset-root "$STAGE12_DATA_ROOT" "${initialization_args[@]}" --prop-roots --humanoid-arena-roots "$HUMANOID_ARENA_ROOT" --humanoid-arena-task "$HUMANOID_ARENA_TASK" --proprio-stats-path "$HUMANOID_ARENA_STATS" "${recipe_args[@]}" "${tuning_args[@]}"
 }
 
 run_all() {
@@ -559,6 +546,24 @@ run_all() {
 }
 
 acquire_run_lock
+if truthy "$FORCE_DATA_AUDIT"; then
+  if [[ "$STAGE3_DATA" != "humanoid_arena" ]]; then
+    echo "HUGE_FORCE_DATA_AUDIT is only supported for humanoid_arena mode" >&2
+    exit 2
+  fi
+  audit_cmd=(
+    .venv/bin/python scripts/preprocess/validate_action_proprio_inventory.py
+    --dataset-root "$STAGE12_DATA_ROOT"
+    --stats-path "$HUMANOID_ARENA_STATS"
+    --force
+  )
+  printf '==> data audit command:'
+  printf ' %q' "${audit_cmd[@]}"
+  echo
+  if ! truthy "$DRY_RUN"; then
+    PYTHONPATH=src "${audit_cmd[@]}"
+  fi
+fi
 run_all
 
 if [[ "$RUN_COUNT" -eq 0 ]]; then

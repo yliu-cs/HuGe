@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,8 @@ from huge.data.episode_selection import (
     task_histogram,
 )
 from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM, validate_action_array
+from huge.data.proprio_stats import read_npy_header
+from huge.data.state_normalizer import StateNormalizer
 from huge.data.video_reader import decode_video_frame
 
 
@@ -80,8 +83,11 @@ class Stage1CacheDataset:
         episode_fraction: float | None = None,
         episode_selection_seed: int = 7,
         max_episodes: int | None = None,
+        proprio_normalizer: StateNormalizer,
     ) -> None:
         self.cache_root = Path(cache_root)
+        self.proprio_root = self.cache_root / "g1_proprio"
+        self.proprio_normalizer = proprio_normalizer
         self.dataset_id = dataset_id
         self.action_horizon = int(action_horizon)
         self.sample_stride = int(sample_stride)
@@ -127,7 +133,7 @@ class Stage1CacheDataset:
             "source_id": dataset_id,
             "dataset_id": dataset_id,
             "adapter_name": type(self).__name__,
-            "adapter_schema_version": 1,
+            "adapter_schema_version": 2,
             "cache_root": str(self.cache_root),
             "data_root": str(self.data_root),
             "requested_fraction": episode_fraction,
@@ -177,6 +183,8 @@ class Stage1CacheDataset:
             raise ValueError(
                 f"{self.dataset_id} manifest dataset is {manifest_dataset!r}, expected {self.expected_dataset!r}"
             )
+        if not self.proprio_root.is_dir():
+            raise FileNotFoundError(f"missing proprio directory: {self.proprio_root}")
         token_root = self.cache_root / "sonic_tokens"
         if not token_root.is_dir():
             raise FileNotFoundError(f"missing token directory: {token_root}")
@@ -269,6 +277,86 @@ class Stage1CacheDataset:
         mask[:valid] = 1.0
         return action, mask
 
+    def _load_state(self, segment: Stage1Segment, frame_idx: int) -> np.ndarray:
+        path = self.proprio_root / f"{segment.stable_id}.npy"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        raw = np.load(path, mmap_mode="r", allow_pickle=False)
+        if raw.shape != (segment.length, PROPRIO_DIM) or raw.dtype != np.dtype(np.float32):
+            raise ValueError(
+                f"{path} must be [{segment.length}, {PROPRIO_DIM}]/float32, "
+                f"got {raw.shape}/{raw.dtype}"
+            )
+        state = np.asarray(raw[frame_idx], dtype=np.float32)
+        if not np.isfinite(state).all():
+            raise ValueError(f"nonfinite proprio at {path}:{frame_idx}")
+        normalized = self.proprio_normalizer.normalize(state)
+        if not np.isfinite(normalized).all() or np.any(np.abs(normalized) > 1.000001):
+            raise ValueError(f"invalid normalized proprio at {path}:{frame_idx}")
+        return normalized
+
+    def validate_proprio_inventory(self) -> dict[str, Any]:
+        index_path = self.cache_root / "meta" / "episode_index.jsonl"
+        expected_lengths: dict[str, int] = {}
+        with index_path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                stable_id = str(row["stable_id"])
+                length = int(row.get("target_frames", row.get("token_frame_count", 0)))
+                relative = f"{stable_id}.npy"
+                if not stable_id or relative in expected_lengths or length <= 0:
+                    raise ValueError(f"{index_path}:{line_number} has invalid inventory row")
+                expected_lengths[relative] = length
+        token_root = self.cache_root / "sonic_tokens"
+        expected = set(expected_lengths)
+        actual_tokens = {
+            path.relative_to(token_root).as_posix()
+            for path in token_root.rglob("*.npy")
+        }
+        actual_proprio = {
+            path.relative_to(self.proprio_root).as_posix()
+            for path in self.proprio_root.rglob("*.npy")
+        }
+        token_missing = expected - actual_tokens
+        proprio_missing = expected - actual_proprio
+        token_extra = actual_tokens - expected
+        proprio_extra = actual_proprio - expected
+        header_mismatch = 0
+        length_mismatch = 0
+        examples = sorted(token_missing | proprio_missing | token_extra | proprio_extra)[:8]
+        def probe(relative: str) -> tuple[int, int, str | None]:
+            token_shape, token_dtype = read_npy_header(token_root / relative)
+            proprio_shape, proprio_dtype = read_npy_header(self.proprio_root / relative)
+            token_header_ok = len(token_shape) == 2 and token_shape[1] == ACTION_DIM and token_dtype == np.dtype(np.float32)
+            proprio_header_ok = len(proprio_shape) == 2 and proprio_shape[1] == PROPRIO_DIM and proprio_dtype == np.dtype(np.float32)
+            if not token_header_ok or not proprio_header_ok:
+                return 1, 0, relative
+            expected_length = expected_lengths[relative]
+            if token_shape[0] != expected_length or proprio_shape[0] != expected_length:
+                return 0, 1, relative
+            return 0, 0, None
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            for bad_header, bad_length, relative in executor.map(
+                probe, sorted(expected & actual_tokens & actual_proprio)
+            ):
+                header_mismatch += bad_header
+                length_mismatch += bad_length
+                if relative is not None and len(examples) < 8:
+                    examples.append(relative)
+        return {
+            "dataset_id": self.dataset_id,
+            "n_files": len(expected),
+            "n_frames": sum(expected_lengths.values()),
+            "missing": len(token_missing) + len(proprio_missing),
+            "extra": len(token_extra) + len(proprio_extra),
+            "header_mismatch": header_mismatch,
+            "length_mismatch": length_mismatch,
+            "examples": examples,
+        }
+
     def _load_image(self, segment: Stage1Segment, frame_idx: int) -> Image.Image:
         raise NotImplementedError
 
@@ -276,6 +364,7 @@ class Stage1CacheDataset:
         segment_idx, frame_idx = self._resolve(idx)
         segment = self.segments[segment_idx]
         action, mask = self._load_action(segment, frame_idx)
+        state = self._load_state(segment, frame_idx)
         return {
             "dataset_id": self.dataset_id,
             "task_id": segment.language,
@@ -284,8 +373,8 @@ class Stage1CacheDataset:
             "video_path": None,
             "video_frame_idx": None,
             "language": segment.language,
-            "state": np.zeros((PROPRIO_DIM,), dtype=np.float32),
-            "state_mask": np.zeros((1,), dtype=np.float32),
+            "state": state,
+            "state_mask": np.ones((1,), dtype=np.float32),
             "normalized_actions": action,
             "sonic_mask": mask,
             "image": self._load_image(segment, frame_idx),
@@ -303,6 +392,8 @@ class Stage1CacheDataset:
             **self.selection_summary(),
             "samples": len(self),
             "contract_files": self._contract_files,
+            "proprio_root": str(self.proprio_root.resolve()),
+            "state_mode": "required_normalized_34d",
         }
 
     def selection_summary(self) -> dict[str, Any]:
