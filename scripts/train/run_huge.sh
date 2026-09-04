@@ -17,8 +17,8 @@ set -euo pipefail
 #   writes to ${HUGE_RUN_ROOT:-./.runs/stage3_real_cola}/pipeline/stage3/<ts>/
 #
 # humanoid_arena mode (the default) trains all tasks with full tuning. Without an
-# architecture selector it uses the fixed order qwenoft -> qwenpi_v3 ->
-# qwengr00t; formal multi-host runs select exactly one architecture with
+# architecture selector it uses the fixed order qwenpi_v3 -> qwengr00t ->
+# qwenoft; formal multi-host runs select exactly one architecture with
 # --arch. Add --full-pipeline to run stage1 -> stage2 -> stage3 per architecture.
 # It writes to:
 #   ${HUGE_RUN_ROOT:-./.runs/full_all_stage}/
@@ -41,7 +41,7 @@ set -euo pipefail
 #   HUGE_STAGE12_PROJECTOR_LR=...         Stage 1/2 projector LR (default 2.5e-5)
 #   HUGE_STAGE12_ACTION_LR=...            Stage 1/2 action-head LR (default 1e-4)
 #   HUGE_STAGE1_SAMPLE_STRIDE=...         Stage 1 time-step stride (default 10)
-#   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenoft qwenpi_v3 qwengr00t")
+#   HUGE_HUMANOID_ARENA_ARCHITECTURES=...     space-separated archs (default "qwenpi_v3 qwengr00t qwenoft")
 #   HUGE_HUMANOID_ARENA_TUNING_MODES=...      space-separated modes (default "full")
 #   HUGE_HUMANOID_ARENA_RESUME_STATE=...      resume state; requires one architecture and full mode
 #   HUGE_HUMANOID_ARENA_VLM_LR=...            full VLM LR (default 1e-5)
@@ -128,7 +128,7 @@ HUMANOID_ARENA_QWENOFT_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENOFT_MAX_STEPS:-$HUMA
 HUMANOID_ARENA_QWENPI_V3_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENPI_V3_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_QWENGR00T_MAX_STEPS="${HUGE_HUMANOID_ARENA_QWENGR00T_MAX_STEPS:-$HUMANOID_ARENA_MAX_STEPS}"
 HUMANOID_ARENA_LEGACY_LR="${HUGE_HUMANOID_ARENA_LEARNING_RATE:-3e-5}"
-read -r -a HUMANOID_ARENA_ARCHITECTURES <<< "${HUGE_HUMANOID_ARENA_ARCHITECTURES:-qwenoft qwenpi_v3 qwengr00t}"
+read -r -a HUMANOID_ARENA_ARCHITECTURES <<< "${HUGE_HUMANOID_ARENA_ARCHITECTURES:-qwenpi_v3 qwengr00t qwenoft}"
 read -r -a HUMANOID_ARENA_TUNING_MODES <<< "${HUGE_HUMANOID_ARENA_TUNING_MODES:-full}"
 HUMANOID_ARENA_LORA_R="${HUGE_HUMANOID_ARENA_LORA_R:-8}"
 HUMANOID_ARENA_LORA_ALPHA="${HUGE_HUMANOID_ARENA_LORA_ALPHA:-16}"
@@ -137,7 +137,7 @@ STAGE12_VLM_LR="${HUGE_STAGE12_VLM_LR:-1e-5}"
 STAGE12_PROJECTOR_LR="${HUGE_STAGE12_PROJECTOR_LR:-2.5e-5}"
 STAGE12_ACTION_LR="${HUGE_STAGE12_ACTION_LR:-1e-4}"
 STAGE1_EPISODE_FRACTION="${HUGE_STAGE1_EPISODE_FRACTION:-}"
-STAGE1_EPISODE_SELECTION_SEED="${HUGE_STAGE1_EPISODE_SELECTION_SEED:-7}"
+STAGE1_EPISODE_SELECTION_SEED="${HUGE_STAGE1_EPISODE_SELECTION_SEED:-1222}"
 STAGE1_SAMPLE_STRIDE="${HUGE_STAGE1_SAMPLE_STRIDE:-10}"
 STAGE1_MAX_STEPS="${HUGE_STAGE1_MAX_STEPS:-}"
 STAGE2_MAX_STEPS="${HUGE_STAGE2_MAX_STEPS:-}"

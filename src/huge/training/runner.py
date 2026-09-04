@@ -188,7 +188,7 @@ def apply_stage_defaults(args: argparse.Namespace, provided: set[str]) -> argpar
     for key, value in asdict(defaults).items():
         if key not in provided:
             setattr(args, key, value)
-    if "batch_size" not in provided and args.model_architecture == "qwenoft" and stage in {"stage2", "stage3"}:
+    if "batch_size" not in provided and args.model_architecture == "qwenoft" and stage in {"stage1", "stage2", "stage3"}:
         args.batch_size = 24
     return args
 
