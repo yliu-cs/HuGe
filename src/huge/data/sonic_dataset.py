@@ -13,6 +13,7 @@ import numpy as np
 from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM, pad_egodex_action, validate_action_array
 from huge.data.episode_selection import global_selected_episode_digest
 from huge.data.state_normalizer import StateNormalizer
+from huge.data.video_reader import decode_video_frame
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,8 @@ class SonicTokenDataset:
         max_episodes: int | None = None,
         video_len_hint_mode: str = "legacy_30fps",
         validated_inventory: dict[str, Any] | None = None,
+        episode_ids: Sequence[str] | None = None,
+        strict_video: bool = False,
     ) -> None:
         self.cache_root = Path(cache_root)
         self.dataset_id = dataset_id
@@ -132,12 +135,28 @@ class SonicTokenDataset:
         self.max_episodes = max_episodes
         self.video_len_hint_mode = video_len_hint_mode
         self.validated_inventory = validated_inventory
+        self.strict_video = strict_video
+        self.episode_ids = None if episode_ids is None else list(episode_ids)
+        if episode_ids is not None and max_episodes is not None:
+            raise ValueError("episode_ids and max_episodes are mutually exclusive")
         if validated_inventory is not None:
             if validated_inventory.get("dataset_id") != dataset_id:
                 raise ValueError(f"validation manifest dataset mismatch for {dataset_id}")
             if validated_inventory.get("cache_root") != str(self.cache_root.resolve()):
                 raise ValueError(f"validation manifest root mismatch for {dataset_id}")
         self.episodes = self._discover_episodes()
+        self.pool_episodes = len(self.episodes)
+        self.pool_samples = sum((ep.length + self.sample_stride - 1) // self.sample_stride for ep in self.episodes)
+        if self.episode_ids is not None:
+            available = {ep.episode_id for ep in self.episodes}
+            selected = set(self.episode_ids)
+            if len(available) != len(self.episodes) or len(selected) != len(self.episode_ids) or not selected <= available:
+                raise ValueError(f"{dataset_id}: duplicate or missing episode IDs: {sorted(selected - available)}")
+            self.episodes = [ep for ep in self.episodes if ep.episode_id in selected]
+        if strict_video:
+            for ep in self.episodes:
+                if ep.video_path is None or not ep.video_path.is_file():
+                    raise FileNotFoundError(f"{dataset_id}/{ep.episode_id}: required video is missing: {ep.video_path}")
         self._finalize_index()
 
     def _discover_episodes(self) -> list[EpisodeRecord]:
@@ -299,7 +318,7 @@ class SonicTokenDataset:
             "state_mask": state_mask,
             "normalized_actions": action,
             "sonic_mask": sonic_mask,
-            "image": None,
+            "image": decode_video_frame(ep.video_path, self._video_frame_idx(ep, frame_idx) or 0, missing_ok=False) if self.strict_video else None,
         }
 
     def data_contract(self) -> dict[str, Any]:
@@ -320,7 +339,7 @@ class SonicTokenDataset:
             tasks[self.language_map.get(episode.episode_id, self.language)] += 1
         inventory_digest = (
             str(self.validated_inventory["inventory_sha256"])
-            if self.validated_inventory is not None and self.max_episodes is None
+            if self.validated_inventory is not None and self.max_episodes is None and self.episode_ids is None
             else inventory.hexdigest()
         )
         return {
@@ -339,6 +358,10 @@ class SonicTokenDataset:
             "video_mode": self.video_len_hint_mode,
             "task_histogram": dict(sorted(tasks.items())),
             "token_inventory_digest": inventory_digest,
+            **({"episode_selection": {"pool_episodes": self.pool_episodes,
+                                      "requested_episodes": len(self.episode_ids),
+                                      "selected_episode_ids": [ep.episode_id for ep in self.episodes]}}
+               if self.episode_ids is not None else {}),
         }
 
 
@@ -346,10 +369,11 @@ class SonicTokenDataset:
 class MixtureDataset:
     """Natural-frame-ratio mixture over multiple map-style datasets."""
 
-    def __init__(self, datasets: Sequence[Any]) -> None:
+    def __init__(self, datasets: Sequence[Any], *, sampling: dict[str, Any] | None = None) -> None:
         if not datasets:
             raise ValueError("datasets must be non-empty")
         self.datasets = list(datasets)
+        self.sampling = sampling
         lengths = [len(d) for d in self.datasets]
         self._cum = np.cumsum(lengths)
 
@@ -422,4 +446,6 @@ class MixtureDataset:
         selection = self.selection_summary()
         if selection is not None:
             payload["selection"] = selection
+        if self.sampling is not None:
+            payload["sampling"] = self.sampling
         return payload

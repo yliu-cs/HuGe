@@ -264,6 +264,8 @@ def build_validation_sources(
     stage1_roots: Mapping[str, Path] | None = None,
     stage2_roots: Mapping[str, Path] | None = None,
     humanoid_arena_root: Path | None = None,
+    proprietary_real_root: Path | None = None,
+    proprietary_ego_root: Path | None = None,
 ) -> dict[str, ValidationSource]:
     data = Path(dataset_root)
     s1 = {
@@ -301,7 +303,7 @@ def build_validation_sources(
     he_cache = s2["he"].with_name(f"{s2['he'].name}-cache")
     hiw_cache = s2["hiw"].with_name(f"{s2['hiw'].name}-cache")
     arena = humanoid_arena_root or data / "HumanoidArena"
-    return {
+    sources = {
         "EGODEX": ValidationSource(
             tag="EGODEX",
             dataset_id="egodex",
@@ -373,6 +375,22 @@ def build_validation_sources(
             keep_records=True,
         ),
     }
+    if proprietary_real_root is not None:
+        root = proprietary_real_root
+        sources["PROP_REAL"] = ValidationSource(
+            "PROP_REAL", "proprietary_real", "sonic", root, root / "sonic_tokens", root / "g1_proprio", 66,
+            (root / "meta/info.json", root / "meta/episodes.jsonl", root / "meta/tasks.jsonl"), keep_records=True,
+        )
+    if proprietary_ego_root is not None:
+        from huge.data.prop_ego_dataset import PAIRED_INDEX, load_paired_index
+
+        index = load_paired_index(proprietary_ego_root)
+        root = proprietary_ego_root / index["cache_root"]
+        sources["PROP_EGO"] = ValidationSource(
+            "PROP_EGO", "proprietary_ego", "sonic", root, root / "sonic_tokens", root / "g1_proprio", 66,
+            (proprietary_ego_root / PAIRED_INDEX,), keep_records=True,
+        )
+    return sources
 
 
 def _manifest_bytes(payload: dict[str, Any]) -> bytes:

@@ -15,11 +15,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 SCALE_LABELS = ("From\nScratch", "10%", "100%")
 # Slightly expand the 0%-10% interval for readability without making all categories equidistant.
 PLOT_POSITIONS = (0, 20, 100)
-# The middle values are pseudo data (linear estimates at 10%); replace them after evaluation.
 RESULTS = {
-    "HuGe-OFT": (55.00, 54.91, 54.05),
-    "HuGe-GR00T": (58.33, 59.16, 66.67),
-    "HuGe-Pi": (60.24, 60.72, 65.00),
+    "HuGe-OFT": (55.00, 57.62, 54.05),
+    "HuGe-GR00T": (58.33, 64.05, 66.67),
+    "HuGe-Pi": (60.24, 55.48, 65.00),
 }
 COLORS = {
     "HuGe-OFT": "#2B6A99",
@@ -52,9 +51,21 @@ def main() -> None:
         color = COLORS[model]
         marker, linestyle = STYLES[model]
         ax.plot(PLOT_POSITIONS, scores, color=color, marker=marker, linestyle=linestyle, label=model)
-        ax.scatter(PLOT_POSITIONS[1], scores[1], marker=marker, facecolor="white", edgecolor=color, zorder=3)
 
-    ax.set_xlabel("Pre-training Data Scale", labelpad=8)
+    ax.plot(
+        PLOT_POSITIONS[1:], (RESULTS["HuGe-OFT"][1], 56.43),
+        color=COLORS["HuGe-OFT"], linestyle=STYLES["HuGe-OFT"][1],
+    )
+    ax.scatter(
+        PLOT_POSITIONS[-1], 56.43, marker=STYLES["HuGe-OFT"][0],
+        facecolor="white", edgecolor=COLORS["HuGe-OFT"], zorder=3,
+    )
+    ax.annotate(
+        "w/o Ego Proprio", xy=(PLOT_POSITIONS[-1], 56.43), xytext=(8, 8),
+        textcoords="offset points", ha="right", va="bottom", fontsize=10, color="black",
+    )
+
+    ax.set_xlabel("Pre-Training Ego Data Scale", labelpad=8)
     ax.set_ylabel("HumanoidArena Overall Average", labelpad=8)
     ax.set_xticks(PLOT_POSITIONS, SCALE_LABELS)
     ax.set_ylim(50, 70)
@@ -62,7 +73,6 @@ def main() -> None:
     ax.grid(axis="y", linestyle=(0, (5, 10)), linewidth=0.25, color="#4E616C", zorder=0)
     ax.spines["top"].set_color("none")
     ax.legend(loc="upper left", prop={"size": 10})
-    ax.text(0.98, 0.04, "Hollow markers: pseudo data", transform=ax.transAxes, ha="right", fontsize=10, color="#666666")
 
     fig.tight_layout()
     fig.savefig(output, dpi=600, bbox_inches="tight")

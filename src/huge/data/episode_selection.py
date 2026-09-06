@@ -89,6 +89,18 @@ def selected_episode_digest(episode_ids: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def select_episode_ids(
+    episode_ids: Sequence[str], count: int, *, source_id: str, base_seed: int = 7,
+) -> list[str]:
+    """Select an exact random prefix, returning IDs in canonical order."""
+    ids = sorted(_validated_episode_ids(episode_ids))
+    count = operator.index(count)
+    if not 0 <= count <= len(ids):
+        raise ValueError(f"{source_id}: requested {count} episodes from a pool of {len(ids)}")
+    rng = np.random.Generator(np.random.PCG64(derive_source_seed(base_seed, source_id)))
+    return [ids[i] for i in sorted(rng.permutation(len(ids))[:count])]
+
+
 def task_histogram(episode_ids: Sequence[str], task_ids: Sequence[str]) -> dict[str, int]:
     episodes = _validated_episode_ids(episode_ids)
     tasks = [str(task_id) for task_id in task_ids]

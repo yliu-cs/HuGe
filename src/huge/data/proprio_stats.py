@@ -19,6 +19,9 @@ from huge.data.schemas import PROPRIO_DIM, PROPRIO_LAYOUT, PROPRIO_LAYOUT_VERSIO
 EXACT_STAGE_TAGS = {
     "stage1": ("EGODEX", "EGOVERSE", "BEHAVIOR1K", "XPERIENCE"),
     "stage12": ("EGODEX", "EGOVERSE", "BEHAVIOR1K", "XPERIENCE", "HE", "WBT", "HIW"),
+    "stage123_proprietary": (
+        "EGODEX", "EGOVERSE", "BEHAVIOR1K", "XPERIENCE", "HE", "WBT", "HIW", "PROP_EGO", "PROP_REAL",
+    ),
     "stage123_humanoid_arena": (
         "EGODEX",
         "EGOVERSE",

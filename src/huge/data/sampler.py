@@ -7,10 +7,49 @@ from typing import Any, Iterator
 
 import numpy as np
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, WeightedRandomSampler
 
 
 SAMPLER_STATE_SCHEMA_VERSION = 1
+
+
+class SourceWeightedSampler(WeightedRandomSampler):
+    """Frame-uniform source weighting with an epoch-addressable random stream."""
+
+    def __init__(self, source_lengths: list[int], ego_probability: float, num_samples: int, *, base_seed: int) -> None:
+        if len(source_lengths) not in {1, 2} or any(n <= 0 for n in source_lengths):
+            raise ValueError("expected one Real source and optionally one nonempty Ego source")
+        if not (0 < ego_probability < 1 if len(source_lengths) == 2 else ego_probability == 0):
+            raise ValueError("invalid Ego sampling probability")
+        self.source_lengths = list(source_lengths)
+        self.ego_probability = float(ego_probability)
+        self.base_seed = int(base_seed)
+        self.epoch = 0
+        probabilities = [1 - ego_probability, ego_probability]
+        weights = torch.cat([torch.full((n,), probabilities[i] / n, dtype=torch.double)
+                             for i, n in enumerate(source_lengths)])
+        super().__init__(weights, num_samples, replacement=True, generator=torch.Generator())
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = int(epoch)
+        self.generator.manual_seed(self.base_seed + self.epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        self.set_epoch(self.epoch)
+        return super().__iter__()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"schema_version": 1, "kind": "source_weighted", "base_seed": self.base_seed,
+                "epoch": self.epoch, "source_lengths": self.source_lengths,
+                "ego_probability": self.ego_probability, "num_samples": self.num_samples}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        expected = self.state_dict()
+        if not isinstance(state, dict) or {**state, "epoch": 0} != {**expected, "epoch": 0}:
+            raise ValueError("weighted sampler state does not match current data contract")
+        self.set_epoch(state["epoch"])
 
 
 class BlockShuffleSampler(Sampler[int]):

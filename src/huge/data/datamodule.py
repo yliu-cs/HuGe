@@ -15,7 +15,8 @@ from huge.data.he_dataset import HEDataset
 from huge.data.hiw_dataset import HIWDataset
 from huge.data.humanoid_arena_dataset import HumanoidArenaDataset
 from huge.data.prop_dataset import PropDataset
-from huge.data.prop_ego_dataset import PropEgoDataset
+from huge.data.prop_ego_dataset import PairedPropEgoDataset, PropEgoDataset, load_paired_index
+from huge.data.episode_selection import select_episode_ids
 from huge.data.sonic_dataset import MixtureDataset
 from huge.data.stage1_cache_dataset import Behavior1KDataset, EgoVerseDataset, XperienceDataset
 from huge.data.state_normalizer import StateNormalizer
@@ -236,11 +237,50 @@ def build_stage_dataset(
     humanoid_arena_roots: list[str] | None = None,
     humanoid_arena_task: str = "all",
     validated_inventories: Mapping[str, dict[str, Any]] | None = None,
+    real_num_episodes: int | None = None,
+    ego_num_episodes: int = 0,
+    ego_video_source: str = "raw",
+    mixture_mode: str = "natural",
+    ego_sampling_prob: float | None = None,
 ) -> Dataset:
     root = Path(repo_root)
     data = Path(dataset_root) if dataset_root is not None else root / "resource" / "dataset"
     stage = stage.lower()
     normalizer = StateNormalizer.from_json(proprio_stats_path) if proprio_stats_path else None
+    if real_num_episodes is not None:
+        if stage != "stage3" or max_episodes is not None or episode_fraction is not None or humanoid_arena_roots:
+            raise ValueError("Real/Ego counts require Stage 3 without other selection or HumanoidArena options")
+        if not 1 <= real_num_episodes <= 110 or not 0 <= ego_num_episodes <= 400:
+            raise ValueError("expected 1 <= Real episodes <= 110 and 0 <= Ego episodes <= 400")
+        if len(prop_roots or []) != 1 or len(prop_ego_roots or []) != 1 or normalizer is None:
+            raise ValueError("Real/Ego Stage 3 requires one Real root, one Ego root and proprio stats")
+        if mixture_mode not in {"natural", "balanced"}:
+            raise ValueError(f"unsupported mixture mode: {mixture_mode}")
+        if mixture_mode == "balanced" and ego_num_episodes and (ego_sampling_prob is None or not 0 < ego_sampling_prob < 1):
+            raise ValueError("balanced mixing requires 0 < ego_sampling_prob < 1")
+        real_root, ego_root = Path(prop_roots[0]), Path(prop_ego_roots[0])
+        real_files = sorted((real_root / "sonic_tokens").rglob("*.npy"))
+        real_ids = [p.stem.removeprefix("episode_") for p in real_files]
+        if len(real_ids) != 110 or set(real_ids) != {f"{i:06d}" for i in range(110)}:
+            raise ValueError("Real reference pool must contain each episode 000000..000109 exactly once")
+        index = load_paired_index(ego_root)
+        real_selected = select_episode_ids(real_ids, real_num_episodes, source_id="proprietary_real", base_seed=episode_selection_seed)
+        ego_selected = select_episode_ids([row["episode_id"] for row in index["episodes"]], ego_num_episodes, source_id="proprietary_ego", base_seed=episode_selection_seed)
+        real = PropDataset(real_root, sample_stride=sample_stride, proprio_normalizer=normalizer,
+                           episode_ids=real_selected, strict_video=True,
+                           validated_inventory=(validated_inventories or {}).get("PROP_REAL"))
+        datasets = [real]
+        if ego_num_episodes:
+            datasets.append(PairedPropEgoDataset(ego_root, video_source=ego_video_source, episode_index=index,
+                            sample_stride=sample_stride, proprio_normalizer=normalizer, episode_ids=ego_selected,
+                            validated_inventory=(validated_inventories or {}).get("PROP_EGO")))
+        reference_samples = real.pool_samples + sum((row["length"] + sample_stride - 1) // sample_stride for row in index["episodes"])
+        lengths = [len(dataset) for dataset in datasets]
+        probability = (ego_sampling_prob if mixture_mode == "balanced" else lengths[1] / sum(lengths)) if ego_num_episodes else 0.0
+        return MixtureDataset(datasets, sampling={"mode": mixture_mode, "ego_probability": probability,
+                              "epoch_samples": reference_samples if mixture_mode == "balanced" else sum(lengths),
+                              "source_samples": lengths, "real_num_episodes": real_num_episodes,
+                              "ego_num_episodes": ego_num_episodes, "ego_video_source": ego_video_source if ego_num_episodes else "none"})
     if stage in {"stage1", "egodex", "pretrain_egodex"}:
         if normalizer is None:
             raise ValueError("Stage 1 requires --proprio-stats-path")

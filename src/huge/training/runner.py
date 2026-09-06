@@ -33,10 +33,11 @@ from huge.data.validation_manifest import (
     ensure_validation_manifest,
     load_validation_manifest,
 )
-from huge.data.sampler import BlockShuffleSampler
+from huge.data.sampler import BlockShuffleSampler, SourceWeightedSampler
+from huge.data.prop_ego_dataset import load_paired_index
 from huge.data.schemas import ActionSchema
 from huge.data.video_reader import set_frame_cache_size
-from huge.models.qwen_sonicfm import ACTION_HEAD_DEFAULTS, QwenSonicFM, QwenSonicFMConfig
+from huge.models.qwen_sonicfm import ACTION_HEAD_DEFAULTS, QwenSonicFM, QwenSonicFMConfig, load_portable_safetensors_strict
 from huge.training.checkpointing import (
     PORTABLE_CHECKPOINT_KIND,
     RESUME_STATE_KIND,
@@ -214,6 +215,32 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
     args.resume_from_checkpoint = _optional_path(args.resume_from_checkpoint)
     if args.init_ckpt is not None and args.resume_from_checkpoint is not None:
         raise ValueError("--init-ckpt and --resume-from-checkpoint are mutually exclusive")
+
+    if args.real_num_episodes is not None:
+        if args.stage != "stage3":
+            raise ValueError("--real-num-episodes is only valid for Stage 3")
+        if not 1 <= args.real_num_episodes <= 110 or not 0 <= args.ego_num_episodes <= 400:
+            raise ValueError("expected Real count 1..110 and Ego count 0..400")
+        if args.humanoid_arena_roots or args.max_episodes is not None or args.episode_fraction is not None or args.max_train_samples is not None:
+            raise ValueError("Real/Ego counts cannot be combined with HumanoidArena or global sample/episode limits")
+        if len(args.prop_roots or []) != 1 or len(args.prop_ego_roots or []) != 1:
+            raise ValueError("Real/Ego Stage 3 requires one --prop-roots and one --prop-ego-roots entry")
+        if args.init_ckpt is None and args.resume_from_checkpoint is None:
+            raise ValueError("Real/Ego Stage 3 requires --init-ckpt or --resume-from-checkpoint")
+        if args.gradient_accumulation_steps != 1:
+            raise ValueError("Real/Ego Stage 3 uses gradient_accumulation_steps=1 like HumanoidArena")
+        if args.action_horizon != 50:
+            raise ValueError("Real/Ego Stage 3 requires the canonical 50-step action horizon")
+        args.dataset_root = args.dataset_root or "resource/datasets"
+        if args.ego_num_episodes == 0:
+            args.ego_video_source = "none"
+            args.ego_sampling_prob = 0.0
+        elif args.mixture_mode == "balanced" and (args.ego_sampling_prob is None or not 0 < args.ego_sampling_prob < 1):
+            raise ValueError("balanced mixing requires --ego-sampling-prob with 0 < P < 1")
+        elif args.mixture_mode == "natural" and args.ego_sampling_prob is not None:
+            raise ValueError("--ego-sampling-prob is only used with --mixture-mode balanced")
+    elif provided & {"ego_num_episodes", "ego_video_source", "mixture_mode", "ego_sampling_prob"}:
+        raise ValueError("Real/Ego mixture options require --real-num-episodes")
 
     if args.sample_stride <= 0:
         raise ValueError("--sample-stride must be > 0")
@@ -441,6 +468,8 @@ def _broadcast_run_id(run_id: str, accelerator: Any | None) -> str:
 
 def _run_dir_name(args: argparse.Namespace, accelerator: Any | None) -> str:
     base = str(args.run_id).strip() if args.run_id else time.strftime("%Y%m%d_%H%M%S")
+    if args.real_num_episodes is not None:
+        base += f"_{args.model_architecture}_R{args.real_num_episodes}_E{args.ego_num_episodes}_{args.ego_video_source}"
     if args.run_name:
         base = f"{base}_{args.run_name}"
     return _sanitize_path_part(_broadcast_run_id(base, accelerator))
@@ -901,6 +930,13 @@ def _cumulative_stats_contract(args: argparse.Namespace) -> tuple[str, dict[str,
             )
     if args.stage == "stage2":
         return "stage12", stage12, None
+    if args.stage == "stage3" and args.real_num_episodes is not None:
+        ego_root = Path(args.prop_ego_roots[0])
+        index = load_paired_index(ego_root)
+        return "stage123_proprietary", {
+            **stage12, "PROP_EGO": ego_root / index["cache_root"] / "g1_proprio",
+            "PROP_REAL": Path(args.prop_roots[0]) / "g1_proprio",
+        }, None
     if args.stage == "stage3" and args.humanoid_arena_roots:
         if len(args.humanoid_arena_roots) != 1:
             raise ValueError("cumulative HumanoidArena stats require exactly one --humanoid-arena-roots entry")
@@ -936,6 +972,8 @@ def _validation_sources(args: argparse.Namespace, expected_sources: dict[str, Pa
         stage1_roots=stage1_roots,
         stage2_roots=stage2_roots,
         humanoid_arena_root=arena_root,
+        proprietary_real_root=Path(args.prop_roots[0]) if args.real_num_episodes is not None else None,
+        proprietary_ego_root=Path(args.prop_ego_roots[0]) if args.real_num_episodes is not None else None,
     )
     selected = {tag: available[tag] for tag in expected_sources}
     for tag, expected_root in expected_sources.items():
@@ -945,6 +983,8 @@ def _validation_sources(args: argparse.Namespace, expected_sources: dict[str, Pa
 
 
 def _current_validation_tags(args: argparse.Namespace) -> list[str]:
+    if args.real_num_episodes is not None:
+        return ["PROP_REAL"] + (["PROP_EGO"] if args.ego_num_episodes else [])
     if args.stage == "stage1":
         kinds = (
             [spec.kind for spec in normalize_dataset_specs(args.stage1_sources, stage="stage1")]
@@ -989,6 +1029,7 @@ def _default_cumulative_stats_path(args: argparse.Namespace, stage_scope: str) -
     filename = {
         "stage1": "stage1_proprio_stats_union_sonic.json",
         "stage12": "stage12_proprio_stats_union_sonic.json",
+        "stage123_proprietary": "stage123_proprietary_proprio_stats_union_sonic.json",
         "stage123_humanoid_arena": "stage123_humanoid_arena_proprio_stats_union_sonic.json",
     }[stage_scope]
     return str(data / "meta" / filename)
@@ -1186,7 +1227,7 @@ def _data_summary_lines(contract: dict[str, Any]) -> list[str]:
         token_rows = source.get("selected_token_rows", "unknown")
         line = (
             f"source={source_id} episodes={episodes} segments={segments} "
-            f"token_rows={token_rows} samples={samples} ratio={ratio:.6f} "
+            f"token_rows={token_rows} samples={samples} natural_ratio={ratio:.6f} "
             f"selection_digest={digest}"
         )
         if "source_fps" in source:
@@ -1196,6 +1237,10 @@ def _data_summary_lines(contract: dict[str, Any]) -> list[str]:
                 f" state_mode={source['state_mode']} video_backend={source['video_backend']}"
             )
         lines.append(line)
+    sampling = dataset_contract.get("sampling")
+    if sampling is not None:
+        lines.append(f"mixture={sampling['mode']} target_ego_probability={sampling['ego_probability']:.6f} "
+                     f"logical_epoch_samples={sampling['epoch_samples']} video={sampling['ego_video_source']}")
     return lines
 
 
@@ -2185,12 +2230,13 @@ class SaveCoordinator:
         self.proprio_stats_path = proprio_stats_path
         self.portable_steps: set[int] = set()
         self.resume_steps: set[int] = set()
+        self.source_sample_counts: dict[str, int] = {}
 
     def _trainer_state(self, progress: TrainingProgress, reasons: list[str]) -> dict[str, Any]:
         world_size = int(self.accelerator.num_processes)
         sampler_state = (
             self.train_sampler.state_dict()
-            if isinstance(self.train_sampler, BlockShuffleSampler)
+            if isinstance(self.train_sampler, (BlockShuffleSampler, SourceWeightedSampler))
             else None
         )
         return {
@@ -2233,6 +2279,7 @@ class SaveCoordinator:
                 "current_lrs": list(self.scheduler.get_last_lr()),
             },
             "data": {
+                **({"source_sample_counts": dict(self.source_sample_counts)} if self.source_sample_counts else {}),
                 "seed": self.args.seed,
                 "loader_batches": len(self.train_loader),
                 "dataset_summary": self.data_contract.get("dataset_contract"),
@@ -2270,7 +2317,8 @@ class SaveCoordinator:
                 args=self.args,
                 run_id=self.run_id,
                 progress=progress,
-                metadata=self.checkpoint_metadata,
+                metadata={**self.checkpoint_metadata,
+                          **({"source_sample_counts": dict(self.source_sample_counts)} if self.source_sample_counts else {})},
                 reasons=reasons,
                 accelerator=self.accelerator,
                 proprio_stats_path=self.proprio_stats_path,
@@ -2289,10 +2337,55 @@ class SaveCoordinator:
             self.resume_steps.add(step)
 
 
+def build_dataset_from_args(args: argparse.Namespace, stats: str | None, inventories: dict[str, Any] | None = None) -> Any:
+    """Shared dataset construction for training and the CPU data preflight."""
+    fields = ("dataset_root", "sample_stride", "max_episodes", "egodex_root", "stage1_sources",
+              "stage2_sources", "episode_fraction", "episode_selection_seed", "prop_roots",
+              "prop_ego_roots", "humanoid_arena_roots", "humanoid_arena_task", "real_num_episodes",
+              "ego_num_episodes", "ego_video_source", "mixture_mode", "ego_sampling_prob")
+    return build_stage_dataset(args.stage, proprio_stats_path=stats, validated_inventories=inventories,
+                               **{field: getattr(args, field) for field in fields})
+
+
+def build_training_sampler(dataset: Any, args: argparse.Namespace) -> Sampler[int] | None:
+    sampling = getattr(dataset, "sampling", None)
+    if sampling is not None and sampling["mode"] == "balanced":
+        return SourceWeightedSampler(sampling["source_samples"], sampling["ego_probability"],
+                                     sampling["epoch_samples"], base_seed=args.seed)
+    spans_fn = getattr(dataset, "episode_spans", None)
+    if args.block_shuffle_size and spans_fn is not None:
+        spans = spans_fn()
+        if len(spans):
+            return BlockShuffleSampler(spans, block_size=args.block_shuffle_size, base_seed=args.seed)
+    return None
+
+
+def validate_init_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
+    """Check configuration before loading model weights or creating Accelerator."""
+    path = Path(args.init_ckpt)
+    root = path if path.is_dir() else path.parent
+    weights = root / "model.safetensors" if path.is_dir() else path
+    if not weights.is_file():
+        raise FileNotFoundError(weights)
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))["config"]
+    for field in ("model_architecture", "action_hidden_size", "num_action_layers", "num_attention_heads",
+                  "action_ffn_multiplier", "action_horizon", "num_future_tokens"):
+        expected = getattr(args, field)
+        if field == "num_attention_heads" and expected is None:
+            expected = args.action_hidden_size // 64
+        if expected is not None and config.get(field) != expected:
+            raise ValueError(f"initial checkpoint {field}={config.get(field)!r} != requested {expected!r}")
+    if config.get("state_dim") != 34 or config.get("action_dim") != 66:
+        raise ValueError("initial checkpoint must use 34D state and 66D action")
+    return config
+
+
 def _train_stage_impl(
     args: argparse.Namespace,
     writer_lock_holder: list[RunWriterLock],
 ) -> Path:
+    if args.real_num_episodes is not None and args.init_ckpt is not None:
+        validate_init_checkpoint(args)
     accelerator = None
     if not args.use_accelerate:
         raise ValueError("training must run with accelerate; use scripts/train/train_huge.sh")
@@ -2418,23 +2511,7 @@ def _train_stage_impl(
             f"max_episodes={args.max_episodes or 'all'} stats={stats or 'none'}"
         ),
     )
-    dataset = build_stage_dataset(
-        args.stage,
-        dataset_root=args.dataset_root,
-        sample_stride=args.sample_stride,
-        max_episodes=args.max_episodes,
-        proprio_stats_path=stats,
-        egodex_root=args.egodex_root,
-        stage1_sources=args.stage1_sources,
-        stage2_sources=args.stage2_sources,
-        episode_fraction=args.episode_fraction,
-        episode_selection_seed=args.episode_selection_seed,
-        prop_roots=args.prop_roots,
-        prop_ego_roots=args.prop_ego_roots,
-        humanoid_arena_roots=args.humanoid_arena_roots,
-        humanoid_arena_task=args.humanoid_arena_task,
-        validated_inventories=validated_inventories,
-    )
+    dataset = build_dataset_from_args(args, stats, validated_inventories)
     if accelerator is not None:
         accelerator.wait_for_everyone()
     if validation_manifest is not None:
@@ -2485,16 +2562,7 @@ def _train_stage_impl(
     set_frame_cache_size(args.frame_cache_size)
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
-    train_sampler: Sampler[int] | None = None
-    spans_fn = getattr(train_ds, "episode_spans", None)
-    if args.block_shuffle_size and spans_fn is not None:
-        spans = spans_fn()
-        if len(spans):
-            train_sampler = BlockShuffleSampler(
-                spans,
-                block_size=args.block_shuffle_size,
-                base_seed=args.seed,
-            )
+    train_sampler = build_training_sampler(train_ds, args)
     loader_kwargs: dict[str, Any] = {
         "num_workers": args.num_workers,
         "collate_fn": collator,
@@ -2532,7 +2600,7 @@ def _train_stage_impl(
         _require_equal("drop_last", saved_data.get("drop_last"), bool(args.drop_last))
         _require_equal("sample_stride", saved_data.get("sample_stride"), args.sample_stride)
         saved_sampler = saved_data.get("sampler")
-        current_sampler = train_sampler.state_dict() if isinstance(train_sampler, BlockShuffleSampler) else None
+        current_sampler = train_sampler.state_dict() if isinstance(train_sampler, (BlockShuffleSampler, SourceWeightedSampler)) else None
         if isinstance(saved_sampler, dict) and isinstance(current_sampler, dict):
             saved_sampler = {**saved_sampler, "epoch": 0}
             current_sampler = {**current_sampler, "epoch": 0}
@@ -2587,7 +2655,7 @@ def _train_stage_impl(
     )
     if args.init_ckpt is not None:
         _log_main(accelerator, f"[{args.stage}] loading init checkpoint: {args.init_ckpt}")
-        _load_checkpoint_state(model, args.init_ckpt, accelerator)
+        _load_checkpoint_state(model, args.init_ckpt, accelerator, strict=args.real_num_episodes is not None)
     optimizer_param_groups, optimizer_inventory = build_optimizer_param_groups(model, args)
     if resume_info is not None:
         _require_equal(
@@ -2641,7 +2709,7 @@ def _train_stage_impl(
         # Accelerator uses step_scheduler_with_optimizer=False; this only
         # registers scheduler.bin for exact save/resume.
         lr_scheduler = accelerator.prepare_scheduler(lr_scheduler)
-    if isinstance(train_sampler, BlockShuffleSampler) and accelerator is not None:
+    if isinstance(train_sampler, (BlockShuffleSampler, SourceWeightedSampler)) and accelerator is not None:
         accelerator.register_for_checkpointing(train_sampler)
     if resume_info is not None:
         saved_data = resume_info["trainer_state"].get("data", {})
@@ -2801,6 +2869,11 @@ def _train_stage_impl(
             train_sampler=train_sampler,
             proprio_stats_path=stats,
         )
+        if args.real_num_episodes is not None:
+            save_coordinator.source_sample_counts = (
+                dict(resume_info["trainer_state"]["data"]["source_sample_counts"]) if resume_info is not None
+                else {source.dataset_id: 0 for source in dataset.datasets}
+            )
         train_start = time.time()
         progress_total = total_train_steps
         trace_batches = _env_flag("HUGE_LOG_BATCH_DIGESTS")
@@ -2920,6 +2993,12 @@ def _train_stage_impl(
 
                     lr_scheduler.step()
                     progress.global_step += 1
+                    if save_coordinator.source_sample_counts:
+                        names = list(save_coordinator.source_sample_counts)
+                        counts = torch.tensor([batch["dataset_id"].count(name) for name in names], device=device)
+                        counts = accelerator.reduce(counts, reduction="sum").tolist()
+                        for name, count in zip(names, counts, strict=True):
+                            save_coordinator.source_sample_counts[name] += count
                     if epoch_completed:
                         progress.epoch = epoch + 1
                         progress.batches_consumed_in_epoch = 0
@@ -2993,6 +3072,8 @@ def _train_stage_impl(
                 f"total_time={_format_seconds(time.time() - train_start)}"
             ),
         )
+        if save_coordinator.source_sample_counts:
+            _log_main(accelerator, f"[{args.stage}] consumed source samples: {save_coordinator.source_sample_counts}")
     _main_process_call(accelerator, lambda: writer_lock.release() or True)
     accelerator.wait_for_everyone()
     return out_dir
@@ -3016,7 +3097,7 @@ def _git_commit() -> str | None:
         return None
 
 
-def _load_checkpoint_state(model: QwenSonicFM, checkpoint_path: str | Path, accelerator: Any | None = None) -> None:
+def _load_checkpoint_state(model: QwenSonicFM, checkpoint_path: str | Path, accelerator: Any | None = None, *, strict: bool = False) -> None:
     from safetensors.torch import load_file
 
     ckpt_path = Path(checkpoint_path)
@@ -3024,6 +3105,9 @@ def _load_checkpoint_state(model: QwenSonicFM, checkpoint_path: str | Path, acce
         ckpt_path = ckpt_path / "model.safetensors"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+    if strict:
+        load_portable_safetensors_strict(model, ckpt_path, device="cpu")
+        return
     state_dict = load_file(str(ckpt_path))
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
@@ -3079,6 +3163,11 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--episode-selection-seed", type=int, default=None)
     p.add_argument("--prop-roots", nargs="*", default=None)
     p.add_argument("--prop-ego-roots", nargs="*", default=None)
+    p.add_argument("--real-num-episodes", type=int, default=None)
+    p.add_argument("--ego-num-episodes", type=int, default=0)
+    p.add_argument("--ego-video-source", choices=["raw", "syn"], default="raw")
+    p.add_argument("--mixture-mode", choices=["natural", "balanced"], default="natural")
+    p.add_argument("--ego-sampling-prob", type=float, default=None)
     p.add_argument("--humanoid-arena-roots", nargs="*", default=None)
     p.add_argument("--humanoid-arena-task", default="all")
     p.add_argument("--epochs", type=int, default=None)
