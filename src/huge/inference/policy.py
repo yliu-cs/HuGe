@@ -16,6 +16,7 @@ from huge.inference.observation import assemble_proprio
 from huge.models.qwen_sonicfm import QwenSonicFM
 from huge.data.state_normalizer import StateNormalizer
 from huge.data.transforms import gr00t_image_transform
+from huge.data.video_reader import DEFAULT_DECODE_LONG_EDGE, _resize_long_edge
 
 
 @dataclass(frozen=True)
@@ -178,7 +179,8 @@ class HugePolicy:
             prompt = self._append_oft_action_tokens(prompt, state, state_mask)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
-        pil = Image.fromarray(arr)
+        # Match the training reader's long-edge cap before square padding/crop.
+        pil = _resize_long_edge(Image.fromarray(arr), DEFAULT_DECODE_LONG_EDGE)
         target_size = tuple(getattr(self.model.config, "qwen_image_size", (256, 256)) or (256, 256))
         crop_fraction = float(getattr(self.model.config, "image_crop_fraction", 0.95) or 0.95)
         pil = gr00t_image_transform(

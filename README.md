@@ -567,56 +567,135 @@ TLS; do not expose it to an untrusted network.
 `calls/`. The server first uses `--proprio-stats-path`, then a stats file
 bundled in the checkpoint, then the original path in checkpoint metadata.
 
-For standalone requests without the WBC state stream, add
-`--no-state-tap-enable`.
+When the client already supplies `state.projected_gravity`, or for standalone
+requests without the WBC state stream, add `--no-state-tap-enable`.
 
-## 🦾 WBC deployment
+## 🦾 Deployment (real robot)
 
 Real-robot deployment uses the independent WBC environment. Install
 `GR00T-WholeBodyControl/.venv_inference` according to that project's
-instructions. Run each process below in a separate terminal from the
-repository root.
+instructions. The commands below use the current workspace at
+`/home/kinetra-5090-01/code/liuyang/Huge`, a G1 with Inspire hands, and the
+QwenPI v3 full-tuning checkpoint at step 20000. Run each block in a separate
+terminal. Huge, the VLA client, WBC, and the keyboard publisher run on this
+machine; the camera server must already be available at `192.168.123.164:5555`
+and the robot-side Inspire DDS bridge must be running.
 
-1. Start the Huge server above. Use `--host 0.0.0.0` only on a trusted
-   control network.
+**Terminal 1 — Huge policy server**
 
-2. Start the WBC deploy process:
+```bash
+cd /home/kinetra-5090-01/code/liuyang/Huge
 
-   ```bash
-   cd GR00T-WholeBodyControl/gear_sonic_deploy
+HUGE_DEPLOY_CKPT=".runs/finetune_real/qwenpi_v3/full/stage3/20260905_181319_qwenpi_v3_R110_E0_none/step_20000"
 
-   ./deploy.sh \
-     --input-type zmq_manager \
-     --zmq-host localhost \
-     --hand-type inspire \
-     real
-   ```
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+PYTHONPATH=src \
+.venv/bin/python src/huge/inference/run_huge_server.py \
+--ckpt "$HUGE_DEPLOY_CKPT" \
+--proprio-stats-path "$HUGE_DEPLOY_CKPT/proprio_stats_sonic.json" \
+--host 0.0.0.0 \
+--port 5550 \
+--device cuda \
+--action-horizon 50 \
+--no-state-tap-enable \
+--no-closed-loop-enable \
+--log-dir ".runs/deploy_log/$(date +%Y%m%d_%H%M%S)"
+```
 
-3. Start the VLA client:
+This checkpoint's `config.json` sets `num_inference_steps` to `4`;
+the Huge server reads it from the checkpoint and does not expose a
+`--num-inference-steps` CLI flag. Proprioception uses the stats bundled
+with this exact checkpoint. The client supplies projected gravity and
+publishes SONIC actions on port 5556, so both server-side state tapping
+and action publishing are disabled. Bind to `0.0.0.0` only on a trusted
+control network; use `127.0.0.1` to restrict access to this machine.
 
-   ```bash
-   cd GR00T-WholeBodyControl
+**Terminal 2 — GR00T WBC deploy stack**
 
-   .venv_inference/bin/python gear_sonic/scripts/run_vla_inference.py \
-     --host localhost \
-     --port 5550 \
-     --embodiment-tag unitree_g1_sonic \
-     --prompt "Walk forward, grab the cola and throw it into the trash bin" \
-     --action-publish-rate 50 \
-     --action-horizon 50 \
-     --camera-host 192.168.123.164 \
-     --camera-port 5555
-   ```
+```bash
+cd /home/kinetra-5090-01/code/liuyang/Huge/GR00T-WholeBodyControl/gear_sonic_deploy
 
-4. Start the keyboard publisher:
+./deploy.sh --input-type zmq_manager --zmq-host localhost --hand-type inspire real
+```
 
-   ```bash
-   cd GR00T-WholeBodyControl
-   .venv_inference/bin/python keyboard_pub.py
-   ```
+**Terminal 3 — VLA inference client**
+
+Use this single client entry for the cola checkpoint above. It enables the
+training hand-label compatibility fix and records request, response, action
+publication, camera-read, and keyboard timing. It reuses the original
+asynchronous client loop and starts paused. Run only one VLA client.
+
+```bash
+cd /home/kinetra-5090-01/code/liuyang/Huge
+HUGE_TRACE_DIR=".runs/deploy_timing/$(date +%Y%m%d_%H%M%S_%N)"
+env -u PYTHONPATH -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \
+GR00T-WholeBodyControl/.venv_inference/bin/python \
+scripts/eval/run_traced_vla_inference.py \
+--trace-dir "$HUGE_TRACE_DIR" \
+--hand-state-compat legacy-inspire-six-channel \
+--debug-save-hand-dir "$HUGE_TRACE_DIR" \
+--host localhost \
+--port 5550 \
+--embodiment-tag unitree_g1_sonic \
+--hand-type inspire \
+--prompt "Walk forward, grab the cola and throw into the trash bin" \
+--action-publish-rate 50 \
+--action-horizon 50 \
+--rate 2.5 \
+--camera-host 192.168.123.164 \
+--camera-port 5555
+```
+
+The client uses its Python 3.10 environment directly. Removing inherited
+`PYTHONPATH` and `LD_LIBRARY_PATH` prevents ROS Python 3.12 packages and shared
+libraries from overriding its Pinocchio dependencies.
+
+Hand debug captures are saved under `$HUGE_TRACE_DIR/hand_debug_<timestamp>/`.
+By default, each published action frame writes `.npz` and `.json` files with
+the hand targets sent by the client and the available WBC hand feedback.
+
+`--rate 2.5` inserts a 0.4-second wait after each completed inference; the
+actual chunk update interval also includes inference latency. Actions are
+published at 50 Hz. The client repeats the last action when a chunk expires.
+The wrapper records local PUB sends, which do not confirm WBC receipt or
+execution. Timing adds CPU and disk overhead; actual deployment overhead has
+not been measured.
+
+After the client exits, summarize the recording in the same terminal:
+
+```bash
+env -u PYTHONPATH -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \
+GR00T-WholeBodyControl/.venv_inference/bin/python \
+scripts/eval/summarize_vla_timing.py --trace-dir "$HUGE_TRACE_DIR"
+```
+
+The run directory contains `metadata.json` and `events.jsonl`; the summary
+command writes `summary.json` and `summary.md`, including hand-label audit
+completeness. See the [timing document](resource/info/vla_client_timing_trace_plan.md)
+and [hand-state compatibility document](resource/info/legacy_inspire_hand_state_compat_plan.md)
+for detailed diagnostics and validation scope.
+
+**Terminal 4 — Keyboard publisher**
+
+```bash
+cd /home/kinetra-5090-01/code/liuyang/Huge/GR00T-WholeBodyControl
+
+env -u PYTHONPATH -u LD_LIBRARY_PATH \
+.venv_inference/bin/python keyboard_pub.py
+```
 
 The deploy process controls physical hardware and requires operator checks.
-Do not automate confirmation or motor enablement.
+Confirm deployment manually in Terminal 2. The VLA client starts paused.
+In Terminal 4, type each key and press Enter: `k` starts the WBC control loop
+in planner mode, `i` sends the initial pose and switches to pose mode, and `p`
+resumes action publishing. The initial pose token must match the SONIC model
+used for data collection and deployment.
+
+`p` pauses client publishing while WBC continues running; `k` sends the WBC
+stop command. Exiting the client with Ctrl+C does not send that stop command.
+Do not automate confirmation or motor enablement. Action validity and sensor
+freshness handling must be verified before physical deployment.
 
 ## 🧪 HumanoidArena simulation evaluation
 

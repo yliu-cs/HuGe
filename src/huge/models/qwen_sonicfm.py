@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import torch
 from torch import nn
 
-from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, PROPRIO_DIM
+from huge.data.schemas import ACTION_DIM, ACTION_HORIZON, MOTION_TOKEN_DIM, PROPRIO_DIM
 from huge.models.action_heads.starvla_gr00t_head import StarVLAGR00TActionHead
 from huge.models.action_heads.starvla_oft_head import StarVLAOFTActionHead
 from huge.models.action_heads.starvla_pi_head import StarVLAPIActionHead
@@ -642,6 +642,7 @@ class QwenSonicFM(nn.Module):
         num_inference_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
+        """Predict actions and project the final motion tokens onto the SONIC FSQ grid."""
         del input_ids, images
         if self.action_head is None:
             raise RuntimeError("action head is not initialized")
@@ -649,7 +650,7 @@ class QwenSonicFM(nn.Module):
         if architecture == "qwenpi_v3":
             vl_embs_list, attention_mask = self.encode_vlm_layers(qwen_inputs=qwen_inputs)
             vl_embs_list = self._project_vlm_layers(vl_embs_list)
-            return self.action_head.predict(
+            actions = self.action_head.predict(
                 vl_embs_list=vl_embs_list,
                 state=state,
                 state_mask=state_mask,
@@ -658,26 +659,38 @@ class QwenSonicFM(nn.Module):
                 num_inference_steps=num_inference_steps or self.config.num_inference_steps,
                 generator=generator,
             )
-        hidden_states, attention_mask = self._encode_qwen(qwen_inputs=qwen_inputs)
-        last_hidden = self._project_vlm_layer(hidden_states[-1])
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, : last_hidden.shape[1]]
-        if architecture == "qwengr00t":
-            return self.action_head.predict(
-                vl_embs=last_hidden,
-                state=state,
-                state_mask=state_mask,
-                encoder_attention_mask=attention_mask,
-                horizon=horizon or self.config.action_horizon,
-                num_inference_steps=num_inference_steps or self.config.num_inference_steps,
-                generator=generator,
-            )
-        action_queries = self._gather_action_queries(
-            last_hidden,
-            action_token_mask,
-            horizon=horizon or self.config.action_horizon,
+        else:
+            hidden_states, attention_mask = self._encode_qwen(qwen_inputs=qwen_inputs)
+            last_hidden = self._project_vlm_layer(hidden_states[-1])
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, : last_hidden.shape[1]]
+            if architecture == "qwengr00t":
+                actions = self.action_head.predict(
+                    vl_embs=last_hidden,
+                    state=state,
+                    state_mask=state_mask,
+                    encoder_attention_mask=attention_mask,
+                    horizon=horizon or self.config.action_horizon,
+                    num_inference_steps=num_inference_steps or self.config.num_inference_steps,
+                    generator=generator,
+                )
+            else:
+                action_queries = self._gather_action_queries(
+                    last_hidden,
+                    action_token_mask,
+                    horizon=horizon or self.config.action_horizon,
+                )
+                actions = self.action_head.predict(action_queries)
+
+        motion_tokens = actions[..., :MOTION_TOKEN_DIM]
+        if not torch.isfinite(motion_tokens).all():
+            raise ValueError("predicted motion token contains NaN or Inf")
+        # SONIC uses 32 scalar levels: {-16, ..., 15} / 16.
+        motion_tokens = (motion_tokens.float().clamp(-1.0, 15.0 / 16.0) * 16.0).round() / 16.0
+        return torch.cat(
+            (motion_tokens.to(actions.dtype), actions[..., MOTION_TOKEN_DIM:]),
+            dim=-1,
         )
-        return self.action_head.predict(action_queries)
 
     def save_checkpoint(
         self,
