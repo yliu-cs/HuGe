@@ -2351,7 +2351,8 @@ def build_training_sampler(dataset: Any, args: argparse.Namespace) -> Sampler[in
     sampling = getattr(dataset, "sampling", None)
     if sampling is not None and sampling["mode"] == "balanced":
         return SourceWeightedSampler(sampling["source_samples"], sampling["ego_probability"],
-                                     sampling["epoch_samples"], base_seed=args.seed)
+                                     sampling["epoch_samples"], episode_spans=dataset.episode_spans(),
+                                     block_size=args.block_shuffle_size or 1, base_seed=args.seed)
     spans_fn = getattr(dataset, "episode_spans", None)
     if args.block_shuffle_size and spans_fn is not None:
         spans = spans_fn()
@@ -2586,7 +2587,8 @@ def _train_stage_impl(
         accelerator,
         (
             f"[{args.stage}] train loader ready: batches={len(train_loader)} batch_size={args.batch_size} "
-            f"num_workers={args.num_workers} drop_last={args.drop_last}"
+            f"num_workers={args.num_workers} drop_last={args.drop_last} "
+            f"sampler={type(train_sampler).__name__} block_shuffle_size={args.block_shuffle_size}"
         ),
     )
     if len(train_loader) == 0:

@@ -14,9 +14,12 @@ SAMPLER_STATE_SCHEMA_VERSION = 1
 
 
 class SourceWeightedSampler(WeightedRandomSampler):
-    """Frame-uniform source weighting with an epoch-addressable random stream."""
+    """Sample episode-local blocks while preserving per-frame source weights."""
 
-    def __init__(self, source_lengths: list[int], ego_probability: float, num_samples: int, *, base_seed: int) -> None:
+    def __init__(
+        self, source_lengths: list[int], ego_probability: float, num_samples: int, *,
+        episode_spans: np.ndarray, block_size: int, base_seed: int,
+    ) -> None:
         if len(source_lengths) not in {1, 2} or any(n <= 0 for n in source_lengths):
             raise ValueError("expected one Real source and optionally one nonempty Ego source")
         if not (0 < ego_probability < 1 if len(source_lengths) == 2 else ego_probability == 0):
@@ -25,9 +28,21 @@ class SourceWeightedSampler(WeightedRandomSampler):
         self.ego_probability = float(ego_probability)
         self.base_seed = int(base_seed)
         self.epoch = 0
+        self.blocks = BlockShuffleSampler(episode_spans, block_size, base_seed=base_seed)
+        spans = np.asarray(episode_spans, dtype=np.int64)
+        source_ends = np.cumsum(source_lengths)
+        if (self.blocks.total != int(source_ends[-1])
+                or not np.array_equal(spans[:, 0], np.cumsum(spans[:, 1]) - spans[:, 1])):
+            raise ValueError("episode spans must cover source samples contiguously")
+        if not np.isin(source_ends, spans.sum(axis=1)).all():
+            raise ValueError("episode spans must not cross source boundaries")
+        source_ids = np.searchsorted(source_ends, self.blocks.starts, side="right")
         probabilities = [1 - ego_probability, ego_probability]
-        weights = torch.cat([torch.full((n,), probabilities[i] / n, dtype=torch.double)
-                             for i, n in enumerate(source_lengths)])
+        # Every frame in a selected block is emitted once. Weight blocks by
+        # source_probability / source_frames, without a block-length factor:
+        # sum(weight * block_length) then gives the requested source ratio,
+        # including short episode tails, and equal exposure within each source.
+        weights = torch.tensor([probabilities[i] / source_lengths[i] for i in source_ids], dtype=torch.double)
         super().__init__(weights, num_samples, replacement=True, generator=torch.Generator())
 
     def set_epoch(self, epoch: int) -> None:
@@ -38,17 +53,25 @@ class SourceWeightedSampler(WeightedRandomSampler):
 
     def __iter__(self) -> Iterator[int]:
         self.set_epoch(self.epoch)
-        return super().__iter__()
+        remaining = self.num_samples
+        for block_id in super().__iter__():
+            start = int(self.blocks.starts[block_id])
+            length = min(int(self.blocks.lengths[block_id]), remaining)
+            yield from range(start, start + length)
+            remaining -= length
+            if remaining == 0:
+                return
 
     def state_dict(self) -> dict[str, Any]:
-        return {"schema_version": 1, "kind": "source_weighted", "base_seed": self.base_seed,
+        return {"schema_version": 1, "kind": "source_weighted_blocks", "base_seed": self.base_seed,
                 "epoch": self.epoch, "source_lengths": self.source_lengths,
-                "ego_probability": self.ego_probability, "num_samples": self.num_samples}
+                "ego_probability": self.ego_probability, "num_samples": self.num_samples,
+                "block_size": self.blocks.block_size, "span_fingerprint": self.blocks.span_fingerprint}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         expected = self.state_dict()
         if not isinstance(state, dict) or {**state, "epoch": 0} != {**expected, "epoch": 0}:
-            raise ValueError("weighted sampler state does not match current data contract")
+            raise ValueError("weighted block sampler state does not match current sampling algorithm, blocks or data")
         self.set_epoch(state["epoch"])
 
 

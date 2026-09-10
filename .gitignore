@@ -16,6 +16,7 @@ sync*
 docs/
 skills/
 /scripts/preprocess/calc_egodex_replay_proprio.py
+/scripts/train/train_eval.sh
 
 # Python / uv
 .venv/

@@ -13,18 +13,17 @@ for arg in "$@"; do
       printf '%s\n' \
         'Usage: bash scripts/train/real_huge.sh [--dry-run] [training options]' \
         '' \
-        'Run six Real/Ego experiments with qwenpi_v3 and qwengr00t (12 sequential runs):' \
-        '  R110_E400_raw, R110_E400_syn, R110_E50_syn, R110_E200_syn,' \
-        '  R55_E400_syn, R11_E400_syn.' \
-        'Run both architectures for each experiment before moving to the next.' \
-        'Reuse the completed R110_E0 baselines; they are not rerun.' \
-        'Use balanced Real/Ego sampling with Ego probability 0.5 in every run.' \
-        'Initialize each architecture from its latest published Stage 2 checkpoint:' \
-        '  .runs/full_all_stage/all/<architecture>/full/stage2/<run>/step_<N>' \
+        'Run only qwenpi_v3 R110_E400_syn (one training run).' \
+        'Reuse the completed qwenpi_v3 R110_E0 baseline; it is not rerun.' \
+        'Reuse the completed qwenpi_v3 R110_E400_raw experiment; it is not rerun.' \
+        'Use balanced Real/Ego sampling with Ego probability 0.5.' \
+        'Read contiguous episode blocks (64 samples by default), preserving source probabilities.' \
+        'Initialize qwenpi_v3 from its latest published Stage 2 checkpoint:' \
+        '  .runs/full_all_stage/all/qwenpi_v3/full/stage2/<run>/step_<N>' \
         'Latest means latest run name, then highest step; incomplete saves are excluded.' \
-        'Check both checkpoints before starting; stop on the first training failure.' \
-        'Default outputs: .runs/finetune_real/<architecture>/full/stage3/<run>' \
-        'Train each architecture for 20000 steps by default.' \
+        'Check the initialization checkpoint before starting.' \
+        'Default outputs: .runs/finetune_real/qwenpi_v3/full/stage3/<run>' \
+        'Train for 20000 steps by default.' \
         'Save model checkpoints every 2000 steps; no periodic full resume states.' \
         'Training still saves a full resume state at completion.' \
         '' \
@@ -34,11 +33,11 @@ for arg in "$@"; do
         'This script does not stop GrabGPU or any other process.' \
         '--dry-run detects GPUs and prints the command without starting training.' \
         '' \
-        'Use the same frozen Stage 1/2 + Real/Ego union stats for every experiment.' \
+        'Use the frozen Stage 1/2 + Real/Ego union stats.' \
         'The default training seed is 7; episode selection follows it unless overridden.' \
         'Architecture, initialization, episode counts, video source and mixing are fixed.' \
-        'For single-architecture initialization/resume, use train_huge.sh stage3.' \
-        'Other options (e.g. --max-steps, --seed) apply to all 12 runs.' \
+        'For custom initialization/resume, use train_huge.sh stage3.' \
+        'Other options (e.g. --max-steps, --seed) override the training defaults.' \
         'Per-device batch and accumulation are not rescaled for GPU count.'
       exit 0
       ;;
@@ -47,7 +46,7 @@ for arg in "$@"; do
       option="${arg%%=*}"
       case "${option//_/-}" in
         --stage|--model-architecture|--init-ckpt|--resume-from-checkpoint|--real-num-episodes|--ego-num-episodes|--ego-video-source|--mixture-mode|--ego-sampling-prob|--humanoid-arena-roots)
-          echo "ERROR: $option is controlled by this experiment matrix; use train_huge.sh for a custom run." >&2
+          echo "ERROR: $option is fixed by this experiment; use train_huge.sh for a custom run." >&2
           exit 2
           ;;
       esac
@@ -63,14 +62,9 @@ if [[ "$num_gpus" -lt 1 ]]; then
   exit 1
 fi
 
-architectures=(qwenpi_v3 qwengr00t)
+architectures=(qwenpi_v3)
 experiments=(
-  R110_E400_raw
   R110_E400_syn
-  R110_E50_syn
-  R110_E200_syn
-  R55_E400_syn
-  R11_E400_syn
 )
 checkpoints=()
 for architecture in "${architectures[@]}"; do
