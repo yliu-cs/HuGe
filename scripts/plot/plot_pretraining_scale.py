@@ -16,9 +16,9 @@ SCALE_LABELS = ("From\nScratch", "10%", "100%")
 # Slightly expand the 0%-10% interval for readability without making all categories equidistant.
 PLOT_POSITIONS = (0, 20, 100)
 RESULTS = {
-    "HuGe-OFT": (55.00, 57.62, 54.05),
+    "HuGe-OFT": (55.00, 55.67, 54.05),
     "HuGe-GR00T": (58.33, 64.05, 66.67),
-    "HuGe-Pi": (60.24, 55.48, 65.00),
+    "HuGe-Pi": (60.24, 62.14, 65.00),
 }
 COLORS = {
     "HuGe-OFT": "#2B6A99",
@@ -52,21 +52,8 @@ def main() -> None:
         marker, linestyle = STYLES[model]
         ax.plot(PLOT_POSITIONS, scores, color=color, marker=marker, linestyle=linestyle, label=model)
 
-    ax.plot(
-        PLOT_POSITIONS[1:], (RESULTS["HuGe-OFT"][1], 56.43),
-        color=COLORS["HuGe-OFT"], linestyle=STYLES["HuGe-OFT"][1],
-    )
-    ax.scatter(
-        PLOT_POSITIONS[-1], 56.43, marker=STYLES["HuGe-OFT"][0],
-        facecolor="white", edgecolor=COLORS["HuGe-OFT"], zorder=3,
-    )
-    ax.annotate(
-        "w/o Ego Proprio", xy=(PLOT_POSITIONS[-1], 56.43), xytext=(8, 8),
-        textcoords="offset points", ha="right", va="bottom", fontsize=10, color="black",
-    )
-
-    ax.set_xlabel("Pre-Training Ego Data Scale", labelpad=8)
-    ax.set_ylabel("HumanoidArena Overall Average", labelpad=8)
+    ax.set_xlabel("Egocentric Pre-Training Data Scale", labelpad=8)
+    ax.set_ylabel("HumanoidArena Average Success Rate", labelpad=8)
     ax.set_xticks(PLOT_POSITIONS, SCALE_LABELS)
     ax.set_ylim(50, 70)
     ax.set_yticks((50, 55, 60, 65, 70))

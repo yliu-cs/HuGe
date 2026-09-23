@@ -36,9 +36,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.axes import Axes
+from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import PathPatch, Rectangle
 from matplotlib.path import Path as PlotPath
+from matplotlib.transforms import Affine2D
 
 
 Result = tuple[int, int] | None
@@ -137,8 +139,43 @@ def _plot_measurement(ax: Axes, position: float, result: Result, *,
                 xytext=(0, 6), textcoords="offset points", ha="center", va="bottom", fontsize=10)
 
 
+def _expand_hatches(fig: Figure) -> None:
+    """Replace diagonal hatches with vector lines to avoid PDF tiling patterns."""
+    for ax in fig.axes:
+        for patch in ax.patches:
+            hatch = patch.get_hatch()
+            if not hatch:
+                continue
+            patch.set_hatch(None)
+            bounds = patch.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+            width, height = bounds.width, bounds.height
+            if not math.isfinite(width + height) or width <= 0 or height <= 0:
+                continue  # Pending bars and zero-count failure bands have no fill.
+            segments = []
+            for slope, symbol in ((1, "/"), (-1, "\\")):
+                count = hatch.count(symbol) + hatch.count("x") + hatch.count("X")
+                if not count:
+                    continue
+                # Matplotlib's diagonal hatches use density 6 in a one-inch tile.
+                spacing = 2 / (6 * count)
+                low, high = (-width, height) if slope == 1 else (0, height + width)
+                for index in range(math.floor(low / spacing), math.ceil(high / spacing) + 1):
+                    offset = index * spacing
+                    segments.append(((0, offset), (width, offset + slope * width)))
+            # Anchor physical spacing to the patch so DPI changes and tight-bbox
+            # export move/scale the lines together with their clipping rectangle.
+            transform = Affine2D().scale(1 / width, 1 / height) + patch.get_transform()
+            lines = LineCollection(segments, colors=[patch.get_edgecolor()],
+                                   linewidths=patch.get_hatch_linewidth(), transform=transform,
+                                   capstyle="butt", zorder=patch.get_zorder() + 0.01)
+            ax.add_collection(lines, autolim=False)
+            lines.set_clip_path(patch)
+            lines.set_in_layout(False)
+
+
 def _save(fig: Figure, output_dir: Path, name: str) -> None:
     fig.tight_layout(h_pad=0.5)
+    _expand_hatches(fig)
     output = output_dir / f"{name}.png"
     fig.savefig(output, dpi=600, bbox_inches="tight")
     fig.savefig(output.with_suffix(".pdf"), bbox_inches="tight")

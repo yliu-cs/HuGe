@@ -18,6 +18,7 @@ from huge.training.runner import (
     _validation_sources,
     build_argparser,
     build_dataset_from_args,
+    resolve_data_seed,
     validate_init_checkpoint,
 )
 
@@ -25,6 +26,7 @@ from huge.training.runner import (
 def check_data(args: Any) -> dict[str, Any]:
     if args.stage != "stage3" or args.real_num_episodes is None or args.init_ckpt is None:
         raise ValueError("preflight requires Stage 3 Real/Ego counts and --init-ckpt")
+    resolve_data_seed(args)
     checkpoint = validate_init_checkpoint(args)
     stage_scope, sources, task_scope = _cumulative_stats_contract(args)
     stats = args.proprio_stats_path or _default_cumulative_stats_path(args, stage_scope)

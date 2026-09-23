@@ -201,6 +201,10 @@ def _optional_path(value: Any) -> str | None:
     return None if normalized.lower() in {"", "none", "null"} else normalized
 
 
+def _optional_seed(value: str) -> int | None:
+    return None if value.strip().lower() == "none" else int(value)
+
+
 def _tuning_mode(args: argparse.Namespace) -> str:
     if args.qwen_lora:
         return "lora"
@@ -250,7 +254,7 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
         raise ValueError("--max-train-samples must be > 0")
     if args.episode_selection_seed is None:
         args.episode_selection_seed = args.seed
-    if args.episode_selection_seed < 0:
+    if args.episode_selection_seed is not None and args.episode_selection_seed < 0:
         raise ValueError("--episode-selection-seed must be >= 0")
     if args.episode_fraction is not None:
         if not math.isfinite(args.episode_fraction) or not 0.0 < args.episode_fraction <= 1.0:
@@ -335,8 +339,8 @@ def resolve_and_validate_args(args: argparse.Namespace, provided: set[str]) -> a
         raise ValueError("--num-workers must be >= 0")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch-factor must be > 0")
-    if args.seed < 0:
-        raise ValueError("--seed must be >= 0")
+    if args.seed is not None and args.seed < 0:
+        raise ValueError("--seed must be >= 0 or None")
     if args.max_grad_norm is None or args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be > 0")
     if args.model_architecture not in EXPECTED_FULL_INVENTORY:
@@ -824,6 +828,24 @@ def _main_process_call(accelerator: Any | None, action: Callable[[], T]) -> T:
         error = result.get("error") if isinstance(result, dict) else "rank 0 returned no result"
         raise RuntimeError(str(error))
     return result["value"]  # type: ignore[return-value]
+
+
+def resolve_data_seed(
+    args: argparse.Namespace,
+    accelerator: Any | None = None,
+    trainer_state: dict[str, Any] | None = None,
+) -> None:
+    """Resolve an unfixed data seed once, shared by ranks and saved for resume."""
+    if args.seed is None:
+        if trainer_state is None:
+            args.seed = _main_process_call(accelerator, lambda: int.from_bytes(os.urandom(4), "little"))
+        else:
+            args.seed = trainer_state["data"]["seed"]
+            if args.episode_selection_seed is None:
+                args.episode_selection_seed = trainer_state["resolved_config"]["episode_selection_seed"]
+        _log_main(accelerator, f"[{args.stage}] --seed None: resolved data sampling seed={args.seed}")
+    if args.episode_selection_seed is None:
+        args.episode_selection_seed = args.seed
 
 
 def _payload_fingerprint(payload: Any) -> str:
@@ -2420,13 +2442,15 @@ def _train_stage_impl(
 
     source_contract = _main_process_call(accelerator, lambda: _source_contract(args))
     resume_info: dict[str, Any] | None = None
-    stats_contract = _cumulative_stats_contract(args)
-    requested_stats_path = args.proprio_stats_path
     if args.resume_from_checkpoint is not None:
         resume_info = _main_process_call(
             accelerator,
             lambda: inspect_resume_state(args.resume_from_checkpoint),
         )
+    resolve_data_seed(args, accelerator, resume_info["trainer_state"] if resume_info is not None else None)
+    stats_contract = _cumulative_stats_contract(args)
+    requested_stats_path = args.proprio_stats_path
+    if resume_info is not None:
         if stats_contract is not None:
             resume_run_dir = Path(str(resume_info["trainer_state"]["run_dir"])).resolve()
             snapshot = resume_run_dir / "proprio_stats_sonic.json"
@@ -3203,7 +3227,8 @@ def build_argparser(default_stage: str) -> argparse.ArgumentParser:
     p.add_argument("--deepspeed-config", default=DEFAULT_DEEPSPEED_CONFIG)
     p.add_argument("--zero-stage", type=int, default=None)
     p.add_argument("--log-every-steps", type=int, default=50)
-    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--seed", type=_optional_seed, default=7,
+                   help="Data sampling seed; None chooses a shared random seed per new run and reuses it on resume.")
     return p
 
 

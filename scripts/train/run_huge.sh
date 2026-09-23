@@ -26,6 +26,7 @@ set -euo pipefail
 #
 # Useful environment variables:
 #   HUGE_DRY_RUN=1                 print commands without launching training
+#   HUGE_SEED=7|None               data sampling seed (None: random per new run)
 #   HUGE_STAGE3_DATA=sim|real|humanoid_arena   experiment mode (default humanoid_arena)
 #   HUGE_RUN_ROOT=.runs/xxx        change the root for all experiments
 #   HUGE_STAGE2_SOURCE_ROOT=...    (real) existing stage1/stage2 runs to init from
@@ -363,6 +364,7 @@ run_exp() {
   local out_dir="$RUN_ROOT/$EXPERIMENT_NAME"
   local cmd=("$TRAIN_SCRIPT" "$stage" --output-dir "$out_dir")
 
+  [[ -z "${HUGE_SEED:-}" ]] || cmd+=(--seed "$HUGE_SEED")
   cmd+=("$@")
 
   RUN_COUNT=$((RUN_COUNT + 1))
