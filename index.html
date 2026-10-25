@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f5f0">
+  <title>HuGe: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience</title>
+  <meta name="description" content="HuGe: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience. A family of models learning from over 2,000 hours of human and robot experience.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="HuGe: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience">
+  <meta property="og:description" content="From human experience to humanoid whole-body control. Explore the method, experiments, paper, and code.">
+  <meta property="og:url" content="https://yliu-cs.github.io/HuGe/">
+  <meta property="og:image" content="https://yliu-cs.github.io/HuGe/assets/hero.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/png" sizes="64x64" href="assets/favicon.png">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="nav-wrap">
+      <a class="wordmark" href="#" aria-label="HuGe home"><span class="brand-symbol" aria-hidden="true">H</span>HuGe<span class="wordmark-note">HUMANOID GENERALIST</span></a>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="navigation">Menu <span aria-hidden="true">+</span></button>
+      <nav id="navigation" aria-label="Main navigation">
+        <a href="#overview">Overview</a><a href="#pretraining">Pre-training</a><a href="#results">Benchmarks</a><a href="#downstream">Real world</a><a href="#citation">Citation</a>
+        <a class="nav-code" href="https://github.com/yliu-cs/HuGe" target="_blank" rel="noopener noreferrer">Code <span aria-hidden="true">↗</span></a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero container" aria-labelledby="paper-title">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="status-dot"></span> HUMAN EXPERIENCE. HUMANOID INTELLIGENCE.</div>
+        <h1 id="paper-title"><span class="hero-brand">HuGe<span class="brand-period" aria-hidden="true">.</span><span class="sr-only">: </span></span><span class="paper-title">Scaling Humanoid Generalist<br class="desktop-break"> Vision-Language-Action Models<br class="desktop-break"> with <em>Egocentric Experience</em></span></h1>
+        <p class="hero-description">Learning from egocentric experience—first through large-scale pre-training, then through task-specific adaptation.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" role="link" aria-disabled="true" title="arXiv link coming soon">Read the paper</a>
+          <a class="button button-outline" href="https://github.com/yliu-cs/HuGe" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M8 5 1 12l7 7M16 5l7 7-7 7M14 3l-4 18" fill="none" stroke="currentColor" stroke-width="1.7"/></svg> Explore the code</a>
+        </div>
+      </div>
+      <figure class="hero-visual">
+        <div class="photo-label"><span class="photo-dot"></span> FROM EXPERIENCE TO ACTION <span>01 / G1</span></div>
+        <img src="assets/hero.jpg" width="915" height="720" alt="The Unitree G1 humanoid next to a table with a cola bottle and a nearby bin in the real-world experiment." fetchpriority="high">
+        <div class="hero-photo-overlay" aria-hidden="true"><span class="viewfinder viewfinder-tl"></span><span class="viewfinder viewfinder-br"></span><span class="photo-coordinate">WHOLE-BODY<br>VISION · LANGUAGE · ACTION</span></div>
+        <figcaption><span>Learning to act in the physical world.</span><span>Unitree G1 · Real-world setup</span></figcaption>
+      </figure>
+    </section>
+
+    <div class="research-strip container" aria-label="Research at a glance">
+      <div><strong>2,000<span>+</span></strong><span>hours of human &amp; robot experience</span></div>
+      <div><strong>3</strong><span>architectures, one action interface</span></div>
+      <div><strong>7</strong><span>HumanoidArena evaluation tasks</span></div>
+      <a href="#overview" class="scroll-prompt">Explore the research <span aria-hidden="true">↓</span></a>
+    </div>
+
+    <section class="authors container" aria-label="Authors and affiliations">
+      <p class="author-list">
+        <span><a href="https://yliu-cs.github.io" target="_blank" rel="noopener noreferrer">Yang Liu</a><sup>1*</sup></span><span><a href="https://jiachengliu3.github.io" target="_blank" rel="noopener noreferrer">Jiacheng Liu</a><sup>1,2,3*</sup></span><span>Hengtao Li<sup>4*</sup></span><span>Yuheng Huang<sup>2</sup></span><span>Zijian Yang<sup>5</sup></span><span>Ji Dai<sup>5</sup></span><span>Maoxin Wang<sup>5</sup></span><span><a href="https://gaoe05.github.io" target="_blank" rel="noopener noreferrer">Yi Gao</a><sup>6</sup></span><span>Qishen Wang<sup>7</sup></span><span>Baohua Yin<sup>8</sup></span><span>Peiyang Li<sup>5</sup></span><span><a href="https://baishuanghao.github.io" target="_blank" rel="noopener noreferrer">Shuanghao Bai</a><sup>9</sup></span><span><a href="https://sunrisulfr.github.io" target="_blank" rel="noopener noreferrer">Mingyang Sun</a><sup>1,2,3</sup></span><span><a href="https://dingpx.github.io" target="_blank" rel="noopener noreferrer">Pengxiang Ding</a><sup>1,2</sup></span><span><a href="https://teacher.bupt.edu.cn/yinjianqin/zh_CN/index.htm" target="_blank" rel="noopener noreferrer">Jianqin Yin</a><sup>5</sup></span><span><a href="https://lixiny.github.io" target="_blank" rel="noopener noreferrer">Lixin Yang</a><sup>3,10†</sup></span><span><a href="https://milab.westlake.edu.cn" target="_blank" rel="noopener noreferrer">Donglin Wang</a><sup>1†</sup></span>
+      </p>
+      <ol class="affiliations" aria-label="Institutions"><li>Westlake University</li><li>Zhejiang University</li><li>Shanghai Innovation Institute</li><li>Hebei University of Technology</li><li>Beijing University of Posts and Telecommunications</li><li>Southwest University of Finance and Economics</li><li>University of Science and Technology of China</li><li>University of Sussex</li><li>Xi'an Jiaotong University</li><li>Shanghai Jiao Tong University</li></ol>
+      <p class="author-notes">* Equal contribution <span>·</span> † Corresponding authors</p>
+    </section>
+
+    <section id="overview" class="section container overview">
+      <div class="section-heading"><span class="section-number">01 / THE IDEA</span><h2>Human experience.<br><em>Whole-body intelligence.</em></h2></div>
+      <div class="overview-copy"><p class="lead">Everyday human activity offers a rich source of experience. How can a humanoid learn from it?</p><p>Robot demonstrations are expensive to collect, especially when a task requires coordinated movement of the entire body. Egocentric human recordings offer scale, but humans and robots look different—and human video does not directly provide robot proprioception.</p><p>We investigate two roles for egocentric data. First, we refine a pre-training recipe through training-strategy, pseudo-proprioception, and data-scale studies. We then compare the complete recipe against existing baselines. Finally, we study how task-specific human demonstrations and visual adaptation support downstream fine-tuning on a real humanoid.</p></div>
+      <div class="research-roadmap">
+        <a href="#pretraining"><span class="roadmap-part">PART I / PRE-TRAINING</span><strong>Build the recipe, one experiment at a time.</strong><span>Training strategy → Pseudo-proprioception → Data scale → Baseline comparison</span><span class="roadmap-arrow" aria-hidden="true">↗</span></a>
+        <a href="#downstream"><span class="roadmap-part">PART II / DOWNSTREAM</span><strong>Bring human task experience to a real robot.</strong><span>Visual adaptation → Fine-tuning with ego data → Real-world demonstrations</span><span class="roadmap-arrow" aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <section id="method" class="section method-section">
+      <div class="container">
+        <div class="section-heading section-heading-wide"><div><span class="section-number">02 / THE METHOD</span><h2>Different experience.<br><em>One common interface.</em></h2></div><p>Three representative VLA architectures.<br>A shared path from perception to action.</p></div>
+        <figure class="architecture-figure"><img src="assets/architecture.png" width="2400" height="975" alt="HuGe architecture: human and robot motion map to universal SONIC action tokens. Simulated playback provides proprioception, and OFT, GR00T, and Pi variants share three training stages." loading="lazy"><figcaption>Human and robot experience, unified through latent motion tokens and a common whole-body control interface.</figcaption></figure>
+        <div class="training-stages">
+          <article><div class="stage-top"><span>STAGE 01</span><span>1,669.61 h</span></div><h3>Egocentric<br> pre-training</h3><p>Learn from human demonstrations and simulated robot experience, with SONIC actions and reconstructed robot states.</p><p class="dataset-list">EgoDex · EgoVerse · Xperience-10M · BEHAVIOR-1K</p></article>
+          <article><div class="stage-top"><span>STAGE 02</span><span>417.58 h</span></div><h3>Humanoid<br> adaptation</h3><p>Adapt to real robot observations and proprioceptive states using whole-body G1 demonstrations.</p><p class="dataset-list">Humanoid Everyday · UniFoLM-WBT · HIW-500</p></article>
+          <article><div class="stage-top"><span>STAGE 03</span><span>TASK-SPECIFIC</span></div><h3>Downstream<br> fine-tuning</h3><p>Specialize for simulation and real-world tasks, including visually adapted human demonstrations for cola pick-and-drop.</p><p class="dataset-list">HumanoidArena · Real-world cola task</p></article>
+        </div>
+        <div class="model-family"><p class="eyebrow">THREE ARCHITECTURES, ONE FAMILY</p><div class="model-row"><strong>HuGe-OFT</strong><span>Parallel action regression</span><p>An MLP predicts continuous action chunks from action-token hidden states.</p></div><div class="model-row"><strong>HuGe-GR00T</strong><span>Flow matching + cross-attention</span><p>An action transformer generates motion conditioned on vision-language features.</p></div><div class="model-row"><strong>HuGe-Pi</strong><span>Layer-wise action conditioning</span><p>A flow-matching action expert attends to multiple backbone layers.</p></div><p class="interface-note"><span>Qwen3-VL-2B-Instruct</span><span>64-D motion token + 2 hand controls</span><span>34-D proprioception</span><span>50-step chunks at 50 Hz</span></p></div>
+      </div>
+    </section>
+
+    <section id="pretraining" class="section pretraining-section">
+      <div class="container">
+        <div class="section-heading section-heading-wide">
+          <div><span class="section-number">03 / EGO DATA FOR PRE-TRAINING</span><h2>A recipe built<br><em>through three questions.</em></h2></div>
+          <p>First establish how to train. Then ask what human experience should contain—and what happens as it grows.</p>
+        </div>
+        <div class="study-navigation" role="navigation" aria-label="Pre-training studies">
+          <a href="#training-strategy"><span>01</span> Training strategy <span aria-hidden="true">↓</span></a>
+          <a href="#pseudo-proprioception"><span>02</span> Pseudo-proprioception <span aria-hidden="true">↓</span></a>
+          <a href="#scaling"><span>03</span> Scaling ego data <span aria-hidden="true">↓</span></a>
+        </div>
+        <p class="study-protocol"><strong>Shared evaluation:</strong> one multi-task policy per variant, 100 demonstrations per task, and 60 evaluation episodes per task across three seed groups of 20. Success rates are unweighted averages over seven HumanoidArena tasks.</p>
+
+        <article id="training-strategy" class="study">
+          <div class="study-copy">
+            <span class="study-step">EXPLORATION 01 / TRAINING STRATEGY</span>
+            <h3>How much of the<br> backbone should adapt?</h3>
+            <p>Before introducing egocentric pre-training, we compare <strong>Frozen, LoRA, and Full</strong> training on HumanoidArena. Each starts from the pre-trained Qwen3-VL backbone.</p>
+            <ul class="strategy-definitions">
+              <li><strong>Frozen</strong><span>Keep the vision-language backbone fixed.</span></li>
+              <li><strong>LoRA</strong><span>Adapt the backbone with low-rank updates.</span></li>
+              <li><strong>Full</strong><span>Fine-tune the backbone and action modules.</span></li>
+            </ul>
+            <div class="study-finding"><span>WHAT WE CARRY FORWARD</span><p><strong>Full fine-tuning wins across all three variants.</strong> It exceeds LoRA by 19.29–38.81 percentage points, so we adopt Full in the following experiments.</p></div>
+          </div>
+          <div class="study-evidence">
+            <div class="evidence-heading"><h4>Choose the training strategy</h4><span>AVERAGE SUCCESS (%) ↑</span></div>
+            <div class="strategy-table-wrap">
+              <table class="strategy-table">
+                <caption>No HuGe stage pre-training in this comparison; the VLM is pre-trained.</caption>
+                <thead><tr><th scope="col">Variant</th><th scope="col">Frozen</th><th scope="col">LoRA</th><th scope="col" class="selected-strategy">Full</th></tr></thead>
+                <tbody>
+                  <tr><th scope="row">HuGe-OFT</th><td><span>0.00</span><i style="--value:0%" aria-hidden="true"></i></td><td><span>16.19</span><i style="--value:16.19%" aria-hidden="true"></i></td><td class="selected-strategy"><strong>55.00</strong><i style="--value:55%" aria-hidden="true"></i></td></tr>
+                  <tr><th scope="row">HuGe-GR00T</th><td><span>24.05</span><i style="--value:24.05%" aria-hidden="true"></i></td><td><span>34.05</span><i style="--value:34.05%" aria-hidden="true"></i></td><td class="selected-strategy"><strong>58.33</strong><i style="--value:58.33%" aria-hidden="true"></i></td></tr>
+                  <tr><th scope="row">HuGe-Pi</th><td><span>30.24</span><i style="--value:30.24%" aria-hidden="true"></i></td><td><span>40.95</span><i style="--value:40.95%" aria-hidden="true"></i></td><td class="selected-strategy"><strong>60.24</strong><i style="--value:60.24%" aria-hidden="true"></i></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="evidence-note">The action modules are trained in every setting. The low-level SONIC controller remains fixed.</p>
+            <a class="study-next" href="#pseudo-proprioception">With Full selected, what should ego data provide? <span aria-hidden="true">↓</span></a>
+          </div>
+        </article>
+
+        <article id="pseudo-proprioception" class="study">
+          <div class="study-copy">
+            <span class="study-step">EXPLORATION 02 / PSEUDO-PROPRIOCEPTION</span>
+            <h3>Can human experience<br> provide a robot state?</h3>
+            <p>Human video does not contain the corresponding robot proprioception. Simulated G1 playback reconstructs a <strong>34-dimensional state</strong> to accompany egocentric demonstrations.</p>
+            <div class="state-composition"><span><strong>29</strong>joint positions</span><b aria-hidden="true">+</b><span><strong>2</strong>hand states</span><b aria-hidden="true">+</b><span><strong>3</strong>gravity components</span></div>
+            <p>We vary whether these states are provided <strong>during egocentric pre-training</strong>, then evaluate downstream control with robot-state inputs.</p>
+            <div class="study-finding"><span>WHAT WE LEARN</span><p><strong>Robot-state context helps GR00T and Pi.</strong> OFT declines; the paper associates this with truncation of its textual state representation.</p></div>
+          </div>
+          <div class="study-evidence">
+            <div class="evidence-heading"><h4>Add pseudo-proprioception</h4><span>AVERAGE SUCCESS (%) ↑</span></div>
+            <table class="state-table">
+              <caption>Pseudo-proprioceptive states during egocentric pre-training.</caption>
+              <thead><tr><th scope="col">Variant</th><th scope="col">Without</th><th scope="col">With</th><th scope="col">Change</th></tr></thead>
+              <tbody>
+                <tr><th scope="row">HuGe-OFT</th><td>56.43</td><td>54.05</td><td class="negative">−2.38 <small>pp</small></td></tr>
+                <tr><th scope="row">HuGe-GR00T</th><td>61.67</td><td><strong>66.67</strong></td><td class="positive">+5.00 <small>pp</small></td></tr>
+                <tr><th scope="row">HuGe-Pi</th><td>62.14</td><td><strong>65.00</strong></td><td class="positive">+2.86 <small>pp</small></td></tr>
+              </tbody>
+            </table>
+            <div class="posture-callout"><span>POSTURE-SENSITIVE EXAMPLE / SITSOFA</span><p><strong>61.67 → 78.33%</strong><span>HuGe-GR00T</span></p><p><strong>68.33 → 83.33%</strong><span>HuGe-Pi</span></p></div>
+            <a class="study-next" href="#scaling">With state context, does more experience help? <span aria-hidden="true">↓</span></a>
+          </div>
+        </article>
+
+        <article id="scaling" class="study scaling-study">
+          <div class="study-copy">
+            <span class="study-step">EXPLORATION 03 / SCALING EGOCENTRIC DATA</span>
+            <h3>What changes when<br> experience scales?</h3>
+            <p>We compare no HuGe pre-training, 10% of the egocentric pre-training corpus, and the full corpus, measuring transfer to downstream humanoid control.</p>
+            <p><strong>HuGe-GR00T and HuGe-Pi improve at each evaluated scale.</strong> With the full corpus, they reach 66.67% and 65.00% average success.</p>
+            <div class="study-finding"><span>SCALING TREND</span><p>More egocentric experience benefits the two flow-matching variants. OFT falls at the largest scale, consistent with the textual-state truncation issue.</p></div>
+            <p class="evidence-note">These are observed trends at three evaluated scales; the study does not fit a mathematical scaling law.</p>
+          </div>
+          <div class="study-evidence">
+            <figure class="scaling-figure">
+              <div class="scaling-chart-heading"><h4>Average success (%)</h4><span>Select a model to highlight</span></div>
+              <div class="scaling-legend" role="group" aria-label="Highlight a scaling curve">
+                <button type="button" class="scaling-key scaling-groot" data-scaling-model="groot" aria-pressed="false" aria-controls="scaling-chart"><span class="scaling-swatch" aria-hidden="true"></span>HuGe-GR00T</button>
+                <button type="button" class="scaling-key scaling-pi" data-scaling-model="pi" aria-pressed="false" aria-controls="scaling-chart"><span class="scaling-swatch" aria-hidden="true"></span>HuGe-Pi</button>
+                <button type="button" class="scaling-key scaling-oft" data-scaling-model="oft" aria-pressed="false" aria-controls="scaling-chart"><span class="scaling-swatch" aria-hidden="true"></span>HuGe-OFT</button>
+              </div>
+              <!-- Categorical x positions: 58, 260, 462. Success-rate y mapping: 274 - (value - 50) * 12. -->
+              <svg id="scaling-chart" class="scaling-chart" viewBox="0 0 520 340" role="img" aria-labelledby="scaling-chart-title scaling-chart-desc">
+                <title id="scaling-chart-title">Egocentric pre-training scale and downstream success</title>
+                <desc id="scaling-chart-desc">Three equally spaced experimental settings: no HuGe pre-training, 10%, and 100% of the egocentric corpus. Average success rates: HuGe-GR00T, 58.33, 64.05, 66.67%; HuGe-Pi, 60.24, 62.14, 65.00%; HuGe-OFT, 55.00, 55.67, 54.05%. The vertical axis runs from 50 to 70%. Lines connect measured points and are not a fitted scaling law.</desc>
+                <rect class="scaling-full-band" x="426" y="22" width="72" height="252" rx="8"/>
+                <g class="scaling-grid" aria-hidden="true">
+                  <path d="M58 34H482 M58 94H482 M58 154H482 M58 214H482 M58 274H482"/>
+                  <path class="scaling-guide" d="M58 34V274 M260 34V274 M462 34V274"/>
+                </g>
+                <g class="scaling-axis" aria-hidden="true">
+                  <text x="39" y="39">70</text><text x="39" y="99">65</text><text x="39" y="159">60</text><text x="39" y="219">55</text><text x="39" y="279">50</text>
+                  <text class="scaling-x-label" x="58" y="306">No pre-train.</text><text class="scaling-x-label" x="260" y="306">10%</text><text class="scaling-x-label scaling-x-full" x="462" y="306">100%</text>
+                  <text class="scaling-axis-title" x="260" y="334">PRE-TRAINING SETTING</text>
+                </g>
+                <g class="scaling-series scaling-oft" data-scaling-series="oft" aria-hidden="true">
+                  <polyline class="scaling-line" points="58,214 260,205.96 462,225.4"/>
+                  <g class="scaling-points"><rect x="53" y="209" width="10" height="10" rx="2"/><rect x="255" y="200.96" width="10" height="10" rx="2"/><rect x="457" y="220.4" width="10" height="10" rx="2"/></g>
+                  <g class="scaling-point-values"><text x="58" y="239">55.00</text><text x="260" y="230.96">55.67</text><text x="462" y="250.4">54.05</text></g>
+                </g>
+                <g class="scaling-series scaling-pi" data-scaling-series="pi" aria-hidden="true">
+                  <polyline class="scaling-line" points="58,151.12 260,128.32 462,94"/>
+                  <g class="scaling-points"><path d="M58 144.12l7 7-7 7-7-7Z M260 121.32l7 7-7 7-7-7Z M462 87l7 7-7 7-7-7Z"/></g>
+                  <g class="scaling-point-values"><text x="58" y="133.12">60.24</text><text x="260" y="153.32">62.14</text><text x="462" y="119">65.00</text></g>
+                </g>
+                <g class="scaling-series scaling-groot" data-scaling-series="groot" aria-hidden="true">
+                  <polyline class="scaling-line" points="58,174.04 260,105.4 462,73.96"/>
+                  <g class="scaling-points"><circle cx="58" cy="174.04" r="5.5"/><circle cx="260" cy="105.4" r="5.5"/><circle cx="462" cy="73.96" r="5.5"/></g>
+                  <g class="scaling-point-values"><text x="58" y="199.04">58.33</text><text x="260" y="87.4">64.05</text><text x="462" y="55.96">66.67</text></g>
+                </g>
+              </svg>
+              <figcaption>Equal spacing represents experimental settings, not proportional data volumes. “No pre-train.” means no HuGe stage pre-training; the backbone starts from Qwen3-VL.</figcaption>
+            </figure>
+            <details class="scale-values"><summary>Exact values at each scale <span aria-hidden="true">+</span></summary><table class="state-table"><caption>Average success (%). The three columns are experimental settings, not equally spaced data volumes.</caption><thead><tr><th scope="col">Variant</th><th scope="col">No pre-train.</th><th scope="col">10%</th><th scope="col">100%</th></tr></thead><tbody><tr><th scope="row">HuGe-OFT</th><td>55.00</td><td>55.67</td><td>54.05</td></tr><tr><th scope="row">HuGe-GR00T</th><td>58.33</td><td>64.05</td><td>66.67</td></tr><tr><th scope="row">HuGe-Pi</th><td>60.24</td><td>62.14</td><td>65.00</td></tr></tbody></table></details>
+          </div>
+        </article>
+        <a class="recipe-conclusion" href="#results"><div><span class="eyebrow">FROM EXPLORATION TO COMPARISON</span><h3>Now evaluate the complete recipe.</h3><p>Full fine-tuning · pseudo-proprioceptive pre-training · full egocentric corpus</p></div><span class="conclusion-arrow" aria-hidden="true">↓</span></a>
+      </div>
+    </section>
+
+    <section id="results" class="section container results-section">
+      <div class="section-heading section-heading-wide"><div><span class="section-number">04 / COMPARISON WITH EXISTING BASELINES</span><h2>The complete recipe.<br><em>Against existing baselines.</em></h2></div><p>Building on the three investigations, we compare HuGe with existing policies across seven HumanoidArena tasks.</p></div>
+      <div class="results-layout"><div class="result-story"><span class="eyebrow">HUMANOIDARENA · OVERALL SUCCESS</span><div class="big-result">66.67<span>%</span></div><p class="result-model">HuGe-GR00T</p><p class="result-gain">+12.86 <span>percentage points over the strongest listed baseline, π<sub>0.5</sub>.</span></p><p>HuGe-Pi reaches <strong>65.00%</strong>. One multi-task policy per variant is evaluated across seven tasks.</p><div class="protocol-note"><strong>Evaluation protocol</strong><p>100 training demonstrations per task. 60 evaluation episodes per task: three seed groups of 20. Overall is the unweighted mean across seven tasks.</p></div></div><div class="chart-panel"><div class="chart-header"><div><h3>Compare success rates</h3><p id="metric-description">Unweighted average across all 7 tasks</p></div><label class="select-label"><span class="sr-only">Evaluation metric</span><select id="result-metric"><option value="overall">Overall average</option><option value="hoi">Object interaction (HOI)</option><option value="hsi">Scene interaction (HSI)</option><optgroup label="Individual tasks"><option value="football">Football</option><option value="doubledesk">DoubleDesk</option><option value="ppbox">P&amp;PBox</option><option value="opendoor">OpenDoor</option><option value="sitsofa">SitSofa</option><option value="boxing">Boxing</option><option value="visnavi">VisNavi</option></optgroup></select></label></div><div class="chart-axis" aria-hidden="true"><span>0</span><span>50</span><span>100%</span></div><div id="results-chart" class="results-chart" aria-label="Model success rates"><noscript><p>JavaScript enables the interactive chart. All results are available in the table below.</p></noscript></div><p class="chart-legend"><span class="legend-dot"></span> HuGe models <span class="legend-dot baseline-dot"></span> Baselines <span>† Reported by HumanoidArena</span></p><p class="sr-only" id="chart-announcement" aria-live="polite"></p></div></div>
+      <details class="full-results"><summary>Explore all task-level results <span aria-hidden="true">+</span></summary><div class="table-scroll" tabindex="0" role="region" aria-label="HumanoidArena task-level success rates"><table><caption>Success rate (%). † Results retrieved from the original HumanoidArena paper; other results evaluated in this work.</caption><thead><tr><th scope="col">Model</th><th scope="col">Football</th><th scope="col">DoubleDesk</th><th scope="col">P&amp;PBox</th><th scope="col">OpenDoor</th><th scope="col">SitSofa</th><th scope="col">Boxing</th><th scope="col">VisNavi</th><th scope="col">Overall</th></tr></thead><tbody>
+        <tr><th scope="row">ACT †</th><td>20.00</td><td>30.00</td><td>60.00</td><td>58.30</td><td>21.70</td><td>58.30</td><td>28.30</td><td>39.51</td></tr>
+        <tr><th scope="row">DP †</th><td>53.30</td><td>35.00</td><td>0.00</td><td>83.30</td><td>83.30</td><td>21.70</td><td>50.00</td><td>46.66</td></tr>
+        <tr><th scope="row">FM †</th><td>21.70</td><td>20.00</td><td>0.00</td><td>76.70</td><td>48.30</td><td>18.30</td><td>38.30</td><td>31.90</td></tr>
+        <tr><th scope="row">π<sub>0.5</sub> †</th><td>10.00</td><td>30.00</td><td>75.00</td><td>85.00</td><td>70.00</td><td>71.70</td><td>35.00</td><td>53.81</td></tr>
+        <tr><th scope="row">GR00T (scratch)</th><td>0.00</td><td>0.00</td><td>75.00</td><td>11.67</td><td>13.33</td><td>68.33</td><td>36.67</td><td>29.29</td></tr>
+        <tr><th scope="row">GR00T (N1.7)</th><td>13.33</td><td>0.00</td><td>76.67</td><td>8.33</td><td>75.00</td><td>11.67</td><td>26.67</td><td>30.24</td></tr>
+        <tr class="ours"><th scope="row">HuGe-OFT</th><td>48.33</td><td>0.00</td><td>53.33</td><td>75.00</td><td>55.00</td><td>73.33</td><td>73.33</td><td>54.05</td></tr>
+        <tr class="ours"><th scope="row">HuGe-GR00T</th><td>71.67</td><td>15.00</td><td>81.67</td><td>95.00</td><td>78.33</td><td>68.33</td><td>56.67</td><td><strong>66.67</strong></td></tr>
+        <tr class="ours"><th scope="row">HuGe-Pi</th><td>63.33</td><td>11.67</td><td>76.67</td><td>88.33</td><td>83.33</td><td>68.33</td><td>63.33</td><td>65.00</td></tr>
+      </tbody></table></div><p class="table-note">Performance varies by task: DoubleDesk remains challenging for all HuGe variants (0–15% success). HOI comprises Football, DoubleDesk, and P&amp;PBox; HSI comprises the remaining four tasks.</p></details>
+    </section>
+
+    <section id="downstream" class="section adaptation-section">
+      <div class="container downstream-introduction">
+        <span class="section-number">05 / EGO DATA FOR DOWNSTREAM TASKS</span>
+        <h2>A second role for ego data.<br><em>Learning the task at hand.</em></h2>
+        <div class="downstream-context"><p>Pre-training builds transferable experience. Can task-specific human demonstrations also help when real robot data is limited?</p><p>We move to a real Unitree G1, hold the robot budget at <strong>110 demonstrations</strong>, and add <strong>400 human demonstrations</strong> of cola pick-and-drop. First, we study the visual gap. Then, we measure full-task success.</p></div>
+      </div>
+      <div class="container adaptation-layout"><div class="adaptation-copy"><span class="section-number">DOWNSTREAM STUDY 01 / VISUAL ADAPTATION</span><h2>The same experience.<br><em>A new embodiment.</em></h2><p>Human hands become robot hands. The task, motion, and supervision stay aligned.</p><p class="muted">For downstream cola pick-and-drop, visual adaptation inpaints human arms and hands and composites rendered robotic counterparts, while preserving actions, states, and language.</p><div class="frame-controls"><label for="frame-slider">Explore paired observations <output id="frame-number" for="frame-slider">08 / 15</output></label><input id="frame-slider" type="range" min="1" max="15" value="8" step="1" aria-label="Select paired human and robot-adapted frame"><div class="range-labels"><span>Approach</span><span>Pick up</span><span>Drop</span></div></div></div><div class="frame-pair"><figure><div class="adaptation-frame human-frame" role="img" aria-label="Original human observation, frame 8 of 15"></div><figcaption><span class="frame-dot human-dot"></span> Human observation <span>ORIGINAL</span></figcaption></figure><figure><div class="adaptation-frame robot-frame" role="img" aria-label="Visually adapted robot observation, frame 8 of 15"></div><figcaption><span class="frame-dot robot-dot"></span> Robot embodiment <span>ADAPTED</span></figcaption></figure><p>Paired frames from the visual adaptation figure in the paper.</p></div></div>
+      <div class="container visual-evidence">
+        <div class="evidence-heading"><h3>Do adapted observations look more like robot experience?</h3><span>FRÉCHET DISTANCE TO REAL ROBOT FEATURES ↓</span></div>
+        <div class="fd-grid">
+          <article><h4>Wan2.2</h4><p>2.0311 <span aria-hidden="true">→</span> <strong>1.3499</strong></p><span class="fd-reduction">33.54% lower</span></article>
+          <article><h4>VideoMAE V2</h4><p>7.5697 <span aria-hidden="true">→</span> <strong>5.5204</strong></p><span class="fd-reduction">27.07% lower</span></article>
+          <article><h4>V-JEPA 2</h4><p>305.5143 <span aria-hidden="true">→</span> <strong>263.2697</strong></p><span class="fd-reduction">13.83% lower</span></article>
+        </div>
+        <p class="fd-note">Raw → visually adapted ego observations. Distances decrease within all three feature spaces; their absolute scales differ.</p>
+        <details class="feature-details"><summary>Inspect the feature distributions <span aria-hidden="true">+</span></summary><figure><button class="figure-zoom" type="button" data-zoom="assets/feature-alignment.png" data-caption="PCA projections of normalized raw ego, visually adapted, and real robot features in Wan2.2, VideoMAE V2, and V-JEPA 2 feature spaces." aria-label="Enlarge feature alignment figure"><img src="assets/feature-alignment.png" width="2400" height="740" alt="Three PCA projections show visually adapted human features shifting toward real robot feature distributions across Wan2.2, VideoMAE V2, and V-JEPA 2." loading="lazy"><span class="zoom-label">View full figure <span aria-hidden="true">↗</span></span></button><figcaption>Feature-space alignment provides complementary evidence of reduced visual discrepancy.</figcaption></figure></details>
+      </div>
+    </section>
+
+    <section id="downstream-results" class="section real-section"><div class="container"><div class="section-heading section-heading-wide"><div><span class="section-number">DOWNSTREAM STUDY 02 / TASK FINE-TUNING</span><h2>Does human task experience<br><em>improve robot control?</em></h2></div><p>“Walk forward, grab the cola<br>and throw into the trash bin”</p></div><div class="real-layout"><div class="real-copy"><span class="eyebrow">UNITREE G1 + INSPIRE HANDS</span><h3>More human experience.<br>Better task completion.</h3><p>With 110 robot demonstrations held fixed, adding 400 human demonstrations improves HuGe-Pi on a whole-body pick-and-drop task. Visually adapting those human observations adds two successful trials out of 30.</p><p class="real-protocol">30 trials per condition · randomized bottle placement · HuGe-Pi only</p><div class="real-bars" aria-label="Real-world success rates"><div><div class="real-bar-label"><span>Robot data only</span><strong>43.3% <small>13/30</small></strong></div><div class="real-bar-track"><span style="--value:43.3%" class="bar-muted"></span></div></div><div><div class="real-bar-label"><span>+ Raw human experience</span><strong>60.0% <small>18/30</small></strong></div><div class="real-bar-track"><span style="--value:60%" class="bar-light"></span></div></div><div><div class="real-bar-label"><span>+ Visually adapted experience</span><strong>66.7% <small>20/30</small></strong></div><div class="real-bar-track"><span style="--value:66.7%"></span></div></div></div><p class="real-note">The two augmented conditions use the same 400 human demonstrations, with raw or adapted visuals.</p></div><figure class="real-figure"><button class="figure-zoom" type="button" data-zoom="assets/real-world.png" data-caption="Real-world experimental setup, bottle placements, success rates, stage-wise performance, and execution sequences on Unitree G1." aria-label="Enlarge the real-world experiment figure"><img src="assets/real-world.png" width="2400" height="1228" alt="Real-world experiment figure with the G1 setup, varied cola placements, success rates and sequential photographs of the robot completing the task." loading="lazy"><span class="zoom-label">View experiment details <span aria-hidden="true">↗</span></span></button><figcaption>Approach → pick up → crouch → throw into the bin.<br>Full experiment figure from the paper.</figcaption></figure></div></div></section>
+
+    <section id="demos" class="section demo-section">
+      <div class="container">
+        <div class="section-heading section-heading-wide">
+          <div><span class="section-number">06 / REAL-WORLD DEMONSTRATIONS</span><h2>One task.<br><em>Different conditions.</em></h2></div>
+          <p>From a knocked-over bottle to different tabletop placements: three real-world rollouts reveal how the policy adapts and coordinates its body.</p>
+        </div>
+        <div class="demo-context"><span class="eyebrow">SHARED INSTRUCTION</span><p>“Walk forward, grab the cola and throw into the trash bin”</p><span class="demo-platform">HuGe-Pi · Unitree G1</span></div>
+        <div class="demo-grid">
+          <figure class="demo-card">
+            <div class="demo-card-heading"><div class="demo-topline"><span>01 / OBJECT DISTURBANCE</span><span>10.6 s</span></div><h3 id="demo-recovery-title">Recover after<br> a disturbance.</h3></div>
+            <div class="demo-video-wrap"><video controls playsinline preload="none" poster="assets/demos/demo-03.jpg" aria-labelledby="demo-recovery-title" aria-describedby="demo-recovery-caption"><source src="assets/demos/demo-03.mp4" type="video/mp4">Your browser does not support embedded video. <a href="assets/demos/demo-03.mp4">Open the disturbance demonstration</a>.</video></div>
+            <figcaption id="demo-recovery-caption"><p>The bottle is deliberately knocked over during grasping—a perturbation absent from fine-tuning data. The robot re-grasps it and completes the task.</p><div class="demo-focus"><span>WATCH FOR / RECOVERY</span><p>Bottle tips → re-grasp → successful drop</p></div></figcaption>
+          </figure>
+          <figure class="demo-card">
+            <div class="demo-card-heading"><div class="demo-topline"><span>02 / TABLETOP PLACEMENT A</span><span>10.0 s</span></div><h3 id="demo-placement-title">Adapt to the<br> bottle position.</h3></div>
+            <div class="demo-video-wrap"><video controls playsinline preload="none" poster="assets/demos/demo-01.jpg" aria-labelledby="demo-placement-title" aria-describedby="demo-placement-caption"><source src="assets/demos/demo-01.mp4" type="video/mp4">Your browser does not support embedded video. <a href="assets/demos/demo-01.mp4">Open the first bottle-placement demonstration</a>.</video></div>
+            <figcaption id="demo-placement-caption"><p>At one tabletop placement, the robot approaches, picks up the bottle, and turns toward the bin. Compare its approach and reach with the next rollout.</p><div class="demo-focus"><span>WATCH FOR / SPATIAL ADAPTATION</span><p>Approach → reach and grasp → turn</p></div></figcaption>
+          </figure>
+          <figure class="demo-card">
+            <div class="demo-card-heading"><div class="demo-topline"><span>03 / TABLETOP PLACEMENT B</span><span>12.5 s</span></div><h3 id="demo-coordination-title">Coordinate the<br> full sequence.</h3></div>
+            <div class="demo-video-wrap"><video controls playsinline preload="none" poster="assets/demos/demo-02.jpg" aria-labelledby="demo-coordination-title" aria-describedby="demo-coordination-caption"><source src="assets/demos/demo-02.mp4" type="video/mp4">Your browser does not support embedded video. <a href="assets/demos/demo-02.mp4">Open the second bottle-placement demonstration</a>.</video></div>
+            <figcaption id="demo-coordination-caption"><p>With the bottle at another tabletop position, the robot links pickup, transport, crouching, and release through coordinated arm and lower-body motion.</p><div class="demo-focus"><span>WATCH FOR / WHOLE-BODY CONTROL</span><p>Carry the bottle → crouch → release</p></div></figcaption>
+          </figure>
+        </div>
+        <p class="demo-note">These rollouts provide qualitative evidence of adaptation to an object disturbance and spatial generalization across the evaluated bottle placements. Reported success rates use 30 evaluation trials per data configuration.</p>
+      </div>
+    </section>
+
+    <section id="citation" class="section container citation-section"><div><span class="section-number">07 / BUILD ON HUGE</span><h2>Experience worth<br><em>building on.</em></h2><p>If HuGe supports your research,<br>please consider citing our work.</p><div class="resource-links"><a role="link" aria-disabled="true" title="arXiv link coming soon">Read the paper</a><a href="https://github.com/yliu-cs/HuGe" target="_blank" rel="noopener noreferrer">Explore the repository <span aria-hidden="true">↗</span></a><a href="mailto:liuyang67@westlake.edu.cn">Contact the authors <span aria-hidden="true">↗</span></a></div></div><div class="citation-box"><div class="citation-header"><span>BIBTEX</span><button id="copy-citation" type="button">Copy citation <span aria-hidden="true">⧉</span></button></div><pre><code id="bibtex">@misc{liu2026huge,
+  title = {HuGe: Scaling Humanoid Generalist
+    Vision-Language-Action Models with
+    Egocentric Experience},
+  author = {Liu, Yang and Liu, Jiacheng and Li, Hengtao
+    and Huang, Yuheng and Yang, Zijian and Dai, Ji
+    and Wang, Maoxin and Gao, Yi and Wang, Qishen
+    and Yin, Baohua and Li, Peiyang and Bai, Shuanghao
+    and Sun, Mingyang and Ding, Pengxiang
+    and Yin, Jianqin and Yang, Lixin and Wang, Donglin},
+  year = {2026},
+  eprint = {xxxx.xxxxx},
+  archivePrefix = {arXiv},
+  primaryClass = {},
+  url = {https://arxiv.org/abs/xxxx.xxxxx}
+}</code></pre><div class="citation-bottom"><span id="copy-status" role="status" aria-live="polite">arXiv ID pending</span><a href="assets/huge.bib" download>Download .bib <span aria-hidden="true">↓</span></a></div></div></section>
+  </main>
+  <footer class="site-footer container"><a class="wordmark" href="#">HuGe<span class="brand-period">.</span></a><p>Human experience. Humanoid intelligence.</p><a href="#main">Back to top <span aria-hidden="true">↑</span></a></footer>
+  <dialog id="figure-dialog" aria-labelledby="figure-caption"><div class="dialog-header"><span>HuGe / Research figure</span><button type="button" id="close-figure" autofocus aria-label="Close enlarged figure">Close <span aria-hidden="true">×</span></button></div><img id="enlarged-figure" alt=""><p id="figure-caption"></p></dialog>
+</body>
+</html>

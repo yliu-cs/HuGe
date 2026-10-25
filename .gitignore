@@ -78,6 +78,9 @@ tests/
 *.webm
 *.gif
 
+# Curated project-page demonstrations
+!/assets/demos/*.mp4
+
 # OS / editor noise
 .DS_Store
 Thumbs.db
