@@ -1,7 +1,17 @@
-# 🤖 Huge: Humanoid General Foundation Model
+# HuGe: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience
 
-Huge is a Qwen3-VL vision-language-action training and inference stack for
-humanoid loco-manipulation.
+HuGe (**Hu**manoid **Ge**neralist) is a family of vision-language-action models
+for humanoid whole-body control. This repository provides Qwen3-VL-2B-Instruct
+implementations of OFT-, GR00T-, and Pi-style policies that predict SONIC motion
+tokens and hand-control signals through a three-stage training pipeline:
+egocentric pre-training, humanoid adaptation, and downstream fine-tuning.
+
+Yang Liu, Jiacheng Liu, Hengtao Li, Yuheng Huang, Zijian Yang, Ji Dai,
+Maoxin Wang, Yi Gao, Qishen Wang, Baohua Yin, Peiyang Li, Shuanghao Bai,
+Mingyang Sun, Pengxiang Ding, Jianqin Yin, Lixin Yang, and Donglin Wang.
+
+[Project page](https://yliu-cs.github.io/HuGe) ·
+[Code](https://github.com/yliu-cs/HuGe)
 
 ## 🧩 Core contracts
 
@@ -16,12 +26,20 @@ humanoid loco-manipulation.
 | Base VLM | `resource/model/Qwen3-VL-2B-Instruct` |
 | SONIC assets | `resource/model/sonic` |
 
+Paper variants and configuration names:
+
+| Paper variant | `--model-architecture` |
+| --- | --- |
+| HuGe-OFT | `qwenoft` |
+| HuGe-GR00T | `qwengr00t` |
+| HuGe-Pi | `qwenpi_v3` |
+
 Training stages:
 
 | Stage | Data |
 | --- | --- |
-| `stage1` | EgoDex, EgoVerse, Behavior-1K, and Xperience adapters |
-| `stage2` | Humanoid-Everyday, G1-WBT, and HIW-500 |
+| `stage1` | EgoDex, EgoVerse, BEHAVIOR-1K, and Xperience-10M |
+| `stage2` | Humanoid Everyday, UniFoLM-WBT (`G1_WBT`), and HIW-500 |
 | `stage3` | proprietary real/sim data or the unified HumanoidArena cache |
 
 ## ⚙️ Requirements
@@ -54,7 +72,7 @@ print("flash-attn:", md.version("flash-attn"))
 PY
 ```
 
-Use `PYTHONPATH=src .venv/bin/python` for Huge Python entry points. Do not
+Use `PYTHONPATH=src .venv/bin/python` for HuGe Python entry points. Do not
 mix the root environment with the separate WBC or Isaac Lab environments.
 
 ## 🗂️ Repository layout
@@ -110,6 +128,8 @@ resource/datasets/
     g1_proprio/
   G1_WBT/
     g1_proprio/
+  HIW-500/
+    g1_proprio/
 ```
 
 `G1_WBT` may be an external symlink.
@@ -149,9 +169,10 @@ Default inputs and output:
 | `--out-root` | `resource/datasets/HumanoidArena` |
 | `--he-cache-root` | `resource/datasets/humanoid-everyday-cache` |
 | `--wbt-source-root` | `resource/datasets/G1_WBT` |
+| `--hiw-source-root` | `resource/datasets/HIW-500` |
 
 The preprocessor validates all episodes, writes to staging, computes
-HE + WBT + HumanoidArena union stats, validates the cache, and publishes it
+HE + WBT + HIW + HumanoidArena union stats, validates the cache, and publishes it
 atomically.
 
 ```text
@@ -165,6 +186,10 @@ resource/datasets/HumanoidArena/
     language_map.json
     proprio_stats_union_sonic.json
 ```
+
+This cache-local stats file is a legacy preprocessing output. Current training
+requires cumulative statistics that also include all Stage 1 sources; generate
+them as described in [Cumulative proprioception statistics](#cumulative-proprioception-statistics).
 
 Embedded v2 RGB frames are encoded to MP4. V3 sidecar videos are linked back to
 the raw tree. Do not move or delete `HumanoidArena_raw` after preprocessing.
@@ -269,8 +294,8 @@ PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
   --token-glob '**/token_state.npy' --resume
 
 PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
-  --input-root resource/datasets/egoverse-cache/sonic_tokens \
-  --output-root resource/datasets/egoverse-cache/g1_proprio \
+  --input-root resource/datasets/egoverse-retargeted-cache/sonic_tokens \
+  --output-root resource/datasets/egoverse-retargeted-cache/g1_proprio \
   --token-glob '*.npy' --resume
 
 PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_proprio/run.py \
@@ -337,6 +362,102 @@ bash scripts/train/train_huge.sh <stage> [options]
 The launcher configures Accelerate, DeepSpeed, GPU/process discovery, cuDNN,
 and previous-stage checkpoint selection.
 
+### Cumulative proprioception statistics
+
+Prepare the source caches, paired action/proprio arrays, and dataset indexes
+before training. EgoDex requires `meta/egodex_index.json`; the other Stage 1
+caches require their published conversion manifests and episode indexes.
+Computing stats does not build these inputs or replace the training inventory
+validation.
+
+The current trainer validates exact cumulative statistics, including the
+source roots, stage scope, and 34-D layout. Even when a training example selects
+a subset of episodes, its stats use the complete cumulative source pool.
+
+| Training configuration | `--stage-scope` | Sources | File under `resource/datasets/meta/` |
+| --- | --- | --- | --- |
+| Stage 1 | `stage1` | EgoDex + EgoVerse + BEHAVIOR-1K + Xperience-10M | `stage1_proprio_stats_union_sonic.json` |
+| Stage 2 | `stage12` | Stage 1 + HE + WBT + HIW | `stage12_proprio_stats_union_sonic.json` |
+| HumanoidArena Stage 3 | `stage123_humanoid_arena` | Stage 1 + Stage 2 + all HumanoidArena tasks | `stage123_humanoid_arena_proprio_stats_union_sonic.json` |
+| Real/Ego Stage 3 | `stage123_proprietary` | Stage 1 + Stage 2 + proprietary Ego + Real | `stage123_proprietary_proprio_stats_union_sonic.json` |
+
+Run the setup and the commands for the required scopes in the same Bash
+session from the repository root. Each `--source TAG=ROOT` points directly to
+a directory of 34-D proprio arrays; all `*.npy` files beneath it are scanned.
+The arrays must be nonempty, finite `[T,34] float32` data. The exact quantile
+computation needs scratch space of at least `total_frames * 34 * 4` bytes;
+its temporary subdirectory is removed when the computation finishes.
+
+```bash
+huge_data_root=resource/datasets
+huge_stats_root="$huge_data_root/meta"
+huge_stats_scratch=.runs/proprio_stats/scratch
+
+stage1_sources=(
+  --source "EGODEX=$huge_data_root/EgoDex-cache/g1_proprio"
+  --source "EGOVERSE=$huge_data_root/egoverse-retargeted-cache/g1_proprio"
+  --source "BEHAVIOR1K=$huge_data_root/behavior-1k-2025-challenge-cache/g1_proprio"
+  --source "XPERIENCE=$huge_data_root/xperience-10m-cache/g1_proprio"
+)
+stage12_sources=(
+  "${stage1_sources[@]}"
+  --source "HE=$huge_data_root/humanoid-everyday-cache/g1_proprio"
+  --source "WBT=$huge_data_root/G1_WBT/g1_proprio"
+  --source "HIW=$huge_data_root/HIW-500/g1_proprio"
+)
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_union_proprio_stats.py \
+  --stage-scope stage1 "${stage1_sources[@]}" \
+  --scratch-dir "$huge_stats_scratch" \
+  --out "$huge_stats_root/stage1_proprio_stats_union_sonic.json" \
+  --show-progress
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_union_proprio_stats.py \
+  --stage-scope stage12 "${stage12_sources[@]}" \
+  --scratch-dir "$huge_stats_scratch" \
+  --out "$huge_stats_root/stage12_proprio_stats_union_sonic.json" \
+  --show-progress
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_union_proprio_stats.py \
+  --stage-scope stage123_humanoid_arena "${stage12_sources[@]}" \
+  --source "HUMANOID_ARENA=$huge_data_root/HumanoidArena/g1_proprio" \
+  --scratch-dir "$huge_stats_scratch" \
+  --out "$huge_stats_root/stage123_humanoid_arena_proprio_stats_union_sonic.json" \
+  --show-progress
+```
+
+For the Real/Ego configuration used by `scripts/train/real_huge.sh`, derive
+the Ego proprio path from its existing paired index and include both
+downstream sources:
+
+```bash
+huge_ego_proprio="$(
+  .venv/bin/python - "$huge_data_root/proprietary/ego" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index = json.loads((root / "meta/stage3_episode_index.json").read_text())
+print(root / index["cache_root"] / "g1_proprio")
+PY
+)"
+
+PYTHONPATH=src .venv/bin/python scripts/preprocess/calc_union_proprio_stats.py \
+  --stage-scope stage123_proprietary "${stage12_sources[@]}" \
+  --source "PROP_EGO=$huge_ego_proprio" \
+  --source "PROP_REAL=$huge_data_root/proprietary/real/cola_final_110/g1_proprio" \
+  --scratch-dir "$huge_stats_scratch" \
+  --out "$huge_stats_root/stage123_proprietary_proprio_stats_union_sonic.json" \
+  --show-progress
+```
+
+HumanoidArena cumulative stats always have `task_scope="all"`. The statistics
+CLI has no task selector, and current HumanoidArena training accepts only
+`--humanoid-arena-task all`. Cache-local HE/WBT/HIW/HumanoidArena stats do not
+satisfy this cumulative contract. Keep `--dataset-root` and any explicit source
+roots consistent with the resolved source paths recorded in the stats.
+
 ### Stage 1/2 multi-source data
 
 Repeated source arguments provide the common upper-level interface; each kind
@@ -345,20 +466,24 @@ Stage 1 uses EgoDex only and Stage 2 uses HE + WBT.
 
 ```bash
 bash scripts/train/train_huge.sh stage1 \
+  --dataset-root resource/datasets \
   --stage1-source egodex resource/datasets/EgoDex \
-  --stage1-source egoverse resource/datasets/egoverse-cache \
+  --stage1-source egoverse resource/datasets/egoverse-retargeted-cache \
   --stage1-source behavior1k resource/datasets/behavior-1k-2025-challenge-cache \
   --stage1-source xperience resource/datasets/xperience-10m-cache \
   --episode-fraction 0.10 \
   --episode-selection-seed 7 \
-  --sample-stride 10
+  --sample-stride 10 \
+  --proprio-stats-path \
+    resource/datasets/meta/stage1_proprio_stats_union_sonic.json
 
 bash scripts/train/train_huge.sh stage2 \
+  --dataset-root resource/datasets \
   --stage2-source he resource/datasets/humanoid-everyday \
   --stage2-source wbt resource/datasets/G1_WBT \
   --stage2-source hiw resource/datasets/HIW-500 \
   --proprio-stats-path \
-    resource/datasets/G1_WBT-cache/meta/g1_proprio_stats_sonic.json
+    resource/datasets/meta/stage12_proprio_stats_union_sonic.json
 ```
 
 The full-pipeline launcher now defaults Stage 1 to EgoDex + EgoVerse +
@@ -395,31 +520,39 @@ decoded strictly through PyAV/libdav1d.
 
 ```bash
 bash scripts/train/train_huge.sh stage3 \
+  --dataset-root resource/datasets \
   --model-architecture qwenpi_v3 \
   --init-ckpt none \
   --prop-roots \
   --humanoid-arena-roots resource/datasets/HumanoidArena \
-  --humanoid-arena-task HOI_pp_box \
+  --humanoid-arena-task all \
   --proprio-stats-path \
-    resource/datasets/HumanoidArena/meta/proprio_stats_union_sonic.json
+    resource/datasets/meta/stage123_humanoid_arena_proprio_stats_union_sonic.json
 ```
 
 The empty `--prop-roots` is intentional; it disables the default proprietary
 dataset.
 
-Use `--humanoid-arena-task all` for the full unified cache. Valid task names
-are recorded in `meta/conversion_manifest.json`.
+This trains one architecture jointly on all tasks in the unified cache.
+Single-task HumanoidArena training is not supported by the current launchers.
 
 ### HumanoidArena experiment matrix
 
 `scripts/train/run_huge.sh` defaults to three sequential Stage 3 full-tuning runs:
 
-- task: `HOI_pp_box`
+- task: `all`
 - architectures: `qwenpi_v3 qwengr00t qwenoft`
-- tuning modes: `full lora frozen_vlm`
+- tuning mode: `full`
 - initialization: none
-- epochs: 50
-- checkpoint interval: 3000 steps
+- processes: 8 GPUs on one node for each full-tuning run
+- training budget: 50,000 successful optimizer updates
+- VLM / projector / action learning rates: `1e-5` / `2.5e-5` / `1e-4`
+- periodic checkpoints: disabled; final checkpoint only
+
+These are the current launcher defaults. Select `--full-pipeline` to run
+Stage 1 -> Stage 2 -> Stage 3 for each architecture, with initialization passed
+between stages. LoRA and frozen-backbone modes remain available through an
+explicit `HUGE_HUMANOID_ARENA_TUNING_MODES` override.
 
 Tuning modes:
 
@@ -427,7 +560,7 @@ Tuning modes:
 | --- | --- |
 | `full` | train the full Qwen model |
 | `lora` | train attention LoRA; default r=8, alpha=16, dropout=0 |
-| `frozen_vlm` | freeze Qwen; train Huge action components |
+| `frozen_vlm` | freeze Qwen; train HuGe action components |
 
 Preview one configuration without training:
 
@@ -452,31 +585,37 @@ bash scripts/train/run_huge.sh
 Run one selected configuration:
 
 ```bash
-HUGE_HUMANOID_ARENA_TASK=HOI_pp_box \
-HUGE_HUMANOID_ARENA_ARCHITECTURES=qwenpi_v3 \
-HUGE_HUMANOID_ARENA_TUNING_MODES=full \
-bash scripts/train/run_huge.sh
+bash scripts/train/run_huge.sh --arch qwenpi_v3
+```
+
+Run the three stages for one architecture:
+
+```bash
+bash scripts/train/run_huge.sh --full-pipeline --arch qwenpi_v3
 ```
 
 Legacy pipeline modes:
 
-- `HUGE_STAGE3_DATA=sim` runs Stage 1 -> Stage 2 -> sim Stage 3 once over every
-  EgoDex time step and writes under `.runs/sim_pipeline`.
+- `HUGE_STAGE3_DATA=sim` runs Stage 1 -> Stage 2 -> sim Stage 3, using a Stage 1
+  start-frame stride of 10 by default, and writes under `.runs/sim_pipeline`.
 - `HUGE_STAGE3_DATA=real` runs real Stage 3 once, initializes from
   `HUGE_STAGE2_SOURCE_ROOT`, and writes under `.runs/stage3_real_cola`.
 
-Both modes retain legacy `resource/dataset/` defaults and require path
+The sim pipeline uses `resource/datasets/` for Stage 1/2. Both modes retain
+legacy `resource/dataset/` roots for Stage 3 and require explicit path
 alignment before use.
 
 Outputs:
 
 ```text
-.runs/stage3_humanoidarena/
-  <task>/<architecture>/<tuning-mode>/stage3/<run-id>/
+.runs/full_all_stage/
+  all/<architecture>/<tuning-mode>/<stage>/<run-id>/
     train.log
     data_manifest.json
     training_config.json
     step_<global-step>/
+      _SUCCESS
+      manifest.json
       model.safetensors
       config.json
       proprio_stats_sonic.json
@@ -485,16 +624,25 @@ Outputs:
 
 ### Stage defaults
 
-| Stage | LR | Batch/process | Epochs | Stride | Warmup | Weight decay | Periodic checkpoint |
+Defaults for `train_huge.sh` without experiment-specific overrides:
+
+| Stage | LR | Batch/process | Training budget | Stride | Warmup | Weight decay | Periodic checkpoint |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `stage1` | `1e-4` | 96 | 1 | 10 | 0.05 | 0.01 | disabled |
-| `stage2` | `1e-4` | 96 | 1 | 5 | 0.05 | 0.01 | disabled |
-| `stage3` | `3e-5` | 32 | 50,000-step cap | 1 | 0.1 | 0.005 | disabled; final only |
+| `stage1` | `3e-5` | 32 | 1 epoch | 10 | 0.05 | 0.01 | disabled |
+| `stage2` | `3e-5` | 32 | 1 epoch | 5 | 0.02 | 0.01 | disabled |
+| `stage3` | `3e-5` | 32 | 50,000 successful updates | 1 | 0.01 | 0.005 | disabled; final only |
+
+When `max_steps` is set, it determines the stopping point and the epoch
+setting is not used as a limit.
+
+OFT defaults to 24 samples per process in all three stages. The experiment
+launcher supplies its own grouped learning rates and other overrides; use its
+dry-run output to inspect the selected configuration.
 
 Shared defaults: `qwenpi_v3`, full Qwen training, bf16, DeepSpeed ZeRO-2,
 16 action layers, 1024 action hidden size, 16 attention heads, 4 inference
-steps, 8 workers, and no validation loop. Only the final checkpoint is saved
-unless a periodic interval is explicitly supplied.
+steps, 4 data-loader workers, and no validation loop. Only the final checkpoint
+is saved unless a periodic interval is explicitly supplied.
 
 For explicit distributed settings:
 
@@ -510,9 +658,10 @@ bash scripts/train/train_huge.sh stage3 \
   --proprio-stats-path /path/to/proprio_stats_union_sonic.json
 ```
 
-Stage 1 and Stage 2 retain legacy `resource/dataset/` defaults when no explicit
-roots are passed. Use repeated `--stage1-source`/`--stage2-source` arguments for
-the current plural tree. See [Compatibility notes](#compatibility-notes).
+Single-stage training retains legacy `resource/dataset/` defaults when no
+explicit dataset root is passed. Use `--dataset-root resource/datasets` and
+the source/stat arguments above for the current plural tree.
+See [Compatibility notes](#compatibility-notes).
 
 ## 📊 Offline evaluation
 
@@ -577,11 +726,11 @@ Real-robot deployment uses the independent WBC environment. Install
 instructions. The commands below use the current workspace at
 `/home/kinetra-5090-01/code/liuyang/Huge`, a G1 with Inspire hands, and the
 QwenPI v3 full-tuning checkpoint at step 20000. Run each block in a separate
-terminal. Huge, the VLA client, WBC, and the keyboard publisher run on this
+terminal. HuGe, the VLA client, WBC, and the keyboard publisher run on this
 machine; the camera server must already be available at `192.168.123.164:5555`
 and the robot-side Inspire DDS bridge must be running.
 
-**Terminal 1 — Huge policy server**
+**Terminal 1 — HuGe policy server**
 
 ```bash
 cd /home/kinetra-5090-01/code/liuyang/Huge
@@ -604,7 +753,7 @@ PYTHONPATH=src \
 ```
 
 This checkpoint's `config.json` sets `num_inference_steps` to `4`;
-the Huge server reads it from the checkpoint and does not expose a
+the HuGe server reads it from the checkpoint and does not expose a
 `--num-inference-steps` CLI flag. Proprioception uses the stats bundled
 with this exact checkpoint. The client supplies projected gravity and
 publishes SONIC actions on port 5556, so both server-side state tapping
@@ -699,67 +848,137 @@ freshness handling must be verified before physical deployment.
 
 ## 🧪 HumanoidArena simulation evaluation
 
-The wrapper uses HumanoidArena's Isaac Lab and LeRobot environments:
+The evaluator loads native HuGe portable checkpoints and runs the SONIC
+backend. It uses the root `.venv` for orchestration and policy inference,
+and HumanoidArena's dedicated Isaac Lab interpreter for simulation. Prepare
+the repository-local `HumanoidArena/` runtime, its task configurations, and
+the required SONIC and local Qwen assets before using this entry point.
+`env.sh` resolves the simulation interpreter through HumanoidArena's
+`isaaclab_twist2_g1/script/common/runtime_paths.sh`.
 
 ```bash
 bash scripts/eval/humanoidarena/run_eval.sh \
-  <task> <lerobot-model-search-root> [all|sonic|twist2]
+  <task> <checkpoint_dir_or_root> [sonic]
 ```
 
-Automatic discovery searches for `*/checkpoints/*/pretrained_model` and
-two-level `<run>/pretrained_model` directories. Use `MODEL_PATHS_CSV` for an
-explicit model path.
+Pass a published `step_<N>` directory to evaluate one checkpoint, or a parent
+directory to discover published `step_<N>` directories recursively. Discovery
+orders checkpoints by parent path and then numeric step; it evaluates every
+discovered checkpoint. Each checkpoint must include `config.json`,
+`model.safetensors`, `proprio_stats_sonic.json`, `proprio_norm_config.json`,
+`manifest.json`, and `_SUCCESS`, with valid publication metadata. The local
+Qwen path recorded in the checkpoint must resolve on this machine.
 
-Supported tasks:
+Supported task names are `boxing`, `doubledesk`, `football`, `open_door`,
+`pp_box`, `sit_sofa`, and `vision_navi`. Use `all` as the **task** to evaluate
+all seven tasks for each selected checkpoint. The backend is always `sonic`;
+LeRobot `pretrained_model` directories and the `twist2` backend are not
+accepted by this launcher.
+
+Preview one checkpoint and one episode without starting policy inference or
+simulation. Replace the checkpoint path with an existing published directory:
+
+```bash
+HUGE_EVAL_CKPT=/absolute/path/to/step_20000
+
+HUGE_EVAL_DRY_RUN=1 \
+TEST_MODE=base_test \
+SEEDS_OVERRIDE=0 \
+REPEATS_PER_SEED=1 \
+HUGE_EVAL_GPU_COUNT=1 \
+HUGE_EVAL_WORKERS_PER_GPU=1 \
+bash scripts/eval/humanoidarena/run_eval.sh \
+  pp_box "$HUGE_EVAL_CKPT" sonic
+```
+
+For this single-checkpoint, single-task invocation, dry-run prints a JSON
+static plan to stdout. It validates the checkpoint, local model assets,
+task YAML, and required upstream source interfaces using the Isaac Lab
+interpreter. It stops before CUDA discovery, model loading, network sockets,
+or simulation startup, so an available GPU is not required for this check.
+The installed Python environments and runtime files are still required.
+It does not create an evaluation attempt or save `plan.json`. A dry-run using
+a checkpoint root or the `all` task goes through the batch wrapper, which
+also writes batch logs and summaries.
+
+Run a one-checkpoint, one-episode smoke evaluation on one visible GPU,
+using `HUGE_EVAL_CKPT` from the preceding block:
+
+```bash
+HUGE_EVAL_DRY_RUN=0 \
+TEST_MODE=base_test \
+SEEDS_OVERRIDE=0 \
+REPEATS_PER_SEED=1 \
+HUGE_EVAL_GPU_COUNT=1 \
+HUGE_EVAL_WORKERS_PER_GPU=1 \
+HUGE_EVAL_OUTPUT_ROOT=.runs/eval/humanoidarena_smoke \
+bash scripts/eval/humanoidarena/run_eval.sh \
+  pp_box "$HUGE_EVAL_CKPT" sonic
+```
+
+This command starts the HuGe policy server and Isaac Lab simulation. Before
+launch, the shell preflight checks OpenGL libraries, TensorRT, cuDNN, and
+ONNX Runtime CUDA support. `SKIP_PREFLIGHT=1` permits execution after those
+shell checks fail; it does not disable later validation or make the run a
+dry-run.
+
+Evaluate all seven tasks with three seed groups and 20 episodes per group
+(420 episodes per selected checkpoint):
+
+```bash
+HUGE_EVAL_DRY_RUN=0 \
+TEST_MODE=base_test \
+SEEDS_OVERRIDE=0,1,2 \
+REPEATS_PER_SEED=20 \
+HUGE_EVAL_GPU_COUNT=1 \
+HUGE_EVAL_WORKERS_PER_GPU=1 \
+HUGE_EVAL_OUTPUT_ROOT=.runs/eval/humanoidarena \
+bash scripts/eval/humanoidarena/run_eval.sh \
+  all "$HUGE_EVAL_CKPT" sonic
+```
+
+Checkpoint and task batches run serially; episodes within a task use the
+selected GPU workers. Passing a checkpoint parent directory expands this
+evaluation to every discovered checkpoint. Use a checkpoint trained for the
+intended tasks.
+
+Common environment overrides:
+
+| Variable | Behavior |
+| --- | --- |
+| `TEST_MODE` | Task YAML configuration directory; default `base_test`. |
+| `SEEDS_OVERRIDE`, `REPEATS_PER_SEED` | Override the seed groups and repeats from the task YAML. |
+| `MAX_STEPS` | Override the task-specific episode step limit. |
+| `HUGE_EVAL_GPU_COUNT` | Use the first N CUDA-visible GPUs; mutually exclusive with `HUGE_EVAL_GPU_LOGICAL_IDS`. |
+| `HUGE_EVAL_GPU_LOGICAL_IDS` | Comma-separated CUDA logical IDs, respecting `CUDA_VISIBLE_DEVICES`. If neither GPU selector is set, all visible GPUs are selected. |
+| `HUGE_EVAL_WORKERS_PER_GPU` | `1` or `2`; the shell launcher defaults to `2`. |
+| `HUGE_EVAL_EXECUTION_HORIZON` | Actions executed from each 50-step prediction; default `20`, range `1..50`. |
+| `HUGE_EVAL_OUTPUT_ROOT` | Episode-result root; default `.runs/eval/humanoidarena`. Must resolve inside this repository's `.runs/`. |
+| `HUGE_EVAL_RESUME` | Default `1`; reuse compatible completed work. |
+| `HUGE_EVAL_RECORD_VIDEO_EVERY_N` | Video recording interval; `0` disables recording. |
+| `HUGE_EVAL_DRY_RUN` | `1` performs static validation and prints the plan; default `0`. |
+
+The launcher does not use the legacy `DRY_RUN`, `NUM_WORKERS`, `MODEL_LIMIT`,
+or `MODEL_PATHS_CSV` variables. The numeric `<index> 2` interface is a separate,
+historical P&PBox checkpoint matrix with fixed defaults; use the task-based
+interface shown here for new runs.
+
+Actual evaluation writes plans, logs, episode records, and summaries:
 
 ```text
-boxing
-doubledesk
-football
-open_door
-pp_box
-sit_sofa
-vision_navi
+<HUGE_EVAL_OUTPUT_ROOT>/<task>/<checkpoint-label>/<contract-id>/
+  contract.json
+  attempts/<attempt-id>/
+    plan.json
+    summary.json
+    summary.csv
+    ...
 ```
 
-One-model, one-episode smoke:
-
-```bash
-TEST_MODE=base_test \
-SEEDS_OVERRIDE=0 \
-REPEATS_PER_SEED=1 \
-NUM_WORKERS=1 \
-MODEL_LIMIT=1 \
-MODEL_PATHS_CSV=/absolute/path/to/pretrained_model \
-bash scripts/eval/humanoidarena/run_eval.sh \
-  pp_box /absolute/path/to/existing/model-search-root sonic
-```
-
-Preview the evaluator command without launching simulation:
-
-```bash
-DRY_RUN=1 \
-SKIP_PREFLIGHT=1 \
-TEST_MODE=base_test \
-SEEDS_OVERRIDE=0 \
-REPEATS_PER_SEED=1 \
-NUM_WORKERS=1 \
-MODEL_LIMIT=1 \
-MODEL_PATHS_CSV=/absolute/path/to/pretrained_model \
-bash scripts/eval/humanoidarena/run_eval.sh \
-  pp_box /absolute/path/to/existing/model-search-root sonic
-```
-
-The default full evaluation is not a smoke test. The preflight checks system
-OpenGL libraries, TensorRT, cuDNN, and ONNX Runtime CUDA support.
-`SKIP_PREFLIGHT=1` permits the run after a failed check; it does not suppress
-the check output.
-
-Base-test defaults are 3 seeds x 20 repeats: 60 episodes per model/backend.
-The default `all` backend runs SONIC and TWIST2: 120 episodes per model.
-
-This wrapper discovers HumanoidArena/LeRobot `pretrained_model` directories.
-It does not load Huge `step_*/model.safetensors` checkpoints directly.
+Checkpoint-root and `all` invocations additionally write batch progress and
+logs under `.runs/eval/humanoidarena_batch/<task>/<run-id>/`, independently of
+`HUGE_EVAL_OUTPUT_ROOT`. Each task summary reports successful and completed
+episode counts, including per-seed counts.
 
 ## ✅ Validation
 
@@ -786,11 +1005,16 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
 ## ⚠️ Compatibility notes
 
-- Current data is stored under `resource/datasets/`. Stage 2, the general
-  audit, and several legacy sim/real/preprocessing defaults still use
-  `resource/dataset/`. Do not treat the paths as interchangeable.
+- Current data is stored under `resource/datasets/`. Single-stage training,
+  the general audit, and several legacy sim/real/preprocessing defaults still
+  use `resource/dataset/`. Pass explicit roots as shown above.
 - Stage 1 accepts `--egodex-root resource/datasets/EgoDex`; both Stage 1 and
-  Stage 2 accept repeated typed source arguments for the plural tree.
+  Stage 2 accept repeated typed source arguments for the plural tree. Their
+  cumulative stats still require all sources in the corresponding stage scope.
+- HumanoidArena training accepts only `all` and requires
+  `stage123_humanoid_arena_proprio_stats_union_sonic.json`. The cache-local
+  `HumanoidArena/meta/proprio_stats_union_sonic.json` is a preprocessing output
+  and does not satisfy the cumulative training contract.
 - `scripts/download_humanoidarena_vision_navi.py` is not present. The
   ModelScope snippet above is the supported download command in this README.
 - `tests/test_download_humanoidarena_vision_navi.py` still imports the removed
@@ -799,10 +1023,10 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 - `src/huge/data/audit.py` writes a report and still checks legacy singular
   paths; it is not a complete audit of the unified HumanoidArena cache.
 - `offline_compare.py` is not a native HumanoidArena evaluator.
-- The HumanoidArena simulation wrapper accepts LeRobot checkpoints, not native
-  Huge checkpoints.
+- The HumanoidArena evaluator loads native HuGe published `step_<N>`
+  checkpoints and supports the SONIC backend. `all` selects seven tasks.
 
 ## 🙏 Acknowledgments
 
-Huge builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC,
+HuGe builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC,
 HumanoidArena, and Qwen3-VL.
