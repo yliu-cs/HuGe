@@ -14,7 +14,9 @@
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" type="image/png" sizes="64x64" href="assets/favicon.png">
   <link rel="stylesheet" href="site.css">
+  <link rel="stylesheet" href="framework.css">
   <script src="site.js" defer></script>
+  <script src="framework.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -75,12 +77,58 @@
     <section id="method" class="section method-section">
       <div class="container">
         <div class="section-heading section-heading-wide"><div><span class="section-number">02 / THE METHOD</span><h2>Different experience.<br><em>One common interface.</em></h2></div><p>Three representative VLA architectures.<br>A shared path from perception to action.</p></div>
-        <figure class="architecture-figure"><img src="assets/architecture.png" width="2400" height="975" alt="HuGe architecture: human and robot motion map to universal SONIC action tokens. Simulated playback provides proprioception, and OFT, GR00T, and Pi variants share three training stages." loading="lazy"><figcaption>Human and robot experience, unified through latent motion tokens and a common whole-body control interface.</figcaption></figure>
-        <div class="training-stages">
-          <article><div class="stage-top"><span>STAGE 01</span><span>1,669.61 h</span></div><h3>Egocentric<br> pre-training</h3><p>Learn from human demonstrations and simulated robot experience, with SONIC actions and reconstructed robot states.</p><p class="dataset-list">EgoDex · EgoVerse · Xperience-10M · BEHAVIOR-1K</p></article>
-          <article><div class="stage-top"><span>STAGE 02</span><span>417.58 h</span></div><h3>Humanoid<br> adaptation</h3><p>Adapt to real robot observations and proprioceptive states using whole-body G1 demonstrations.</p><p class="dataset-list">Humanoid Everyday · UniFoLM-WBT · HIW-500</p></article>
-          <article><div class="stage-top"><span>STAGE 03</span><span>TASK-SPECIFIC</span></div><h3>Downstream<br> fine-tuning</h3><p>Specialize for simulation and real-world tasks, including visually adapted human demonstrations for cola pick-and-drop.</p><p class="dataset-list">HumanoidArena · Real-world cola task</p></article>
-        </div>
+        <figure id="huge-framework" class="hf-figure" aria-labelledby="hf-title" aria-describedby="hf-caption">
+          <div class="hf-meta"><span>FIGURE 01 <b>HUGE FRAMEWORK</b></span><div class="hf-pan-controls"><span>Swipe to explore</span><button type="button" data-hf-pan="-1" aria-label="Pan framework left" aria-controls="hf-board">←</button><button type="button" data-hf-pan="1" aria-label="Pan framework right" aria-controls="hf-board">→</button></div></div>
+          <div class="hf-heading"><div><p class="hf-kicker">FROM HUMAN EXPERIENCE TO HUMANOID CONTROL</p><h3 id="hf-title">Learn. Unify. Act.</h3></div><button id="hf-motion" type="button" aria-pressed="false" aria-controls="hf-board" hidden><span data-motion-icon aria-hidden="true">Ⅱ</span> <span data-motion-label>Pause motion</span></button></div>
+          <div class="hf-viewport" tabindex="0" role="region" aria-label="HuGe framework. Scroll horizontally to explore the full diagram on smaller screens.">
+            <div id="hf-board" class="hf-board">
+              <svg class="hf-wires" width="1248" height="1068" viewBox="0 0 1248 1068" aria-hidden="true"></svg>
+              <div class="hf-lane hf-lane-motion"><div class="hf-lane-label"><span>01</span><h4>A universal action space</h4><p>Different embodiments. Shared motion tokens.</p></div></div>
+              <div class="hf-sonic-region"><span>SONIC <b>FROZEN MOTION PRIOR</b></span></div>
+
+              <article class="hf-node hf-source hf-robot" data-hf-node="robot" tabindex="0" aria-label="Robot action connects to the robot encoder"><img src="assets/framework/robot-motion.jpg" alt="Robot motion in simulation" width="512" height="512" loading="lazy"><div><span class="hf-kicker">ROBOT EXPERIENCE</span><h4>Robot action</h4></div><span class="hf-mobile-arrow" aria-hidden="true">→</span></article>
+              <article class="hf-node hf-source hf-hybrid" data-hf-node="hybrid" tabindex="0" aria-label="VR keypoints and robot leg action connect to the hybrid encoder"><img src="assets/framework/hybrid-motion.jpg" alt="Robot motion with tracked VR keypoints" width="512" height="512" loading="lazy"><div><span class="hf-kicker">HYBRID EXPERIENCE</span><h4>VR keypoints<br><span>+ robot leg action</span></h4></div><span class="hf-mobile-arrow" aria-hidden="true">→</span></article>
+              <article class="hf-node hf-source hf-human" data-hf-node="human" tabindex="0" aria-label="Human motion connects to the human encoder and simulation playback"><img src="assets/framework/human-motion.jpg" alt="Human motion in a shared 3D space" width="512" height="512" loading="lazy"><div><span class="hf-kicker">HUMAN EXPERIENCE</span><h4>Human motion</h4></div><span class="hf-mobile-arrow" aria-hidden="true">→</span></article>
+
+              <div class="hf-node hf-encoder hf-robot-encoder" data-hf-node="robot-encoder" tabindex="0">Robot encoder</div>
+              <div class="hf-node hf-encoder hf-hybrid-encoder" data-hf-node="hybrid-encoder" tabindex="0">Hybrid encoder</div>
+              <div class="hf-node hf-encoder hf-human-encoder" data-hf-node="human-encoder" tabindex="0">Human encoder</div>
+              <article class="hf-node hf-token" data-hf-node="token" tabindex="0"><span class="hf-kicker">SHARED LATENT SPACE</span><div class="hf-token-strip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><h4>Universal motion token</h4><p>64 dimensions</p></article>
+              <article class="hf-node hf-decoder" data-hf-node="decoder" tabindex="0"><span class="hf-kicker">WHOLE-BODY CONTROL</span><h4>Robot control<br>decoder</h4><div class="hf-state-input"><span aria-hidden="true">↑</span> Robot state</div><p>Fixed SONIC controller</p></article>
+              <article class="hf-node hf-execution" data-hf-node="execution" tabindex="0"><span class="hf-kicker">EXECUTION</span><h4>Whole-body action</h4><img src="assets/framework/robot.png" alt="Humanoid coordinating its arms and legs" width="600" height="450" loading="lazy"><span class="hf-execution-label">BODY + HANDS</span></article>
+
+              <span class="hf-route-label hf-motion-route">Motion token per step <span aria-hidden="true">↑</span> <b>64-D</b></span>
+              <span class="hf-route-label hf-playback-route">Human motion → simulated robot experience</span>
+              <span class="hf-route-label hf-hand-route" data-hf-route="hands">Hand controls<b>2-D / action</b></span>
+              <div class="hf-lane hf-lane-policy"><div class="hf-lane-label"><span>02</span><h4>From experience to policy</h4><p>Reconstruct the state. Learn the action.</p></div></div>
+              <article class="hf-node hf-simulation" data-hf-node="simulation" tabindex="0"><span class="hf-kicker">SONIC ENCODE / DECODE</span><h4>Simulation playback</h4><img src="assets/framework/simulation.png" alt="Parallel humanoid simulation reconstructs robot states from human motion" width="560" height="400" loading="lazy"><p>Replay human motion on G1</p></article>
+              <article class="hf-node hf-state" data-hf-node="state" tabindex="0"><span class="hf-kicker">STATE RECONSTRUCTION</span><h4>Pseudo-<br>proprioception</h4><div class="hf-state-size">34<span>-D</span></div><p>29 joints + 2 hands<br>+ 3 gravity components</p></article>
+              <article class="hf-node hf-vlm" data-hf-node="vlm" tabindex="0" aria-label="HuGe vision-language-action model. Select an architecture to explore its action head.">
+                <div class="hf-model-top"><span class="hf-kicker">HUMANOID GENERALIST VLA</span><span class="hf-trainable">TRAINABLE</span></div>
+                <div class="hf-model-tabs" role="group" aria-label="Choose a HuGe architecture"><button type="button" data-hf-model="oft" aria-pressed="false" aria-controls="hf-model-detail">OFT</button><button type="button" data-hf-model="groot" aria-pressed="false" aria-controls="hf-model-detail">GR00T</button><button type="button" data-hf-model="pi" aria-pressed="true" aria-controls="hf-model-detail">Pi</button></div>
+                <div id="hf-model-detail"><h4 id="hf-model-title">HuGe-Pi</h4><div class="hf-model-flow"><span class="hf-backbone">Qwen3-VL <small>2B · vision + language</small></span><span class="hf-mini-arrow" aria-hidden="true">→</span><span id="hf-model-head" class="hf-action-head">DiT</span></div><p id="hf-model-conditioning">Layer-wise backbone features</p><div class="hf-inputs"><span>Image</span><span>Language</span><span>State</span><span id="hf-model-noise">Noise</span></div><p id="hf-model-description">Flow matching · layer-wise conditioning</p></div>
+              </article>
+              <article class="hf-node hf-action" data-hf-node="action" tabindex="0" aria-label="Predicted action chunk: 50 time steps, each a 66-dimensional action consisting of a 64-dimensional motion token and 2 hand controls.">
+                <span class="hf-kicker">VLA OUTPUT</span><h4>Action chunk</h4>
+                <div class="hf-chunk-shape"><b>50</b><span>×</span><b>66</b></div>
+                <p class="hf-chunk-shape-label">time steps × dimensions / action</p>
+                <div class="hf-chunk-strip" aria-hidden="true"><span>a<sub>t</sub></span><span>a<sub>t+1</sub></span><span class="hf-chunk-ellipsis">…</span><span>a<sub>t+49</sub></span></div>
+                <div class="hf-action-dimensions">Per action: <span>64-D motion token</span><span class="hf-hand-dimension">+ 2 hand controls</span></div>
+                <p class="hf-chunk-rate">50 Hz action sequence</p>
+              </article>
+
+              <div class="hf-lane hf-lane-training"><div class="hf-lane-label"><span>03</span><h4>A progressive training recipe</h4><p>Scale experience, then specialize.</p></div></div>
+              <article class="hf-node hf-training hf-stage1" data-hf-node="stage1" tabindex="0"><div class="hf-training-meta"><span>STAGE 01</span><b>1,669.61 h</b></div><div class="hf-training-body"><img src="assets/framework/ego-data.jpg" alt="Diverse egocentric human and simulated robot datasets" width="370" height="480" loading="lazy"><div><h4>Egocentric<br>pre-training</h4><p>Human demonstrations &amp;<br>simulated robot experience</p></div></div><p class="hf-datasets">EgoDex · EgoVerse · Xperience-10M · BEHAVIOR-1K</p></article>
+              <article class="hf-node hf-training hf-stage2" data-hf-node="stage2" tabindex="0"><div class="hf-training-meta"><span>STAGE 02</span><b>417.58 h</b></div><div class="hf-training-body"><img src="assets/framework/robot-data.jpg" alt="Real humanoid demonstration datasets" width="371" height="480" loading="lazy"><div><h4>Humanoid<br>adaptation</h4><p>Real robot observations &amp;<br>proprioceptive states</p></div></div><p class="hf-datasets">Humanoid Everyday · UniFoLM-WBT · HIW-500</p></article>
+              <article class="hf-node hf-training hf-stage3" data-hf-node="stage3" tabindex="0"><div class="hf-training-meta"><span>STAGE 03</span><b>TASK-SPECIFIC</b></div><div class="hf-training-body"><div class="hf-task-images"><img src="assets/framework/task-teleop.jpg" alt="Human teleoperating a humanoid robot" width="480" height="320" loading="lazy"><div><img src="assets/framework/human-view.jpg" alt="Original human view" width="400" height="300" loading="lazy"><span aria-hidden="true">→</span><img src="assets/framework/robot-view.jpg" alt="Visually adapted robot view" width="400" height="300" loading="lazy"></div></div><div><h4>Downstream<br>fine-tuning</h4><p>Task demonstrations &amp;<br>visually adapted ego data</p></div></div><p class="hf-datasets">HumanoidArena · Real-world cola pick-and-drop</p></article>
+              <div class="hf-board-note"><span class="hf-frozen-dot" aria-hidden="true"></span> Shared action targets across embodiments <span>·</span> Full VLA fine-tuning <span>·</span> Frozen low-level controller</div>
+            </div>
+          </div>
+          <div class="hf-legend"><span><i></i> Motion &amp; learning</span><span><i class="hf-legend-state"></i> State reconstruction</span><span><i class="hf-legend-hand"></i> Hand controls</span><p>Hover or focus a step to trace its connections</p></div>
+          <figcaption id="hf-caption">Human and robot experience share a SONIC motion space. Simulation supplies missing robot states; through three training stages, HuGe learns to predict 50-step action chunks, with a 64-D motion token and 2 hand controls in each 66-D action.</figcaption>
+          <p id="hf-model-status" class="sr-only" role="status"></p>
+          <noscript><p class="hf-noscript">Enable JavaScript to explore the connections and switch model architectures. The framework and all three model descriptions remain available below.</p></noscript>
+        </figure>
         <div class="model-family"><p class="eyebrow">THREE ARCHITECTURES, ONE FAMILY</p><div class="model-row"><strong>HuGe-OFT</strong><span>Parallel action regression</span><p>An MLP predicts continuous action chunks from action-token hidden states.</p></div><div class="model-row"><strong>HuGe-GR00T</strong><span>Flow matching + cross-attention</span><p>An action transformer generates motion conditioned on vision-language features.</p></div><div class="model-row"><strong>HuGe-Pi</strong><span>Layer-wise action conditioning</span><p>A flow-matching action expert attends to multiple backbone layers.</p></div><p class="interface-note"><span>Qwen3-VL-2B-Instruct</span><span>64-D motion token + 2 hand controls</span><span>34-D proprioception</span><span>50-step chunks at 50 Hz</span></p></div>
       </div>
     </section>
