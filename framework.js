@@ -214,8 +214,6 @@
     }
   });
 
-  const motionButton = figure.querySelector('#hf-motion');
-  if (motionButton) motionButton.hidden = false;
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   function pan(direction) {
     viewport.scrollBy({ left: direction * viewport.clientWidth * 0.75,
@@ -227,23 +225,11 @@
     event.preventDefault();
     pan(event.key === 'ArrowLeft' ? -1 : 1);
   });
-  let manualPause = null;
   let inView = true;
   function updateMotion() {
-    const paused = manualPause === null ? reducedMotion.matches : manualPause;
-    figure.classList.toggle('hf-paused', paused);
+    figure.classList.toggle('hf-paused', reducedMotion.matches);
     figure.classList.toggle('hf-offscreen', !inView || document.hidden);
-    if (!motionButton) return;
-    motionButton.setAttribute('aria-pressed', String(paused));
-    const icon = motionButton.querySelector('[data-motion-icon]');
-    const label = motionButton.querySelector('[data-motion-label]');
-    if (icon) icon.textContent = paused ? '▷' : 'Ⅱ';
-    if (label) label.textContent = paused ? 'Play motion' : 'Pause motion';
   }
-  motionButton?.addEventListener('click', () => {
-    manualPause = !(manualPause === null ? reducedMotion.matches : manualPause);
-    updateMotion();
-  });
   reducedMotion.addEventListener('change', updateMotion);
   document.addEventListener('visibilitychange', updateMotion);
   if ('IntersectionObserver' in window) {

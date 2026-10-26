@@ -46,7 +46,7 @@ button,input,select {
   font: inherit
 }
 
-button,a,input,select,summary {
+button,a,input,select {
   -webkit-tap-highlight-color: transparent
 }
 
@@ -54,7 +54,7 @@ button {
   color: inherit
 }
 
-button,a,summary {
+button,a {
   touch-action: manipulation
 }
 
@@ -76,7 +76,7 @@ p+p {
   margin-top: 18px
 }
 
-button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible {
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible {
   outline: 3px solid #9c660c;
   outline-offset: 5px
 }
@@ -198,17 +198,13 @@ strong {
   gap: 8px
 }
 
-.brand-symbol {
-  display: inline-grid;
-  place-items: center;
-  background: var(--teal);
-  color: var(--paper);
-  width: 29px;
-  height: 31px;
-  border-radius: 7px 2px 7px 2px;
-  font-size: 23px;
-  font-weight: 700;
-  margin-right: 3px
+.brand-logo {
+  display: block;
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+  margin-inline: -6px -2px
 }
 
 .wordmark-note {
@@ -675,41 +671,9 @@ nav a:hover:after {
   width: 100%
 }
 
-.figure-zoom {
-  padding: 0;
-  border: 0;
-  background: #fff;
-  display: block;
-  width: 100%;
-  position: relative;
-  border-radius: 3px
-}
 
-.figure-zoom img {
-  width: 100%
-}
 
-.zoom-label {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  position: absolute;
-  right: 10px;
-  bottom: 8px;
-  background: rgba(255,255,255,.95);
-  border: 1px solid var(--line);
-  padding: 7px 10px;
-  border-radius: 2px;
-  font-size: 10px;
-  opacity: 0;
-  transform: translateY(3px);
-  transition: opacity .2s,transform .2s
-}
 
-.figure-zoom:hover .zoom-label,.figure-zoom:focus-visible .zoom-label {
-  opacity: 1;
-  transform: none
-}
 
 .architecture-figure figcaption {
   font-size: 11px;
@@ -1139,27 +1103,14 @@ nav a:hover:after {
   margin-top: 55px
 }
 
-.full-results summary {
-  list-style: none;
-  cursor: pointer;
+.full-results>.data-table-title {
+  margin: 0;
+  font-weight: 500;
   font-size: 13px;
   padding: 20px 0;
   display: flex;
   justify-content: space-between;
   align-items: center
-}
-
-.full-results summary::-webkit-details-marker {
-  display: none
-}
-
-.full-results summary>span {
-  font-size: 22px;
-  color: var(--teal)
-}
-
-.full-results[open] summary>span {
-  transform: rotate(45deg)
 }
 
 .table-scroll {
@@ -1452,57 +1403,12 @@ caption {
   gap: 20px
 }
 
-dialog {
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 20px;
-  width: min(1500px,94vw);
-  max-height: 90vh;
-  color: var(--ink);
-  background: #fff
-}
 
-dialog::backdrop {
-  background: rgba(11,27,34,.8);
-  backdrop-filter: blur(5px)
-}
 
-.dialog-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 20px;
-  margin-bottom: 25px;
-  font: 10px var(--mono);
-  color: var(--muted)
-}
 
-.dialog-header button {
-  padding: 8px 13px;
-  border: 1px solid var(--line);
-  background: var(--paper);
-  border-radius: 3px;
-  font: 12px var(--sans);
-  display: flex;
-  gap: 20px
-}
 
-.dialog-header button span {
-  font-size: 18px;
-  line-height: 1
-}
 
-dialog>img {
-  width: 100%;
-  max-height: calc(90vh - 150px);
-  object-fit: contain
-}
 
-dialog>p {
-  font-size: 12px;
-  margin-top: 20px;
-  color: var(--muted)
-}
 
 @keyframes grow {
   from {
@@ -1902,10 +1808,9 @@ dialog>p {
   .wordmark {
     font-size: 24px
   }
-  .brand-symbol {
-    width: 25px;
-    height: 28px;
-    font-size: 21px
+  .brand-logo {
+    width: 42px;
+    height: 42px
   }
   .menu-toggle {
     display: flex;
@@ -2135,14 +2040,6 @@ dialog>p {
     margin-top: 14px;
     padding: 0 6px
   }
-  .zoom-label {
-    opacity: 1;
-    font-size: 8px;
-    padding: 4px 6px;
-    right: 4px;
-    bottom: 4px;
-    gap: 6px
-  }
   .training-stages {
     grid-template-columns: 1fr;
     gap: 30px;
@@ -2305,7 +2202,7 @@ dialog>p {
   .full-results {
     margin-top: 33px
   }
-  .full-results summary {
+  .full-results>.data-table-title {
     font-size: 12px
   }
   .table-note {
@@ -2395,24 +2292,6 @@ dialog>p {
   .site-footer>a:last-child {
     margin-left: auto;
     font-size: 10px
-  }
-  dialog {
-    padding: 13px;
-    width: 96vw
-  }
-  .dialog-header {
-    font-size: 9px;
-    margin-bottom: 18px;
-    gap: 15px
-  }
-  .dialog-header button {
-    font-size: 11px;
-    padding: 7px 10px;
-    gap: 12px
-  }
-  dialog>p {
-    font-size: 10px;
-    line-height: 1.7
   }
 }
 
@@ -2864,27 +2743,11 @@ dialog>p {
 .scale-values {
   margin-top: 8px;
 }
-.scale-values summary,.feature-details summary {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 20px;
-  cursor: pointer;
-  list-style: none;
-  padding-block: 13px;
+.scale-values>.data-table-title {
+  margin: 0;
+  padding-block: 12px;
+  font-weight: 500;
   font-size: 12px;
-}
-.scale-values summary {
-  padding-block: 8px;
-}
-.scale-values summary::-webkit-details-marker,.feature-details summary::-webkit-details-marker {
-  display: none;
-}
-.scale-values summary span,.feature-details summary span {
-  font-size: 22px;
-}
-.scale-values[open] summary span,.feature-details[open] summary span {
-  transform: rotate(45deg);
 }
 .recipe-conclusion {
   display: flex;
@@ -3001,26 +2864,6 @@ dialog>p {
   color: #a5b9bf;
   font-size: 10px;
   margin-top: 24px;
-}
-.feature-details {
-  margin-top: 30px;
-  border-block: 1px solid #3a515b;
-}
-.feature-details summary {
-  font-size: 12px;
-  padding-block: 18px;
-}
-.feature-details figure {
-  padding: 20px;
-  background: #fff;
-  color: var(--ink);
-  margin-bottom: 20px;
-  border-radius: 3px;
-}
-.feature-details figcaption {
-  font-size: 10px;
-  color: var(--muted);
-  margin-top: 15px;
 }
 .demo-context {
   display: flex;
@@ -3368,7 +3211,7 @@ dialog>p {
   .scaling-figure figcaption {
     font-size: 9px;
   }
-  .scale-values summary {
+  .scale-values>.data-table-title {
     font-size: 11px;
   }
   .recipe-conclusion {
@@ -3433,15 +3276,6 @@ dialog>p {
     margin-bottom: 10px;
   }
   .fd-note {
-    font-size: 9px;
-  }
-  .feature-details summary {
-    font-size: 11px;
-  }
-  .feature-details figure {
-    padding: 12px;
-  }
-  .feature-details figcaption {
     font-size: 9px;
   }
   .demo-grid {

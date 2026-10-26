@@ -102,23 +102,6 @@ document.addEventListener('keydown', event => {
 });
 window.matchMedia('(min-width: 601px)').addEventListener('change', closeMenu);
 
-const dialog = document.querySelector('#figure-dialog');
-document.querySelectorAll('[data-zoom]').forEach(button => {
-  button.addEventListener('click', () => {
-    const enlarged = document.querySelector('#enlarged-figure');
-    enlarged.src = button.dataset.zoom;
-    enlarged.alt = button.querySelector('img').alt;
-    document.querySelector('#figure-caption').textContent = button.dataset.caption;
-    dialog.showModal();
-  });
-});
-document.querySelector('#close-figure').addEventListener('click', () => dialog.close());
-dialog.addEventListener('click', event => {
-  if (event.target !== dialog) return;
-  const bounds = dialog.getBoundingClientRect();
-  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) dialog.close();
-});
-
 const copyButton = document.querySelector('#copy-citation');
 // Keep attention on the selected demonstration when switching between clips.
 const demoVideos = document.querySelectorAll('.demo-card video');

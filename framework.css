@@ -19,9 +19,6 @@
 .hf-heading { padding: 28px 28px 12px; gap: 20px; }
 .hf-kicker { display: block; font: 9px/1.4 var(--mono); letter-spacing: .65px; color: #697c75; }
 .hf-heading h3 { font-size: 32px; letter-spacing: -1.15px; line-height: 1.2; margin-top: 8px; }
-#hf-motion { flex-shrink: 0; border: 1px solid #c5d4c9; background: #fff9; border-radius: 7px; padding: 8px 12px; font: 11px/1.4 var(--mono); color: #47665a; }
-#hf-motion:hover { background: #e7efe7; }
-#hf-motion [data-motion-icon] { display: inline-block; width: 14px; }
 .hf-viewport { position: relative; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-color: #a6bdb0 #edf1e9; scrollbar-width: thin; }
 .hf-viewport:focus-visible { outline-offset: -4px; }
 .hf-board { position: relative; width: 1248px; height: 1068px; margin-inline: auto; isolation: isolate; }
@@ -181,13 +178,10 @@
   .hf-heading { padding: 22px 15px 12px; align-items: flex-start; gap: 10px; }
   .hf-heading h3 { font-size: 25px; }
   .hf-heading .hf-kicker { max-width: 175px; font-size: 7px; line-height: 1.6; }
-  #hf-motion { font-size: 9px; padding: 8px; margin-top: 4px; }
   .hf-legend { padding: 14px 15px; font-size: 8px; gap: 10px 14px; }
   .hf-legend p { font-size: 8px; }
   .hf-figure figcaption { padding: 15px; font-size: 10px; }
 }
 @media(prefers-reduced-motion:reduce) {
-  /* The initial paused state is set in JS; a deliberate Play still works. */
-  .hf-figure .hf-edge-pulse { animation: hf-flow 5s linear infinite!important; }
-  .hf-figure.hf-paused .hf-edge-pulse,.hf-figure.hf-offscreen .hf-edge-pulse { animation-play-state: paused!important; }
+  .hf-figure .hf-edge-pulse { animation: none!important; }
 }
