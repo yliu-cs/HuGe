@@ -1,4 +1,39 @@
-# HuGe: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience
+<p align="center">
+  <img src="assets/HuGe-icon.png" alt="HuGe logo" width="88" height="88">
+</p>
+
+<h1 align="center">
+  HuGe: Scaling Humanoid Generalist<br>
+  Vision-Language-Action Models<br>
+  with Egocentric Experience
+</h1>
+
+<div align="center">
+
+[Yang&nbsp;Liu](https://yliu-cs.github.io)<sup>&#42;</sup> · [Jiacheng&nbsp;Liu](https://jiachengliu3.github.io)<sup>&#42;</sup> · Hengtao&nbsp;Li<sup>&#42;</sup> · Yuheng&nbsp;Huang · Zijian&nbsp;Yang · Ji&nbsp;Dai<br>
+Maoxin&nbsp;Wang · [Yi&nbsp;Gao](https://gaoe05.github.io) · Qishen&nbsp;Wang · Baohua&nbsp;Yin · Peiyang&nbsp;Li · [Shuanghao&nbsp;Bai](https://baishuanghao.github.io)<br>
+[Mingyang&nbsp;Sun](https://sunrisulfr.github.io) · [Pengxiang&nbsp;Ding](https://dingpx.github.io) · [Jianqin&nbsp;Yin](https://teacher.bupt.edu.cn/yinjianqin/zh_CN/index.htm) · [Lixin&nbsp;Yang](https://lixiny.github.io)<sup>†</sup> · [Donglin&nbsp;Wang](https://milab.westlake.edu.cn)<sup>†</sup>
+
+<sup>&#42; Equal contribution &nbsp; · &nbsp; † Corresponding authors</sup>
+
+[![Homepage](https://img.shields.io/badge/Homepage-HuGe-167D8D?style=flat-square)](https://yliu-cs.github.io/HuGe/)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.34186-B31B1B?style=flat-square&logo=arxiv)](https://arxiv.org/abs/2610.34186)
+[![Code](https://img.shields.io/badge/Code-GitHub-181717?style=flat-square&logo=github)](https://github.com/yliu-cs/HuGe)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/release/python-3120/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.7.1-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
+
+</div>
+
+<p align="center">
+  <a href="https://yliu-cs.github.io/HuGe/#overview">
+    <img src="assets/architecture.png" alt="HuGe framework: shared SONIC motion tokens, pseudo-proprioception through simulation playback, three VLA architectures, and a three-stage training pipeline" width="100%">
+  </a>
+</p>
+
+<p align="center">
+  <em>Egocentric pre-training → Humanoid adaptation → Downstream fine-tuning.<br>
+  HuGe predicts action chunks with a 66-D action at each time step.</em>
+</p>
 
 HuGe (**Hu**manoid **Ge**neralist) is a family of vision-language-action models
 for humanoid whole-body control. This repository provides Qwen3-VL-2B-Instruct
@@ -6,13 +41,7 @@ implementations of OFT-, GR00T-, and Pi-style policies that predict SONIC motion
 tokens and hand-control signals through a three-stage training pipeline:
 egocentric pre-training, humanoid adaptation, and downstream fine-tuning.
 
-Yang Liu, Jiacheng Liu, Hengtao Li, Yuheng Huang, Zijian Yang, Ji Dai,
-Maoxin Wang, Yi Gao, Qishen Wang, Baohua Yin, Peiyang Li, Shuanghao Bai,
-Mingyang Sun, Pengxiang Ding, Jianqin Yin, Lixin Yang, and Donglin Wang.
-
-[Project page](https://yliu-cs.github.io/HuGe) ·
-[Paper](https://arxiv.org/abs/2610.34186) ·
-[Code](https://github.com/yliu-cs/HuGe)
+---
 
 ## 🧩 Core contracts
 
