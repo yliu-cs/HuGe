@@ -11,6 +11,7 @@ Maoxin Wang, Yi Gao, Qishen Wang, Baohua Yin, Peiyang Li, Shuanghao Bai,
 Mingyang Sun, Pengxiang Ding, Jianqin Yin, Lixin Yang, and Donglin Wang.
 
 [Project page](https://yliu-cs.github.io/HuGe) ·
+[Paper](https://arxiv.org/abs/2610.34186) ·
 [Code](https://github.com/yliu-cs/HuGe)
 
 ## 🧩 Core contracts
@@ -1030,3 +1031,19 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
 HuGe builds on Psi0, GR00T-WholeBodyControl, Isaac-GR00T, GEAR-SONIC,
 HumanoidArena, and Qwen3-VL.
+
+## 📖 Citation
+
+If HuGe supports your research, please consider citing our
+[paper](https://arxiv.org/abs/2610.34186):
+
+```bibtex
+@article{liu2026huge,
+  author    = {Yang Liu and Jiacheng Liu and Hengtao Li and Yuheng Huang and Zijian Yang and Ji Dai and Maoxin Wang and Yi Gao and Qishen Wang and Baohua Yin and Peiyang Li and Shuanghao Bai and Mingyang Sun and Pengxiang Ding and Jianqin Yin and Lixin Yang and Donglin Wang},
+  title     = {{HuGe}: Scaling Humanoid Generalist Vision-Language-Action Models with Egocentric Experience},
+  journal   = {CoRR},
+  volume    = {abs/2610.34186},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2610.34186}
+}
+```
